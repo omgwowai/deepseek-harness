@@ -156,15 +156,19 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
           toolBlocks.set(call.index, block)
           yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
         }
-        if (call.id !== undefined) block.callId = call.id
-        if (call.function?.name !== undefined) block.name = call.function.name
+        // A streaming gateway may repeat the tool-call slot with EMPTY id/name
+        // on continuation deltas instead of omitting the fields. Treating "" as
+        // 'provided' overwrites the real name from the opening delta and the
+        // call dispatches as `unknown tool ""`. Same guard as llm-pi-ai.
+        if (call.id !== undefined && call.id.length > 0) block.callId = call.id
+        if (call.function?.name !== undefined && call.function.name.length > 0) block.name = call.function.name
         const fragment = call.function?.arguments ?? ''
         block.text += fragment
         yield {
           type: 'tool-call-delta',
           index: block.index,
           id: CallId(block.callId ?? ''),
-          ...block.name !== undefined ? { name: block.name } : {},
+          ...block.name !== undefined && block.name.length > 0 ? { name: block.name } : {},
           argumentsDelta: fragment,
         }
       }
