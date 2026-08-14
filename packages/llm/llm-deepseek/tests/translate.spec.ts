@@ -123,6 +123,33 @@ describe('translate: tool calls', () => {
     ])
   })
 
+  // Regression: some OpenAI-compatible gateways repeat the tool-call slot with
+  // EMPTY id/name on continuation deltas rather than omitting the fields.
+  // Accepting "" as a value overwrote the opening delta's real name, and the
+  // call dispatched as `unknown tool ""`.
+  it('keeps the opening id/name when continuation deltas repeat them as empty strings', async () => {
+    const chunks = await collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_b833', type: 'function', function: { name: 'get_weather', arguments: '' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: '', type: 'function', function: { name: '', arguments: '{' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: '', type: 'function', function: { name: '', arguments: '"city": "Paris"}' } }] } }] },
+      { choices: [{ delta: { content: '' }, finish_reason: 'tool_calls' }] },
+      DONE,
+    )))
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: 'call_b833', name: 'get_weather', argumentsDelta: '' },
+      { type: 'tool-call-delta', index: 0, id: 'call_b833', name: 'get_weather', argumentsDelta: '{' },
+      { type: 'tool-call-delta', index: 0, id: 'call_b833', name: 'get_weather', argumentsDelta: '"city": "Paris"}' },
+      {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: 'call_b833', name: 'get_weather', arguments: '{"city": "Paris"}' },
+      },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+
   it('disambiguates parallel tool calls by wire index', async () => {
     const chunks = await collect(translate(feed(
       firstChunk,
