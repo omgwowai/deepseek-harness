@@ -6,6 +6,7 @@ import {
   DEEPSEEK_DEFAULT_MAX_TOKENS,
   DEEPSEEK_DEFAULT_MAX_USES,
   DEEPSEEK_DEFAULT_MODEL,
+  DEEPSEEK_DEFAULT_STREAM,
 } from '@deepseek-ai/dsh-web-search-deepseek'
 
 /** Construct the provider over a fixed options value; production passes a live thunk. */
@@ -31,6 +32,7 @@ maybe('DeepSeekSearchProvider real API', () => {
       apiVersion: DEEPSEEK_DEFAULT_API_VERSION,
       maxTokens: DEEPSEEK_DEFAULT_MAX_TOKENS,
       maxUses: DEEPSEEK_DEFAULT_MAX_USES,
+      stream: DEEPSEEK_DEFAULT_STREAM,
     })
     const result = await provider.search({ query: 'What is DeepSeek Harness?', maxResults: 5 })
     expect(result.sources.length).toBeGreaterThan(0)

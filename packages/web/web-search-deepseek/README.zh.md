@@ -25,6 +25,7 @@ Exa 和 Perplexity 提供专用搜索端点，DeepSeek 则没有。该提供方�
 | `apiVersion` | `2023-06-01` | `anthropic-version` 标头值。 |
 | `maxTokens` | `4096` | Messages 请求生成 token 的正整数上限。 |
 | `maxUses` | `5` | 每次请求使用 `web_search` 服务器工具的正整数上限。 |
+| `stream` | `false` | 以 Messages 事件流（`text/event-stream`）读取响应，而不是单个 JSON 响应体，并重组出相同的块。当某端点的单次响应中 `web_search_tool_result` 块不带 `content` 时启用；下文「仅在事件流上作答的端点」一节有详细说明。 |
 
 ```yaml
 - id: web-search-deepseek
@@ -35,6 +36,12 @@ Exa 和 Perplexity 提供专用搜索端点，DeepSeek 则没有。该提供方�
 ```
 
 上面的条目是 `web-search-deepseek` Settings 段的 base 层：叠加其上的用户层会作用于**下一次**搜索，因为提供方是按次投影该段，而不是在注册时固化它。因此端点或模型变化时，seam 的提供方选择不会闪断。`apiKey` 带有 `role('secret')`，所以它在任何一层都不会出现在 `describe()` 响应中——配置表层只能知道 credentials 领域是否为 `apiKeyEnv` 所命名的引用持有值，而无从知道某一层是否带着字面密钥。
+
+## 仅在事件流上作答的端点
+
+部分 Anthropic 兼容网关会执行服务器端搜索，但在单次响应中返回**不带 `content`** 的 `web_search_tool_result` 块，只在事件流上给出结果与引用摘录。面对这类端点，默认模式取到的结果块中没有任何可引用条目，搜索因而报告零来源——看上去像是网上没有内容，实则只是传输方式不同。此时应设置 `stream: true`：提供方会发送 `stream: true` 并携带 `Accept: text/event-stream`，从帧中重组 `web_search_tool_result` 块与 `citations_delta` 摘录，再按与单次响应体完全相同的方式映射，严格模式、去重与 `WEB_ABORTED` 取消语义均保持不变。DeepSeek 官方端点在单次响应中即返回完整块，因此默认值仍为 `false`。
+
+事件流只改变读取响应的方式，并不会让搜索变为增量式：seam 仍在流结束后一次性返回完整的 `WebSearchResult`。
 
 ## 映射
 
@@ -84,3 +91,4 @@ DeepSeek 返回的提供方生成答案均不被该提供方信任为 `content`�
 - **动态凭据的可用性在操作内部解析**：同步的 `available()` 约定可以确认解析器存在，但无法查询异步凭据存储。因此，选中的无密钥提供方会使搜索以 `WEB_PROVIDER_CREDENTIAL_MISSING` 失败；稳定的 `web_search` schema 仍保持注册。调用方取消在本地与该预检存在竞态，但无法强制任意凭据后端自行停止工作。
 - **超量返回的源仍消耗 token**：协议没有结果数量旋钮，`maxResults` 只能由 seam 在事后截断。
 - **未引用的结果没有 `snippet`**：只有 `text` 块中的引用（`cited_text`）匹配其 URL 时，源才会获得 snippet。
+- **`stream` 需要手动设置，无法自动探测**：在传输层面，"端点省略了 `web_search_tool_result.content`" 与"确实没有搜到内容"无从区分，因此提供方既不能自行选择模式，也不能跨模式重试。取值错误时的表现是搜索报告零来源。

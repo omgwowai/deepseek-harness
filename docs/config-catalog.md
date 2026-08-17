@@ -2938,10 +2938,17 @@ export interface Config {
   maxTokens?: number
   /** Maximum `web_search` server-tool uses per request. Defaults to 5. */
   maxUses?: number
+  /**
+   * Read the response as a Messages event stream. Defaults to `false`. Enable
+   * for an Anthropic-compatible endpoint that runs the search but returns a
+   * `web_search_tool_result` block with no `content` in the single-shot
+   * response, which surfaces as a search that reports no sources.
+   */
+  stream?: boolean
 }
 ```
 
-Source: [`packages/web/web-search-deepseek/src/index.ts:46`](../packages/web/web-search-deepseek/src/index.ts)
+Source: [`packages/web/web-search-deepseek/src/index.ts:48`](../packages/web/web-search-deepseek/src/index.ts)
 
 <a id="deepseek-aidsh-web-search-exa"></a>
 

@@ -74,6 +74,18 @@ async function searchOnce(ctx: Context): Promise<string> {
   return String((fetchSpy.mock.calls.at(-1)?.[0] as URL | string | undefined) ?? '')
 }
 
+/** The same answer as {@link ONE_RESULT}, delivered only as stream frames. */
+function eventStreamResponse(): Response {
+  const frames = [
+    { type: 'content_block_start', index: 0, content_block: ONE_RESULT.content[1] },
+    { type: 'message_stop' },
+  ]
+  return new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
 describe('web-search-deepseek settings section', () => {
   it('serves a stored endpoint to the next search without re-registering the provider', async () => {
     const bench = await boot()
@@ -109,6 +121,20 @@ describe('web-search-deepseek settings section', () => {
     await bench.settingsFiber.dispose()
 
     expect(await searchOnce(bench.ctx)).toContain('https://search.entry.test/v1')
+    await bench.ctx.fiber.dispose()
+  })
+
+  it('serves a stored stream flag to the next search, sources and all', async () => {
+    const bench = await boot()
+    await bench.ctx.settings.update(WEB_SEARCH_DEEPSEEK_SETTINGS_NAMESPACE, { stream: true })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockImplementation(() => Promise.resolve(eventStreamResponse()))
+
+    const result = await bench.ctx.web.search({ query: 'anything' })
+
+    const init = fetchSpy.mock.calls.at(-1)?.[1]
+    expect(JSON.parse(init?.body as string)).toMatchObject({ stream: true })
+    expect(result.sources).toEqual([{ url: 'https://a.test', title: 'A' }])
     await bench.ctx.fiber.dispose()
   })
 
