@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-08-17-sse-done-sentinel-closed-by-eof.md
+2026-08-17-sse-done-sentinel-closed-by-eof.md: d33ecb30fb9fc2449dcf5e6b3d6f1b5e091868f8
+2026-08-17-sse-done-sentinel-closed-by-eof.zh.md: 19b75270bd724f155f9a585afb9f3eddb88e0cf4
