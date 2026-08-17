@@ -25,6 +25,7 @@ It reuses the `DEEPSEEK_API_KEY` credential reference (no new secret) but **not*
 | `apiVersion` | `2023-06-01` | `anthropic-version` header value. |
 | `maxTokens` | `4096` | Positive-integer upper bound on generated tokens for the Messages request. |
 | `maxUses` | `5` | Positive-integer maximum `web_search` server-tool uses per request. |
+| `stream` | `false` | Read the response as a Messages event stream (`text/event-stream`) instead of one JSON body, reassembling the same blocks. Enable for an endpoint whose single-shot response carries a `web_search_tool_result` block with no `content`, described under "Endpoints that answer only on the stream" below. |
 
 ```yaml
 - id: web-search-deepseek
@@ -35,6 +36,12 @@ It reuses the `DEEPSEEK_API_KEY` credential reference (no new secret) but **not*
 ```
 
 The entry above is the base layer of the `web-search-deepseek` Settings section: a user layer over it reaches the NEXT search, because the provider projects the section per call rather than capturing it at registration. The seam's provider selection therefore never flickers when an endpoint or model changes. `apiKey` carries `role('secret')`, so it never rides a `describe()` response in any layer — a configuration surface learns only whether the credentials domain holds a value for the reference `apiKeyEnv` names, never whether a layer carries a literal key.
+
+## Endpoints that answer only on the stream
+
+Some Anthropic-compatible gateways run the server-side search but return a `web_search_tool_result` block with **no `content`** in the single-shot response, and emit the results and citation excerpts only on the event stream. Against such an endpoint the default mode finds a result block holding nothing citeable and the search reports no sources, which reads as an empty web rather than a wire difference. Set `stream: true` there: the provider sends `stream: true` with `Accept: text/event-stream`, reassembles `web_search_tool_result` blocks and `citations_delta` excerpts from the frames, and maps them exactly as it maps a single-shot body — strict mode, dedup, and `WEB_ABORTED` cancellation included. Official DeepSeek returns complete blocks in the single-shot response, so the default stays `false`.
+
+Streaming affects only how the response is read. It does not make search incremental: the seam still returns one complete `WebSearchResult` after the stream ends.
 
 ## Mapping
 
@@ -84,3 +91,4 @@ Append-only; newly visible content follows the reusable request prefix and does 
 - **Dynamic credential availability resolves inside the operation** — the synchronous `available()` contract can establish that a resolver exists but cannot query an asynchronous credential store. A selected keyless provider therefore fails the search with `WEB_PROVIDER_CREDENTIAL_MISSING`; the stable `web_search` schema remains registered. Caller cancellation races this preflight locally, but cannot force an arbitrary credential backend itself to stop work.
 - **Over-returned sources still cost tokens** — with no result-count knob on the wire, `maxResults` is enforced only post-hoc by seam truncation.
 - **Uncited results carry no `snippet`** — a source gains one only when a `text` block citation (`cited_text`) matches its URL.
+- **`stream` is a manual setting, not a detected one** — nothing on the wire distinguishes an endpoint that omits `web_search_tool_result.content` from one that genuinely found nothing, so the provider cannot choose the mode itself or retry across it. A wrong value surfaces as a search reporting no sources.

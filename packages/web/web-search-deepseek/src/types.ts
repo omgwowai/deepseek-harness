@@ -42,6 +42,21 @@ export interface AnthropicResponse {
   content?: ContentBlock[]
 }
 
+/**
+ * One Messages SSE event, narrowed to the fields stream reassembly reads.
+ * Every field is optional because a gateway may emit events this provider does
+ * not consume, and an unrecognized event is skipped rather than rejected.
+ */
+export interface StreamEvent {
+  type?: string
+  /** Position of the content block this event applies to. */
+  index?: number
+  /** Present on `content_block_start`: the block in its initial state. */
+  content_block?: ContentBlock
+  /** Present on `content_block_delta`. */
+  delta?: { type?: string; citation?: CitationLocation }
+}
+
 /** DeepSeek's error response envelope (best-effort; fields vary). */
 export interface AnthropicError {
   error?: { message?: string } | string

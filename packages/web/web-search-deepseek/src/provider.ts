@@ -3,6 +3,8 @@
  * `web_search_20250305` server tool. Each search costs a model turn, but returns structured
  * result blocks; absence of those blocks is an error rather than a prose-scraping fallback.
  * The wire format and native `fetch` client are provider-private and do not use `ctx.llm`.
+ * The response is one JSON body by default and an event stream under
+ * `stream` — see `./stream.ts` for which endpoints require the latter.
  * @module @deepseek-ai/dsh-web-search-deepseek/provider
  */
 
@@ -15,6 +17,7 @@ import type {
 } from '@deepseek-ai/dsh-web'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import type {} from '@deepseek-ai/dsh-session'
+import { readAnthropicStream } from './stream.ts'
 import type {
   AnthropicError,
   AnthropicResponse,
@@ -46,6 +49,12 @@ export const DEEPSEEK_DEFAULT_MAX_TOKENS = 4096
 /** Default maximum `web_search` server-tool uses per request. */
 export const DEEPSEEK_DEFAULT_MAX_USES = 5
 
+/**
+ * Read the single-shot response by default: official DeepSeek returns complete
+ * `web_search_tool_result` blocks there, and streaming only adds reassembly.
+ */
+export const DEEPSEEK_DEFAULT_STREAM = false
+
 /** Attribution header sent on every request. Bump with the package version. */
 const USER_AGENT = 'deepseek-harness/0.0.1'
 
@@ -74,6 +83,8 @@ export interface DeepSeekSearchLlmRequest {
       readonly name: 'web_search'
       readonly max_uses: number
     }]
+    /** Present only when the endpoint is read as an event stream. */
+    readonly stream?: true
   }
 }
 
@@ -102,6 +113,12 @@ export interface DeepSeekSearchProviderOptions {
   maxTokens: number
   /** Maximum `web_search` server-tool uses per request. */
   maxUses: number
+  /**
+   * Read the response as a Messages event stream instead of one JSON body. Set
+   * this for an endpoint that omits `web_search_tool_result.content` from the
+   * single-shot response and delivers the results only on the stream.
+   */
+  stream: boolean
   /**
    * Record the exact secret-free request immediately before dispatch. A throw
    * prevents dispatch so model-visible auxiliary input cannot escape logging.
@@ -210,6 +227,7 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
         content: [{ type: 'text', text: `Perform a web search for the query: ${request.query}` }],
       }],
       tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: options.maxUses }],
+      ...options.stream ? { stream: true as const } : {},
     }
     options.recordRequest?.({
       endpoint,
@@ -229,7 +247,7 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
           'authorization': `Bearer ${apiKey}`,
           'anthropic-version': options.apiVersion,
           'content-type': 'application/json',
-          'accept': 'application/json',
+          'accept': options.stream ? 'text/event-stream' : 'application/json',
           'user-agent': USER_AGENT,
         },
         body: JSON.stringify(body),
@@ -260,7 +278,10 @@ export class DeepSeekSearchProvider implements WebSearchProvider {
     }
 
     try {
-      const payload = await response.json() as AnthropicResponse
+      const payload = options.stream
+        ? await readAnthropicStream(response, signal)
+        : await response.json() as AnthropicResponse
+      throwIfSearchAborted(signal)
       return mapAnthropicResponse(payload)
     } catch (error: unknown) {
       if (signal?.aborted === true || isAbortError(error)) throw searchAborted(signal, error)
