@@ -15,10 +15,11 @@ export const name = 'tokenrouter-rollout-invariant'
 export const inject = ['invariants']
 
 /**
- * Runtime invariant: injected rollout plans are user-role messages appended
- * through `agent.inject` (which lands in the inbox and the session log), and
- * every durable record is a declared SessionEventMap member — the repository
- * invariant "model-visible means logged" holds by construction.
+ * No runtime invariant: rollout plans reach the model only through
+ * `agent.inject`, whose own package already logs the appended user message, so
+ * this package owns no cordis event stream and no cross-plugin mutable
+ * relation of its own. Plan derivation and command dispatch are pure functions
+ * asserted directly by this package's behavior specs.
  */
 const install: InvariantInstaller = () => {}
 
