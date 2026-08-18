@@ -559,6 +559,78 @@ Source: [`packages/core/session/src/types.ts:309`](../packages/core/session/src/
 
 Source: [`packages/core/session/src/types.ts:304`](../packages/core/session/src/types.ts)
 
+### `rollout/*`
+
+<a id="rollouterror--log-only"></a>
+
+#### `rollout/error` — log-only
+
+```ts persistence-catalog
+/**
+ * A rollout round failed before selection (e.g. all workers failed or the
+ * judge was unreachable and no fallback applied). Log-only.
+ */
+'rollout/error': {
+  trigger: RolloutTrigger
+  reason: string
+}
+```
+
+Source: [`packages/extensions/tokenrouter-rollout/src/types.ts:76`](../packages/extensions/tokenrouter-rollout/src/types.ts)
+
+<a id="rolloutselected--log-only"></a>
+
+#### `rollout/selected` — log-only
+
+```ts persistence-catalog
+/**
+ * The judge's selection: which trajectory won and why. Model-visible
+ * narration derives from this event (the surface projection renders the
+ * winning plan summary as a user-role context message).
+ */
+'rollout/selected': RolloutSelectedEventData
+```
+
+Source: [`packages/extensions/tokenrouter-rollout/src/types.ts:71`](../packages/extensions/tokenrouter-rollout/src/types.ts)
+
+<a id="rolloutstart--log-only"></a>
+
+#### `rollout/start` — log-only
+
+```ts persistence-catalog
+/**
+ * A rollout round opened: N diverse trajectories will run in parallel and
+ * a judge will pick one. Durable, log-only (non-surface): the selected
+ * plan itself is delivered through `rollout/selected` narration, and the
+ * round's bookkeeping stays trace-only.
+ */
+'rollout/start': {
+  trigger: RolloutTrigger
+  /** Short human-readable description of the decision being rolled out. */
+  decision: string
+  /** Number of trajectories requested. */
+  count: number
+}
+```
+
+Source: [`packages/extensions/tokenrouter-rollout/src/types.ts:52`](../packages/extensions/tokenrouter-rollout/src/types.ts)
+
+<a id="rollouttrajectory--log-only"></a>
+
+#### `rollout/trajectory` — log-only
+
+```ts persistence-catalog
+/**
+ * One trajectory's durable record, appended when it settles. The worker's
+ * full plan text is NOT logged here (it can be long); the summary line
+ * keeps the log lightweight and the judge input reconstructable from the
+ * worker sessions.
+ */
+'rollout/trajectory': RolloutTrajectoryEventData
+```
+
+Source: [`packages/extensions/tokenrouter-rollout/src/types.ts:65`](../packages/extensions/tokenrouter-rollout/src/types.ts)
+
 ### `sandbox/*`
 
 <a id="sandboxmode--log-only"></a>

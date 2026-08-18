@@ -92,3 +92,7 @@
 .code[data-error] {
   color: var(--dsw-alias-state-error-primary);
 }
+
+.footer {
+  border-top: 1px solid var(--dsw-alias-border-subtle);
+}

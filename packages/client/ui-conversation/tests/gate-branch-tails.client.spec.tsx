@@ -42,9 +42,12 @@ const SessionProviderStub: SessionProviderComponent = ({ children }) => children
 
 /** Observe the owner currency without importing the Tool details renderer. */
 function renderToolDetailsProbe(owners?: DetailsToolOwnerProps[]): DetailsSlotProps['renderSlot'] {
-  return (_key, owner) => {
-    owners?.push(owner as unknown as DetailsToolOwnerProps)
-    return <div data-testid="tool-details-seat" />
+  return (key, owner) => {
+    if (key === 'conversation.details.tool') {
+      owners?.push(owner as unknown as DetailsToolOwnerProps)
+      return <div data-testid="tool-details-seat" />
+    }
+    return null
   }
 }
 

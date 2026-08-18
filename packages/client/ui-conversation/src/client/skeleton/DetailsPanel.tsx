@@ -124,6 +124,9 @@ export function DetailsPanel({ useSession, useSessions, sessionId, useStore, ren
               </>
             )}
       </div>
+      <div className={css.footer}>
+        {renderSlot('conversation.details.footer', {})}
+      </div>
     </div>
   )
 }

@@ -1,0 +1,38 @@
+/* Rollout stats panel: session-details readout of the rolloutStats projection. */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--dsw-alias-border-subtle);
+}
+
+.title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-text-primary);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+}
+
+.item {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.label {
+  color: var(--dsw-alias-text-secondary);
+}
+
+.value {
+  color: var(--dsw-alias-text-primary);
+  font-variant-numeric: tabular-nums;
+}
