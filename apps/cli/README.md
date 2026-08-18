@@ -40,6 +40,12 @@ Bundles named in `dsh.profile.bundles` resolve from the dsh installation first (
 
 Use `--dump-default-config` and `--dump-config` to inspect the composed tree without booting it.
 
+## Bundled skills
+
+`config/skills/` ships skills that every profile carries. The launcher points `$DSH_BUNDLED_SKILL_DIR` at that directory unless the environment already names one, so the root reaches the host `skill-filesystem` row and each agent preset's own row alike; an inherited value wins, which is how a deployment redirects or empties the root. It is the lowest-precedence root the provider mounts, so a same-named skill under a project root, a custom root, or `$DSH_HOME/skills` shadows the shipped copy. A skill belonging to one preset ships under `config/agent-presets/<id>/skills/` instead, so it travels with the copy a person edits.
+
+`config/skills/j-space` is vendored from [J-Space Cognition Suite V3.6](https://github.com/Tiger3807861189/J-Space-Cognition-Suite-V3.6) under Apache-2.0; its `LICENSE` travels with it. Update it by replacing the directory from an upstream revision, keeping that file, and running the suite's own checker (`python3 apps/cli/config/skills/j-space/scripts/verify_suite.py`).
+
 The [CLI behavior reference](reference/README.md) owns exact layer precedence, flags, shutdown behavior, deployment defaults, and source execution.
 
 ## Development
