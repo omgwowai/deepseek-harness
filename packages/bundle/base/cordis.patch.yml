@@ -369,6 +369,27 @@
       config:
         allowParallelInProgress: true
 
+    # Decision-point rollout: disabled by default; a user enables it (and
+    # tunes it) through the settings section. Workers ride whatever
+    # llm-deepseek route the deployment configures. `judgeBaseURL` is
+    # deliberately absent: the judge endpoint is a property of the deployment,
+    # so the user supplies their own OpenAI-compatible URL in settings before
+    # enabling rollout.
+    - id: tokenrouter-rollout
+      name: '@deepseek-ai/dsh-tokenrouter-rollout'
+      config:
+        enabled: false
+        rolloutCount: 3
+        judgeModel: claude-opus-5
+        judgeApiKeyEnv: DEEPSEEK_API_KEY
+        workerProvider: deepseek-official
+        workerModels: []
+        workerTimeoutMs: 600000
+        judgeTimeoutMs: 180000
+        maxPlanChars: 12000
+        autoMilestone: false
+        maxContextChars: 4000
+
     # Persisted same-session goals reach the model and the slash menu here; the
     # domain, driver, and `/goal` command are above.
     - id: tool-goal
