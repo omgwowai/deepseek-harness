@@ -44,7 +44,11 @@
                 tokenrouter:
                   displayName: TokenRouter
                   api: openai-completions
-                  baseURL: !!js process.env.DSH_TOKENROUTER_BASE_URL ?? 'http://tokenrouter.omgwow.tech:8081/v1'
+                  # Pinned in composition, which outranks the environment by
+                  # design: omitting it would silently fall back to the
+                  # installed catalog's DeepSeek endpoint, and this route's
+                  # model ids only exist on the gateway.
+                  baseURL: http://tokenrouter.omgwow.tech:8081/v1
                   # Credential *reference*, resolved per request; no key here.
                   apiKeyEnv: DSH_TOKENROUTER_API_KEY
 
