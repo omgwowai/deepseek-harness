@@ -265,13 +265,6 @@ const SCENARIOS: Scenario[] = [
     configPath: IMAGE_CONFIG,
   },
   {
-    name: 'inline-image-prompt',
-    hasModelTurn: true,
-    recorded: false,
-    headerClass: 'image',
-    configPath: IMAGE_CONFIG,
-  },
-  {
     name: 'pty-tools',
     hasModelTurn: true,
     recorded: false,
