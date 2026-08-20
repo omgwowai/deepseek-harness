@@ -1,0 +1,407 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepseek-harness-config
+  namespace: mc-tianhai-feng
+data:
+  settings.yaml: |
+    llm-deepseek:
+      apiKeyEnv: DEEPSEEK_API_KEY
+      baseURL: http://127.0.0.1:8081/v1
+      thinking: enabled
+      reasoningEffort: high
+      models:
+        - id: deepseek-v4-flash
+          name: DeepSeek-V4-Flash
+          contextWindow: 1000000
+    agent-default-model:
+      provider: deepseek-official
+      model: deepseek-v4-flash
+  cordis.patch.yml: |
+    # Keep unattended workflow and code-runtime execution disabled. Creation
+    # mode retains its separately authenticated, user-approved Cordis runner.
+    - id: workflow-worker-thread
+      disabled: true
+    - id: tool-workflow
+      disabled: true
+    - id: code-runtime
+      disabled: true
+    - id: ui-workflow-run
+      disabled: true
+  llm-proxy.py: |
+    import http.server
+    import os
+    import urllib.error
+    import urllib.request
+
+    UPSTREAM = 'http://tokenrouter.omgwow.tech:8081'
+    API_KEY = os.environ['TOKENROUTER_API_KEY']
+    OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({'http': os.environ['HTTP_PROXY']}))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+      protocol_version = 'HTTP/1.1'
+
+      def forward(self):
+        length = int(self.headers.get('content-length', '0'))
+        body = self.rfile.read(length) if length else None
+        headers = {key: value for key, value in self.headers.items()
+                   if key.lower() not in {'host', 'authorization', 'connection', 'content-length'}}
+        headers['Authorization'] = f'Bearer {API_KEY}'
+        request = urllib.request.Request(UPSTREAM + self.path, body, headers, method=self.command)
+        try:
+          result = OPENER.open(request, timeout=3600)
+        except urllib.error.HTTPError as error:
+          result = error
+        except Exception as error:
+          payload = ('{"error":{"message":' + repr(str(error)) + '}}').encode()
+          self.send_response(502)
+          self.send_header('content-type', 'application/json')
+          self.send_header('content-length', str(len(payload)))
+          self.end_headers()
+          self.wfile.write(payload)
+          return
+        self.send_response(result.status)
+        for key, value in result.headers.items():
+          if key.lower() not in {'connection', 'transfer-encoding'}:
+            self.send_header(key, value)
+        self.end_headers()
+        while chunk := result.read1(16384):
+          self.wfile.write(chunk)
+          self.wfile.flush()
+
+      do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = forward
+
+    http.server.ThreadingHTTPServer(('127.0.0.1', 8081), Handler).serve_forever()
+  web.conf: |
+    server {
+      listen 8080;
+      server_name _;
+
+      auth_basic "DeepSeek Harness";
+      auth_basic_user_file /etc/nginx/secrets/htpasswd;
+
+      add_header Content-Security-Policy "frame-ancestors 'none'" always;
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      client_max_body_size 32m;
+
+      location / {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host 127.0.0.1:3080;
+        proxy_set_header Origin http://127.0.0.1:3080;
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        # randomUUID is secure-context-only in browsers. The internal HTTP
+        # endpoint still has getRandomValues, so supply the missing UUID API.
+        sub_filter_once on;
+        sub_filter '</head>' '<script>if(!crypto.randomUUID){crypto.randomUUID=()=>"10000000-1000-4000-8000-100000000000".replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16))}</script></head>';
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek-harness
+  namespace: mc-tianhai-feng
+  labels:
+    app.kubernetes.io/name: deepseek-harness
+    app.kubernetes.io/instance: omgwowai
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: deepseek-harness
+      app.kubernetes.io/instance: omgwowai
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: deepseek-harness
+        app.kubernetes.io/instance: omgwowai
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: build-pinned-source
+          image: harbor.omgwow.ai/dockerhub-cache/node:22-bookworm
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          env:
+            - name: DSH_COMMIT
+              value: 47f943859bef60e4160492346772ded9b24f765a
+            - name: HTTP_PROXY
+              value: http://192.168.0.8:3128
+            - name: HTTPS_PROXY
+              value: http://192.168.0.8:3128
+            - name: http_proxy
+              value: http://192.168.0.8:3128
+            - name: https_proxy
+              value: http://192.168.0.8:3128
+            - name: npm_config_proxy
+              value: http://192.168.0.8:3128
+            - name: npm_config_https_proxy
+              value: http://192.168.0.8:3128
+          command:
+            - /bin/bash
+            - -euc
+            - |
+              npm install --global pnpm@11.7.0
+              mkdir -p /persistent/deepseek-harness/home /persistent/deepseek-harness/workspace
+              source_dir=/persistent/deepseek-harness/source
+              if [ ! -f "$source_dir/.source-$DSH_COMMIT" ]; then
+                if [ -e "$source_dir" ]; then
+                  mv "$source_dir" "/persistent/deepseek-harness/source-incomplete-$(date +%s)"
+                fi
+                mkdir -p "$source_dir"
+                curl --fail --location --retry 4 --proxy "$HTTPS_PROXY" \
+                  "https://codeload.github.com/omgwowai/deepseek-harness/tar.gz/$DSH_COMMIT" \
+                  | tar -xz --strip-components=1 -C "$source_dir"
+                touch "$source_dir/.source-$DSH_COMMIT"
+              fi
+              cd "$source_dir"
+              if [ ! -f apps/web/dist/index.html ]; then
+                pnpm install --frozen-lockfile
+                pnpm run build
+              fi
+              pnpm --filter @deepseek-ai/dsh-subprocess-local exec node -e "require('node-pty')"
+              touch ".dsh-build-$DSH_COMMIT"
+              cp /config/settings.yaml /persistent/deepseek-harness/home/settings.yaml
+              cp /config/cordis.patch.yml /persistent/deepseek-harness/home/cordis.patch.yml
+              chown -R 1000:1000 /persistent/deepseek-harness/home /persistent/deepseek-harness/workspace
+              chmod 0700 /persistent/deepseek-harness/home /persistent/deepseek-harness/workspace
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: persistent
+              mountPath: /persistent
+            - name: config
+              mountPath: /config
+              readOnly: true
+        - name: validate-config
+          image: harbor.omgwow.ai/dockerhub-cache/nginx:1.29-alpine
+          command: ["nginx", "-t"]
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/nginx/secrets/htpasswd
+              subPath: htpasswd
+              readOnly: true
+      containers:
+        - name: harness
+          image: harbor.omgwow.ai/dockerhub-cache/node:22-bookworm
+          workingDir: /workspace
+          command: ["node", "--import", "/app/node_modules/tsx/dist/esm/index.mjs", "/app/apps/cli/src/bin.ts"]
+          args: ["web", "--trusted-host", "192.168.2.37:32185"]
+          env:
+            - name: DSH_HOME
+              value: /home/dsh
+            - name: HOME
+              value: /home/dsh
+            - name: DEEPSEEK_BASE_URL
+              value: http://127.0.0.1:8081/v1
+            - name: DEEPSEEK_API_KEY
+              value: sidecar-injects-real-credential
+            - name: NODE_ENV
+              value: production
+            - name: TSX_TSCONFIG_PATH
+              value: /app/tsconfig.json
+            # The cluster kernel exposes neither Landlock nor bubblewrap. The
+            # container remains non-root with a read-only root filesystem and
+            # no service-account token; this enables Bash inside that boundary.
+            - name: DSH_PERMISSION_MODE
+              value: danger-full-access
+          ports:
+            - name: harness
+              containerPort: 3080
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:3080/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:3080/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:3080/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: persistent
+              mountPath: /app
+              subPath: deepseek-harness/source
+              readOnly: true
+            - name: persistent
+              mountPath: /home/dsh
+              subPath: deepseek-harness/home
+            - name: persistent
+              mountPath: /workspace
+              subPath: deepseek-harness/workspace
+            - name: tmp
+              mountPath: /tmp
+        - name: gateway
+          image: harbor.omgwow.ai/dockerhub-cache/nginx:1.29-alpine
+          ports:
+            - name: web
+              containerPort: 8080
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            tcpSocket:
+              port: web
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: web
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/nginx/secrets/htpasswd
+              subPath: htpasswd
+              readOnly: true
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+        - name: llm-proxy
+          image: harbor.omgwow.ai/dockerhub-cache/node:22-bookworm
+          command: ["python3", "/config/llm-proxy.py"]
+          env:
+            - name: TOKENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepseek-harness-model-key
+                  key: tokenrouter-key
+            - name: NODE_USE_ENV_PROXY
+              value: "1"
+            - name: HTTP_PROXY
+              value: http://192.168.0.8:3128
+            - name: HTTPS_PROXY
+              value: http://192.168.0.8:3128
+            - name: NO_PROXY
+              value: localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local,kubernetes.default.svc
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            exec:
+              command: ["node", "-e", "const s=require('node:net').connect(8081,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["node", "-e", "const s=require('node:net').connect(8081,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))"]
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: persistent
+          persistentVolumeClaim:
+            claimName: ch-home
+        - name: config
+          configMap:
+            name: deepseek-harness-config
+        - name: secrets
+          secret:
+            secretName: deepseek-harness-secrets
+        - name: nginx-conf
+          projected:
+            sources:
+              - configMap:
+                  name: deepseek-harness-config
+                  items:
+                    - key: web.conf
+                      path: web.conf
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-harness
+  namespace: mc-tianhai-feng
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: deepseek-harness
+    app.kubernetes.io/instance: omgwowai
+  ports:
+    - name: http
+      port: 80
+      targetPort: web
+      nodePort: 32185
