@@ -2473,6 +2473,85 @@ export type TokenMeterConfig = Record<string, never>
 
 来源：[`packages/llm/token-meter/src/types.ts:12`](../packages/llm/token-meter/src/types.ts)
 
+<a id="deepseek-aidsh-tokenrouter-rollout"></a>
+
+## `@deepseek-ai/dsh-tokenrouter-rollout`
+
+依赖：`agents` · `subagents`
+
+```ts config-catalog
+/** Plugin configuration as written in cordis.yml; {@link resolveConfig} fills the rest. */
+export interface Config {
+  /** Master switch; the plugin is inert while false. Default false. */
+  enabled?: boolean
+  /** Parallel trajectories per rollout round. Default 3. */
+  rolloutCount?: number
+  /**
+   * SOTA judge model id on the judge endpoint. Default `claude-opus-5`;
+   * `gpt-5.6-sol` is a validated alternative.
+   */
+  judgeModel?: string
+  /**
+   * Judge endpoint base URL (OpenAI-compatible), e.g.
+   * `https://gateway.example/v1`. No default: the endpoint is a property of
+   * the deployment, not of this plugin, and a built-in one would ship a
+   * specific operator's host to every install. An enabled plugin without it
+   * fails at load.
+   */
+  judgeBaseURL?: string
+  /** API-key environment variable name for the judge endpoint. Default `DEEPSEEK_API_KEY`. */
+  judgeApiKeyEnv?: string
+  /**
+   * Worker provider route. Default `deepseek-official` (the dsh adapter the
+   * deployment already configures), so rollout uses the cheap model dsh
+   * already chose.
+   */
+  workerProvider?: string
+  /**
+   * Subagent provider that runs the workers. Default `fork`, which seeds each
+   * worker with the parent's completed-turn history so it plans against the
+   * real conversation rather than the decision line alone.
+   */
+  workerSubagentProvider?: string
+  /**
+   * Worker model pool; each trajectory picks `pool[i % pool.length]`. When
+   * empty, trajectories fall back to the triggering agent's own model.
+   */
+  workerModels?: string[]
+  /** Diversity slots; one per trajectory when non-empty (cycling). */
+  diversitySlots?: DiversitySlot[]
+  /** Timeout per worker run, ms. Default 10 minutes. */
+  workerTimeoutMs?: number
+  /** Timeout for the judge call, ms. Default 3 minutes. */
+  judgeTimeoutMs?: number
+  /** Max chars of each plan sent to the judge (keeps SOTA tokens bounded). Default 12_000. */
+  maxPlanChars?: number
+  /** Whether milestone completion auto-triggers a rollout round. Default false (follows `enabled`). */
+  autoMilestone?: boolean
+  /** Max chars of the milestone context sent to the judge/workers. Default 4_000. */
+  maxContextChars?: number
+  /** Optional judge system prompt override. */
+  judgeSystemPrompt?: string
+}
+
+/**
+ * Rollout worker diversity slot. Diversity is PROMPT-level: the harness routes
+ * a child through `AgentOptions`, which carries provider, model, and token cap
+ * but no sampling scalars, so a slot varies what the worker is asked to do
+ * rather than how the sampler behaves. A per-slot temperature would need the
+ * `agent/request` waterfall on each child; that is deferred work, and until it
+ * exists a temperature field would be accepted and silently dropped.
+ */
+export interface DiversitySlot {
+  /** Stable slot label recorded in `rollout/trajectory` and used in prompts. */
+  label: string
+  /** Extra strategy guidance appended to the worker prompt. */
+  strategy?: string
+}
+```
+
+来源：[`packages/extensions/tokenrouter-rollout/src/config.ts:27`](../packages/extensions/tokenrouter-rollout/src/config.ts)
+
 <a id="deepseek-aidsh-tool-bash"></a>
 
 ## `@deepseek-ai/dsh-tool-bash`
@@ -3103,10 +3182,17 @@ export interface Config {
   maxTokens?: number
   /** Maximum `web_search` server-tool uses per request. Defaults to 5. */
   maxUses?: number
+  /**
+   * Read the response as a Messages event stream. Defaults to `false`. Enable
+   * for an Anthropic-compatible endpoint that runs the search but returns a
+   * `web_search_tool_result` block with no `content` in the single-shot
+   * response, which surfaces as a search that reports no sources.
+   */
+  stream?: boolean
 }
 ```
 
-来源：[`packages/web/web-search-deepseek/src/index.ts:46`](../packages/web/web-search-deepseek/src/index.ts)
+来源：[`packages/web/web-search-deepseek/src/index.ts:48`](../packages/web/web-search-deepseek/src/index.ts)
 
 <a id="deepseek-aidsh-web-search-exa"></a>
 
@@ -3215,6 +3301,7 @@ export interface Config {
 - `@deepseek-ai/dsh-client-ui-plan`（[`packages/client/ui-plan/src/index.ts`](../packages/client/ui-plan/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-reference`（[`packages/client/ui-reference/src/index.ts`](../packages/client/ui-reference/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-renderer`（[`packages/client/ui-renderer/src/index.ts`](../packages/client/ui-renderer/src/index.ts)）
+- `@deepseek-ai/dsh-client-ui-rollout`（[`packages/client/ui-rollout/src/index.ts`](../packages/client/ui-rollout/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-settings`（[`packages/client/ui-settings/src/index.ts`](../packages/client/ui-settings/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-settings-general`（[`packages/client/ui-settings-general/src/index.ts`](../packages/client/ui-settings-general/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-settings-models`（[`packages/client/ui-settings-models/src/index.ts`](../packages/client/ui-settings-models/src/index.ts)）

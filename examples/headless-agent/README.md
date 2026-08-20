@@ -27,6 +27,17 @@ pnpm exec vitest run --config vitest.e2e.config.ts packages/e2b/e2b/tests/compos
 
 The overlay creates the same absolute cwd inside the sandbox, but it does not upload or mount the host workspace. File and Bash mutations exist only in E2B; Cordis, model calls, agent/session state, session logs, skills, and SDK buffers remain on the host. The composition kills its sandbox on timeout and disposal. It is a provider-composition POC, not a whole-harness migration or a workspace-sync feature.
 
+## Multimodal over an aggregating gateway
+
+[`tokenrouter-vision.cordis.yml`](tokenrouter-vision.cordis.yml) routes the agent through pi-ai to a gateway that multiplexes one OpenAI-compatible endpoint over many vendors, so images reach a vision model instead of the direct DeepSeek adapter:
+
+```sh
+DSH_TOKENROUTER_API_KEY=… node --import tsx/esm tests/fixtures/headless-driver.ts \
+  tokenrouter-vision.cordis.yml "read_image ./shot.png and describe it"
+```
+
+Because the gateway hides the vendor behind the URL, every wire fact pi-ai would otherwise infer is declared, and each model states its own `input` modalities. Those lists record verified behavior: several routes accept an image part, return HTTP 200, and answer from the text alone. `deepseek-v3.2` is declared `[text]` for that reason, which makes `read_image` refuse up front rather than let the model describe an image it never received. The [Agent Note](../../.agents/notes/implemented/feature/2026-08-20-tokenrouter-declared-modality.md) owns the rationale.
+
 ## Advanced configuration
 
 [`advanced.cordis.yml`](advanced.cordis.yml) adds Code Mode and the Cordis tools to the test composition.
