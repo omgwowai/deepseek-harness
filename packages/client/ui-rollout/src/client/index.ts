@@ -140,7 +140,9 @@ export function apply(ctx: ClientContext): void {
       adoptButton(actions)
       return {
         run: async (sid) => {
-          const result = await ctx.remote.commands.execute(sid, '/rollout')
+          // `/rollout` takes no arguments and carries no images; rc8's
+          // command envelope requires the image list explicitly.
+          const result = await ctx.remote.commands.execute(sid, '/rollout', [])
           if (!result.ok) return `${result.error.message} (${result.error.code})`
           if (result.value === undefined) return 'unknown command: /rollout'
           return null

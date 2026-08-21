@@ -113,7 +113,9 @@ describe('ui-rollout browser apply', () => {
       run: (id: SessionId) => Promise<string | null>
     }
     const failure = await face.run(SID)
-    expect(execute).toHaveBeenCalledWith(SID, '/rollout')
+    // rc8 made the image list a required parameter of the command envelope;
+    // `/rollout` takes no arguments and carries no images.
+    expect(execute).toHaveBeenCalledWith(SID, '/rollout', [])
     expect(failure).toBeNull()
   })
 
