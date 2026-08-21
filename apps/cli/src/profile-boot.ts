@@ -34,6 +34,27 @@ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 /** Shipped agent-preset root: beside this app's own config, in both source and built layouts. */
 const SHIPPED_PRESET_ROOT = fileURLToPath(new URL('../config/agent-presets/', import.meta.url))
 
+/** Shipped bundled-skill root: beside this app's own config, in both source and built layouts. */
+const SHIPPED_SKILL_ROOT = fileURLToPath(new URL('../config/skills/', import.meta.url))
+
+/**
+ * The bundled-skill root this run should mount, or `undefined` to leave the
+ * environment as it stands. The variable, not a row patch, is what carries the
+ * root: `skill-filesystem` mounts once on the host plane for headless and TUI
+ * profiles but once per agent preset under the web profile, and only an
+ * environment default reaches every one of those rows without the launcher
+ * knowing which composition it just booted.
+ *
+ * Any inherited value wins, including the empty string, which is how a
+ * deployment mounts a different root or none at all. That ranking matches
+ * `loadLayeredEnv`, where the process environment outranks every file layer.
+ * @param inherited - the raw `DSH_BUNDLED_SKILL_DIR` value (`undefined` when unset).
+ * @returns the shipped root to install, or `undefined` when the environment already decided.
+ */
+export function resolveBundledSkillRoot(inherited: string | undefined): string | undefined {
+  return inherited === undefined ? SHIPPED_SKILL_ROOT : undefined
+}
+
 import { DSH_LAUNCH_ENVIRONMENT_KEY, type LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
 import { provideCmdline } from '@deepseek-ai/dsh-cmdline'
 import { createProcessShutdown, type ProcessShutdown } from './process-shutdown.ts'
@@ -205,6 +226,8 @@ function suppressShutdownError(ctx: Context, signal: AbortSignal, error: unknown
  * @returns the settled root context and the shutdown controller.
  */
 export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Context; shutdown: ProcessShutdown }> {
+  const bundledSkillRoot = resolveBundledSkillRoot(process.env.DSH_BUNDLED_SKILL_DIR)
+  if (bundledSkillRoot !== undefined) process.env.DSH_BUNDLED_SKILL_DIR = bundledSkillRoot
   const composed = composeProfile(options.profile, options.patchFiles)
   const app: { current?: Context } = {}
   const shutdown = createProcessShutdown(async () => { await app.current?.fiber.dispose() })

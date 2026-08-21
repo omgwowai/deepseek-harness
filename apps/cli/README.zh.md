@@ -40,6 +40,12 @@ profile 目录包含一个 `package.json`，其中记录树外插件依赖，以
 
 使用 `--dump-default-config` 和 `--dump-config` 可在不启动的情况下检查组合后的配置树。
 
+## 内置 skills
+
+`config/skills/` 中的 skill 随每个 profile 一同提供。除非环境变量中已指定，否则启动器会将 `$DSH_BUNDLED_SKILL_DIR` 指向该目录，因此这个根目录既能被宿主的 `skill-filesystem` 配置行读到，也能被每个 agent preset 自己的配置行读到；已继承的值优先，部署方可借此重定向或清空该根目录。它是提供方挂载的最低优先级根目录，因此项目根目录、自定义根目录或 `$DSH_HOME/skills` 下的同名 skill 会遮蔽这份内置副本。只属于某一个 preset 的 skill 应改为放在 `config/agent-presets/<id>/skills/`，这样它会随人们编辑的那份副本一同复制。
+
+`config/skills/j-space` 引入自 [J-Space Cognition Suite V3.6](https://github.com/Tiger3807861189/J-Space-Cognition-Suite-V3.6)，遵循 Apache-2.0 许可证，其 `LICENSE` 文件随目录一同保留。更新方式为：从上游对应版本整体替换该目录、保留该文件，并运行该套件自带的检查器（`python3 apps/cli/config/skills/j-space/scripts/verify_suite.py`）。
+
 层的确切优先级、flag、关闭行为、部署默认值和源码执行方式，以 [CLI（命令行界面）行为参考](reference/README.md)为准。
 
 ## 开发
