@@ -122,6 +122,16 @@ export interface PiAiProviderProfile {
    */
   compat?: PiAiCompatProfile
   /**
+   * Merge consecutive user messages into one before the wire, applied to
+   * requests that contain images. Some gateways (notably certain regional
+   * chains behind shared routers) re-merge consecutive user turns upstream and
+   * drop image parts in the process, so a request whose image arrives beside
+   * injected context messages reaches the model without the image. Merging on
+   * this side keeps every part inside one user message the gateway cannot
+   * split. Text-only requests are unaffected.
+   */
+  mergeUserMessages?: boolean
+  /**
    * Context capacity for a model this route lists that neither the entry nor
    * the installed catalog sizes (default 262,144). A guess by construction, so
    * a deployment whose gateway serves smaller models corrects it here.
@@ -312,6 +322,7 @@ const profile = z.object({
   models: z.array(modelProfile),
   modelOverrides: z.dict(modelOverride),
   compat: compatProfile,
+  mergeUserMessages: z.boolean().default(false),
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
   defaultMaxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
   defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),
