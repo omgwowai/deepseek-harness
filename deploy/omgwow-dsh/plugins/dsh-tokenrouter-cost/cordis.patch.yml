@@ -1,0 +1,7 @@
+# dsh-tokenrouter-cost bundle patch：挂载自研计费插件。
+- insert:
+    - id: tokenrouter-cost
+      name: dsh-tokenrouter-cost
+- id: cost-meter
+  name: dsh-cost-meter
+  disabled: true

@@ -1,0 +1,441 @@
+{
+  "_note": "暂时方案：全量价格 JSON 快照（CNY/1M，源自 Token Router 控制台价格页）。cached=缓存读；cachedWrite=缓存写（缺省按缓存读价）；tiered 模型的基础档入主字段，其余档在 _tiers。Token Router 开放价格 API 后改为自动拉取。",
+  "models": {
+    "claude-fable-5": {
+      "input": 135.41,
+      "cached": 13.54,
+      "cachedWrite": 169.27,
+      "output": 677.07
+    },
+    "claude-haiku-4.5": {
+      "input": 13.54,
+      "cached": 1.35,
+      "cachedWrite": 16.93,
+      "output": 67.71
+    },
+    "claude-opus-4.5": {
+      "input": 67.71,
+      "cached": 6.77,
+      "cachedWrite": 84.63,
+      "output": 338.54
+    },
+    "claude-opus-4.6": {
+      "input": 67.71,
+      "cached": 6.77,
+      "cachedWrite": 84.63,
+      "output": 338.54
+    },
+    "claude-opus-4.7": {
+      "input": 67.71,
+      "cached": 6.77,
+      "cachedWrite": 84.63,
+      "output": 338.54
+    },
+    "claude-opus-4.8": {
+      "input": 67.71,
+      "cached": 6.77,
+      "cachedWrite": 84.63,
+      "output": 338.54
+    },
+    "claude-opus-5": {
+      "input": 67.71,
+      "cached": 6.77,
+      "cachedWrite": 84.63,
+      "output": 338.54
+    },
+    "claude-sonnet-4.5": {
+      "input": 40.62,
+      "cached": 4.06,
+      "cachedWrite": 50.78,
+      "output": 203.12
+    },
+    "claude-sonnet-4.6": {
+      "input": 40.62,
+      "cached": 4.06,
+      "cachedWrite": 50.78,
+      "output": 203.12
+    },
+    "claude-sonnet-5": {
+      "input": 27.08,
+      "cached": 2.71,
+      "cachedWrite": 33.85,
+      "output": 135.41
+    },
+    "deepseek-v3.2": {
+      "input": 2.0,
+      "cached": 0.4,
+      "cachedWrite": null,
+      "output": 3.0
+    },
+    "deepseek-v4-flash": {
+      "input": 1.0,
+      "cached": 0.02,
+      "cachedWrite": null,
+      "output": 2.0
+    },
+    "deepseek-v4-pro": {
+      "input": 3.0,
+      "cached": 0.03,
+      "cachedWrite": null,
+      "output": 6.0
+    },
+    "gemini-3-flash-preview": {
+      "input": 6.77,
+      "cached": 0.68,
+      "cachedWrite": null,
+      "output": 40.62
+    },
+    "gemini-3.1-flash-lite": {
+      "input": 3.39,
+      "cached": 0.34,
+      "cachedWrite": null,
+      "output": 20.31
+    },
+    "gemini-3.1-pro-preview": {
+      "input": 27.08,
+      "cached": 2.71,
+      "cachedWrite": null,
+      "output": 162.5,
+      "_tiers": [
+        {
+          "input": 54.17,
+          "cached": 5.42,
+          "cachedWrite": null,
+          "output": 243.75
+        }
+      ]
+    },
+    "gemini-3.5-flash": {
+      "input": 20.31,
+      "cached": 2.03,
+      "cachedWrite": null,
+      "output": 121.87
+    },
+    "glm-5": {
+      "input": 4.0,
+      "cached": 1.0,
+      "cachedWrite": null,
+      "output": 18.0,
+      "_tiers": [
+        {
+          "input": 6.0,
+          "cached": 1.5,
+          "cachedWrite": null,
+          "output": 22.0
+        }
+      ]
+    },
+    "glm-5-turbo": {
+      "input": 5.0,
+      "cached": 1.2,
+      "cachedWrite": null,
+      "output": 22.0,
+      "_tiers": [
+        {
+          "input": 7.0,
+          "cached": 1.8,
+          "cachedWrite": null,
+          "output": 26.0
+        }
+      ]
+    },
+    "glm-5.1": {
+      "input": 6.0,
+      "cached": 1.3,
+      "cachedWrite": null,
+      "output": 24.0,
+      "_tiers": [
+        {
+          "input": 8.0,
+          "cached": 2.0,
+          "cachedWrite": null,
+          "output": 28.0
+        }
+      ]
+    },
+    "glm-5.2": {
+      "input": 8.0,
+      "cached": 2.0,
+      "cachedWrite": null,
+      "output": 28.0
+    },
+    "glm-5.3": {
+      "input": 8.0,
+      "cached": 2.0,
+      "cachedWrite": null,
+      "output": 28.0
+    },
+    "glm-5v-turbo": {
+      "input": 5.0,
+      "cached": 1.2,
+      "cachedWrite": null,
+      "output": 22.0,
+      "_tiers": [
+        {
+          "input": 7.0,
+          "cached": 1.8,
+          "cachedWrite": null,
+          "output": 26.0
+        }
+      ]
+    },
+    "google.gemini-2.5-pro": {
+      "input": 16.93,
+      "cached": 1.69,
+      "cachedWrite": null,
+      "output": 135.41,
+      "_tiers": [
+        {
+          "input": 33.85,
+          "cached": 3.39,
+          "cachedWrite": null,
+          "output": 203.12
+        }
+      ]
+    },
+    "gpt-4o-mini": {
+      "input": 2.03,
+      "cached": 1.02,
+      "cachedWrite": null,
+      "output": 8.12
+    },
+    "gpt-5-mini": {
+      "input": 3.39,
+      "cached": 0.34,
+      "cachedWrite": null,
+      "output": 27.08
+    },
+    "gpt-5.4": {
+      "input": 33.85,
+      "cached": 3.39,
+      "cachedWrite": null,
+      "output": 203.12
+    },
+    "gpt-5.4-mini": {
+      "input": 10.16,
+      "cached": 1.02,
+      "cachedWrite": null,
+      "output": 60.94
+    },
+    "gpt-5.5": {
+      "input": 67.71,
+      "cached": 6.77,
+      "cachedWrite": null,
+      "output": 406.24
+    },
+    "gpt-5.6-luna": {
+      "input": 2.71,
+      "cached": 0.27,
+      "cachedWrite": 3.39,
+      "output": 16.25
+    },
+    "gpt-5.6-sol": {
+      "input": 67.45,
+      "cached": 6.75,
+      "cachedWrite": 84.32,
+      "output": 404.72
+    },
+    "gpt-5.6-terra": {
+      "input": 27.08,
+      "cached": 2.71,
+      "cachedWrite": 33.85,
+      "output": 162.5
+    },
+    "hy3": {
+      "input": 1.0,
+      "cached": 0.25,
+      "cachedWrite": null,
+      "output": 4.0
+    },
+    "hy3-preview": {
+      "input": 1.2,
+      "cached": 0.4,
+      "cachedWrite": null,
+      "output": 4.0,
+      "_tiers": [
+        {
+          "input": 1.6,
+          "cached": 0.6,
+          "cachedWrite": null,
+          "output": 6.4
+        },
+        {
+          "input": 2.0,
+          "cached": 0.8,
+          "cachedWrite": null,
+          "output": 8.0
+        }
+      ]
+    },
+    "kimi-k2.5": {
+      "input": 4.0,
+      "cached": 0.7,
+      "cachedWrite": null,
+      "output": 21.0
+    },
+    "kimi-k2.6": {
+      "input": 6.5,
+      "cached": 1.1,
+      "cachedWrite": null,
+      "output": 27.0
+    },
+    "kimi-k2.7-code": {
+      "input": 6.43,
+      "cached": 1.29,
+      "cachedWrite": null,
+      "output": 27.08
+    },
+    "kimi-k2.7-code-highspeed": {
+      "input": 12.86,
+      "cached": 2.57,
+      "cachedWrite": null,
+      "output": 54.17
+    },
+    "kimi-k3": {
+      "input": 20.0,
+      "cached": 2.0,
+      "cachedWrite": null,
+      "output": 100.0
+    },
+    "mimo-v2.5-pro": {
+      "input": 3.0,
+      "cached": 0.03,
+      "cachedWrite": null,
+      "output": 6.0
+    },
+    "minimax-m2.5": {
+      "input": 2.1,
+      "cached": 0.21,
+      "cachedWrite": null,
+      "output": 8.4
+    },
+    "minimax-m2.7": {
+      "input": 2.1,
+      "cached": 0.42,
+      "cachedWrite": null,
+      "output": 8.4
+    },
+    "minimax-m3": {
+      "input": 2.1,
+      "cached": 0.42,
+      "cachedWrite": null,
+      "output": 8.4,
+      "_tiers": [
+        {
+          "input": 4.2,
+          "cached": 0.84,
+          "cachedWrite": null,
+          "output": 16.8
+        }
+      ]
+    },
+    "qwen3.5-35b-a3b": {
+      "input": 0.95,
+      "cached": null,
+      "cachedWrite": null,
+      "output": 6.77
+    },
+    "qwen3.5-flash": {
+      "input": 0.2,
+      "cached": 0.02,
+      "cachedWrite": null,
+      "output": 2.0,
+      "_tiers": [
+        {
+          "input": 0.8,
+          "cached": 0.08,
+          "cachedWrite": null,
+          "output": 8.0
+        },
+        {
+          "input": 1.2,
+          "cached": 0.12,
+          "cachedWrite": null,
+          "output": 12.0
+        }
+      ]
+    },
+    "qwen3.5-plus": {
+      "input": 0.8,
+      "cached": 0.08,
+      "cachedWrite": null,
+      "output": 4.8,
+      "_tiers": [
+        {
+          "input": 2.0,
+          "cached": 0.2,
+          "cachedWrite": null,
+          "output": 12.0
+        },
+        {
+          "input": 4.0,
+          "cached": 0.4,
+          "cachedWrite": null,
+          "output": 24.0
+        }
+      ]
+    },
+    "qwen3.6-27b": {
+      "input": 1.9,
+      "cached": null,
+      "cachedWrite": null,
+      "output": 13.47
+    },
+    "xai.grok-3": {
+      "input": 16.93,
+      "cached": 2.71,
+      "cachedWrite": null,
+      "output": 33.85,
+      "_tiers": [
+        {
+          "input": 33.85,
+          "cached": 5.42,
+          "cachedWrite": null,
+          "output": 67.71
+        }
+      ]
+    },
+    "xai.grok-4": {
+      "input": 16.93,
+      "cached": 2.71,
+      "cachedWrite": null,
+      "output": 33.85,
+      "_tiers": [
+        {
+          "input": 33.85,
+          "cached": 5.42,
+          "cachedWrite": null,
+          "output": 67.71
+        }
+      ]
+    },
+    "xai.grok-4.20-0309-reasoning": {
+      "input": 16.93,
+      "cached": 2.71,
+      "cachedWrite": null,
+      "output": 33.85,
+      "_tiers": [
+        {
+          "input": 33.85,
+          "cached": 5.42,
+          "cachedWrite": null,
+          "output": 67.71
+        }
+      ]
+    },
+    "xai.grok-4.3": {
+      "input": 16.93,
+      "cached": 2.71,
+      "cachedWrite": null,
+      "output": 33.85,
+      "_tiers": [
+        {
+          "input": 33.85,
+          "cached": 5.42,
+          "cachedWrite": null,
+          "output": 67.71
+        }
+      ]
+    }
+  }
+}
