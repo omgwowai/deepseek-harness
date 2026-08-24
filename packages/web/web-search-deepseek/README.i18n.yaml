@@ -3,4 +3,4 @@
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write packages/web/web-search-deepseek/README.md
 README.md: e6910d4b27900305c2239b8bcdff03cee8869112
-README.zh.md: 56f49cc01ca7719c6ede223fb9d7df8174c786b0
+README.zh.md: b8d4009cbfa55acec4b970fd663bae116680cc0e

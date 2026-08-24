@@ -36,7 +36,7 @@ const view = (state: RolloutStatsState): RolloutStatsProjection => {
   return totals
 }
 
-const schema = z.object({
+const viewSchema = z.object({
   rollouts: z.number(),
   trajectories: z.number(),
   okTrajectories: z.number(),
@@ -48,6 +48,17 @@ const schema = z.object({
   manualRounds: z.number(),
   milestoneRounds: z.number(),
 })
+
+/** The unit's state schema: the view totals plus the winner-score trail. */
+const stateSchema = viewSchema.extend({
+  winnerScores: z.array(z.number()),
+})
+
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    rolloutStats: RolloutStatsState
+  }
+}
 
 /**
  * Fold one session event into the rolling stats. Pure: returns a new state
@@ -98,11 +109,11 @@ export function foldRolloutStats(state: RolloutStatsState, event: { type: string
 }
 
 /** Projection definition for `rolloutStats`, matching the unit contract. */
-export const rolloutStatsProjectionDefinition: ProjectionDefinition<'rolloutStats', RolloutStatsState> = {
+export const rolloutStatsProjectionDefinition = {
   key: 'rolloutStats',
-  schema,
+  stateSchema,
   init,
   apply: (state, event) => foldRolloutStats(state, event),
-  view,
+  wire: { viewSchema, view },
   stateVersion: 1,
-}
+} satisfies ProjectionDefinition<'rolloutStats', RolloutStatsState>
