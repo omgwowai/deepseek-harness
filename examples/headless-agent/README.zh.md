@@ -13,7 +13,7 @@
 pnpm dsh --profile headless "fix the failing test in this workspace"
 ```
 
-产品命令是 [`dsh --profile headless`](../../apps/cli/README.md)：它接受一项非空任务，创建并持久化新会话，打印最终 assistant 文本，然后退出。
+产品命令是 [`dsh --profile headless`](../../apps/cli/README.zh.md)：它接受一项非空任务，创建并持久化新会话，打印最终 assistant 文本，然后退出。
 
 快照套件通过 [`tests/fixtures/headless-driver.ts`](tests/fixtures/headless-driver.ts) 运行本目录的配置。这个未导出且仅供测试使用的进程会在结果记录之前，以 JSONL 发出规范会话事件。该事件流属于测试基础设施，不是受支持的 CLI（命令行界面）输出格式。子会话只通过父会话的工具事件和结果对外显示。
 
@@ -36,7 +36,7 @@ DSH_TOKENROUTER_API_KEY=… node --import tsx/esm tests/fixtures/headless-driver
   tokenrouter-vision.cordis.yml "read_image ./shot.png and describe it"
 ```
 
-由于网关把供应方藏在 URL 之后，pi-ai 本会推断的每一项线缆事实都改为显式声明，每个模型也各自声明其 `input` 模态。这些列表记录的是实测行为：有若干路由会接受图像部分、返回 HTTP 200，并仅凭文本作答。`deepseek-v3.2` 正因如此被声明为 `[text]`，这会让 `read_image` 提前拒绝，而不是让模型去描述它从未收到的图像。理由由该 [Agent Note](../../.agents/notes/implemented/feature/2026-08-20-tokenrouter-declared-modality.md) 记录。
+由于网关把供应方藏在 URL 之后，pi-ai 本会推断的每一项线缆事实都改为显式声明，每个模型也各自声明其 `input` 模态。这些列表记录的是实测行为：有若干路由会接受图像部分、返回 HTTP 200，并仅凭文本作答。`deepseek-v3.2` 正因如此被声明为 `[text]`，这会让 `read_image` 提前拒绝，而不是让模型去描述它从未收到的图像。理由由该 [Agent Note](../../.agents/notes/implemented/feature/2026-08-20-tokenrouter-declared-modality.zh.md) 记录。
 
 ## 高级配置
 
