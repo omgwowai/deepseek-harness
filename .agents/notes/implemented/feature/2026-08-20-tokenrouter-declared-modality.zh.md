@@ -6,7 +6,7 @@ Status: implemented
 
 ## Problem
 
-rc8 为 pi-ai 路由和[直连 DeepSeek 适配器](2026-08-19-direct-deepseek-vision-input.md)加入了图像输入，两者都从精确模型的元数据读取模态。当端点由单一供应方拥有时，这份元数据是可信的。tokenrouter 网关打破了这个前提：它用一个 OpenAI 兼容 URL 复用多家供应方，因此 pi-ai 基于 URL 的识别无法认出它，会把它当作 OpenAI 本身来寻址，从而继承错误的兼容开关，也拿不到可用的模型列表。
+rc8 为 pi-ai 路由和[直连 DeepSeek 适配器](2026-08-20-unified-image-request-pipeline.zh.md)加入了图像输入，两者都从精确模型的元数据读取模态。当端点由单一供应方拥有时，这份元数据是可信的。tokenrouter 网关打破了这个前提：它用一个 OpenAI 兼容 URL 复用多家供应方，因此 pi-ai 基于 URL 的识别无法认出它，会把它当作 OpenAI 本身来寻址，从而继承错误的兼容开关，也拿不到可用的模型列表。
 
 更难的问题是网关不上报能力。用纯文本模型发送带 `image_url` 的请求会返回 HTTP 200，并给出一段仅凭文本写成的流畅回答——图像被丢弃，没有告警、没有错误，也没有可据以判断的字段。让 `deepseek-v3.2` 说出四个色块的颜色时，它凭空编出了一个「色彩和谐轮」。因此，信任端点的组合会产出与成功识图完全一样的、语气自信的幻觉。
 
@@ -14,7 +14,7 @@ rc8 为 pi-ai 路由和[直连 DeepSeek 适配器](2026-08-19-direct-deepseek-vi
 
 `examples/headless-agent/tokenrouter-vision.cordis.yml` 把网关组合为一个 pi-ai provider，其每一项线缆事实都是声明而非推断：`api: openai-completions`、显式的 `baseURL`、`compat.supportsDeveloperRole: false` 与 `compat.maxTokensField: max_tokens`，以及逐模型的目录。凭据以引用形式给出（`apiKeyEnv: DSH_TOKENROUTER_API_KEY`），绝不内联密钥。该覆盖层关闭 `llm-deepseek`，避免直连适配器遮挡此路由，并插入 `attachment-local`——缺少它时，携带图像的请求会以 `UNSUPPORTED_CONTENT` 失败。
 
-每个模型的 `input` 列表记录的是**经实测验证**的模态，而非其宣称的模态。在这把密钥上，有六条路由会接受图像部分并静默丢弃；`deepseek-v3.2` 正因如此被声明为 `input: [text]`。路由级的 `defaultInput: [text]` 让未声明的模型保持「盲」，因此后续新增的模型会向安全侧失败。`maxRequestImageBytes: 12582912` 处于网关的请求体上限之下，也低于[请求图像上限](../bug-fix/2026-08-18-request-image-payload-bound.md)设定的 20 MiB 默认值。
+每个模型的 `input` 列表记录的是**经实测验证**的模态，而非其宣称的模态。在这把密钥上，有六条路由会接受图像部分并静默丢弃；`deepseek-v3.2` 正因如此被声明为 `input: [text]`。路由级的 `defaultInput: [text]` 让未声明的模型保持「盲」，因此后续新增的模型会向安全侧失败。`maxRequestImageBytes: 12582912` 处于网关的请求体上限之下，也低于[请求图像上限](2026-08-20-unified-image-request-pipeline.zh.md)设定的 20 MiB 默认值。
 
 声明 `[text]` 是承重的，而不是说明性的。harness 会在三个彼此独立的位置提前拒绝图像——`read_image`、MCP 工具桥接与 ACP 内容转换——报出 `model "<id>" does not declare image input`。模型根本不会收到图像块，也就无法描述它没看过的东西，于是一个静默的错误答案变成了一次可读的拒绝。
 
