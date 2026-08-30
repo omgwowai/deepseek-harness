@@ -1,0 +1,38 @@
+{
+  "name": "dsh-profile-web-8892",
+  "private": true,
+  "dependencies": {
+    "@deepseek-ai/dsh-experimental-agent-team": "file:../../plugins/dsh-agent-team",
+    "@deepseek-ai/dsh-experimental-tool-agent-team": "file:../../plugins/dsh-tool-agent-team",
+    "@dsh-external/dsh-visualize": "github:Nagi-ovo/dsh-visualize",
+    "@omdsh-dev/dsh-genui": "github:omdsh-dev/dsh-genui#1ca5da4eb9394972cce2c1ccacfedc22eec3166b",
+    "dsh-better-sidebar": "0.17.1",
+    "dsh-cost-meter": "^1.6.13",
+    "dsh-mem-watch": "file:../../plugins/dsh-mem-watch",
+    "dsh-outline": "^0.1.6",
+    "dsh-rollout-transparent": "file:../../plugins/dsh-rollout-transparent",
+    "dsh-service-hub": "file:../../plugins/dsh-service-hub",
+    "dsh-tokenrouter-cost": "file:../../plugins/dsh-tokenrouter-cost",
+    "dsh-ui-hub": "github:Han-1413141/dsh-ui-hub",
+    "dshmarket": "1.38.1"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-cost-meter",
+        "dsh-outline",
+        "@omdsh-dev/dsh-genui",
+        "@dsh-external/dsh-visualize",
+        "dsh-ui-hub",
+        "dsh-tokenrouter-cost",
+        "dsh-service-hub",
+        "dsh-rollout-transparent",
+        "dsh-mem-watch",
+        "dsh-better-sidebar",
+        "dshmarket"
+      ]
+    }
+  }
+}

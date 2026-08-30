@@ -1,0 +1,4 @@
+# dsh-rollout-transparent bundle patch：挂载无感 best-of-N 插件。
+- insert:
+    - id: rollout-transparent
+      name: dsh-rollout-transparent

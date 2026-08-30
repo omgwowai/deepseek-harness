@@ -1,0 +1,8 @@
+packages:
+  - .
+nodeLinker: hoisted
+autoInstallPeers: false
+allowBuilds:
+  node-pty: true
+patchedDependencies:
+  dsh-better-sidebar@0.17.1: patches/dsh-better-sidebar@0.17.1.patch

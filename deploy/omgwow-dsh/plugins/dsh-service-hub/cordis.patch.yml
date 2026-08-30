@@ -1,0 +1,4 @@
+# dsh-service-hub bundle patch：挂载本地服务台插件。
+- insert:
+    - id: service-hub
+      name: dsh-service-hub

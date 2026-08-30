@@ -465,4 +465,51 @@ describe('pi-ai request context conversion', () => {
     )).toThrow(/assistant image output/)
   })
 
+  it('collapses consecutive user messages when mergeUserMessages is set', async () => {
+    const context = await toPiContext(request([
+      user([
+        { type: 'image', attachment: ref },
+        { type: 'text', text: 'caption' },
+      ]),
+      user([{ type: 'text', text: 'injected context' }]),
+      history('assistant', [{ type: 'text', text: 'answer' }]),
+      user([{ type: 'text', text: 'follow-up' }]),
+      user([{ type: 'text', text: 'more context' }]),
+    ]), imageContext(attachments), undefined, true)
+
+    expect(context.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: expect.stringContaining(`Image ${ref.attachmentId}`) as string },
+          { type: 'image', data: 'AQ==', mimeType: 'image/png' },
+          { type: 'text', text: 'caption' },
+          { type: 'text', text: 'injected context' },
+        ],
+        timestamp: 0,
+      },
+      expect.objectContaining({ role: 'assistant' }),
+      { role: 'user', content: 'follow-upmore context', timestamp: 0 },
+    ])
+  })
+
+  it('keeps consecutive user messages apart when mergeUserMessages is unset', async () => {
+    const context = await toPiContext(request([
+      user([{ type: 'image', attachment: ref }, { type: 'text', text: 'caption' }]),
+      user([{ type: 'text', text: 'injected context' }]),
+    ]), imageContext(attachments))
+
+    expect(context.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: expect.stringContaining(`Image ${ref.attachmentId}`) as string },
+          { type: 'image', data: 'AQ==', mimeType: 'image/png' },
+          { type: 'text', text: 'caption' },
+        ],
+        timestamp: 0,
+      },
+      { role: 'user', content: 'injected context', timestamp: 0 },
+    ])
+  })
 })

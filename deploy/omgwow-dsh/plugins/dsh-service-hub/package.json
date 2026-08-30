@@ -1,0 +1,37 @@
+{
+  "name": "dsh-service-hub",
+  "version": "0.1.0",
+  "description": "本地服务台插件：dsh 启动/会话创建时向 hub 上报实例与会话，composer dock 一键打开本地服务台（本会话页面 / 集群任务 / 输入统计）。",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./typert": "./typert.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "typert.js",
+    "cordis.patch.yml"
+  ],
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}

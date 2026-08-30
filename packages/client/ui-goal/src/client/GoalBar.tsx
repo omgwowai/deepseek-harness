@@ -78,17 +78,19 @@ export function GoalBar({ goal, onEdit, onPause, onResume, onClear, t }: GoalBar
   if (goal === undefined || goal === null || goal.phase === 'complete' || goal.id === clearedGoalId) return null
 
   if (editing) {
+    const lines = draft.split('\n').length
+    const rows = Math.min(12, Math.max(3, lines + 1))
     return (
       <div className={css.dock} data-goal-bar>
-        <div className={css.bar}>
-          <input
+        <div className={`${css.bar} ${css.editingBar}`}>
+          <textarea
             className={css.objectiveInput}
-            type="text"
+            rows={rows}
             aria-label={t('objective.aria')}
             value={draft}
             onChange={(e) => { setDraft(e.target.value) }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void handleEdit()
+              if (e.key === 'Enter') { e.preventDefault(); void handleEdit() }
               if (e.key === 'Escape') setEditing(false)
             }}
             autoFocus

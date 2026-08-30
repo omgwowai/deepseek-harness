@@ -1,0 +1,90 @@
+# 8892 实例 profile patch（基于 omgwow-dsh 适配层；凭证经环境变量注入，不落库）。
+# OWTR_DSH_KEY / DEEPSEEK_API_KEY 由启动器从固定凭证目录注入。
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      tokenrouter:
+        displayName: Token Router
+        apiKeyEnv: OWTR_DSH_KEY
+        api: openai-completions
+        baseURL: https://tokenrouter.omgwow.tech/v1
+        mergeUserMessages: true
+        compat:
+          supportsDeveloperRole: false
+          maxTokensField: max_tokens
+          thinkingFormat: deepseek
+        models:
+          - id: claude-fable-5
+            name: Claude Fable 5
+            contextWindow: 200000
+            maxTokens: 32768
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+          - id: gpt-5.6-sol
+            name: GPT 5.6 Sol
+            contextWindow: 272000
+            maxTokens: 32768
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+            compat:
+              thinkingFormat: openai
+          - id: kimi-k3
+            name: Kimi K3
+            contextWindow: 262144
+            maxTokens: 32768
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+          - id: claude-opus-5
+            name: Claude Opus 5
+            contextWindow: 200000
+            maxTokens: 32768
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+          - id: glm-5.3
+            name: GLM 5.3
+            contextWindow: 128000
+            maxTokens: 8192
+            input: [text]
+            reasoningEfforts:
+              high: high
+          - id: deepseek-v4-pro
+            name: DeepSeek V4 Pro
+            contextWindow: 1000000
+            maxTokens: 65536
+            input: [text]
+            reasoningEfforts:
+              high: high
+              max: high
+          - id: deepseek-v4-flash
+            name: DeepSeek V4 Flash
+            contextWindow: 1000000
+            maxTokens: 65536
+            input: [text]
+            reasoningEfforts:
+              high: high
+              max: high
+
+# Host-plane 固定 skills：全局层 provider，所有 agent preset 的会话共享可见。
+- id: skill-filesystem
+  disabled: false
+  config:
+    providerName: host-skills
+    includeDefaultRoots: false
+    customSkillDirs:
+      - !!js "(process.env.DSH_SKILLS_DIR ?? (process.env.DSH_HOME ?? '/tmp/dsh-home') + '/skills')"
+    watch: true
+
+# 官方 Agent Teams（experimental，本地 vendor）：roster/信箱/任务 DAG + 模型工具。
+# 挂在 host 层：所有会话共享团队状态；成员经 spawn/fork 子代理 provider 创建。
+- insert:
+    - id: agent-team
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+    - id: tool-agent-team
+      name: '@deepseek-ai/dsh-experimental-tool-agent-team'

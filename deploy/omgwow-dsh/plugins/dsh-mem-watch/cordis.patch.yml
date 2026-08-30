@@ -1,0 +1,4 @@
+# dsh-mem-watch bundle patch：挂载 5s 级全实例内存监控插件。
+- insert:
+    - id: mem-watch
+      name: dsh-mem-watch

@@ -1,0 +1,9 @@
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+agent-default-model:
+  provider: tokenrouter
+  model: deepseek-v4-pro
+  reasoningEffort: max
+dsh-better-sidebar:
+  autoOpenSubagent: false
+  autoOpenJobs: false

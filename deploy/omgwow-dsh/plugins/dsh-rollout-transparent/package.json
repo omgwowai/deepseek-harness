@@ -1,0 +1,42 @@
+{
+  "name": "dsh-rollout-transparent",
+  "version": "0.1.5",
+  "description": "无感（model-unaware）推理期 best-of-N：拦截每个循环步骤的 llm/stream，并行 N 条 rollout，judge 选优后仅重放胜者，轨迹=每步选中者拼凑；rollout 树经 Typert 暴露到单独页面。",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./typert": "./typert.js",
+    "./verifier": "./verifier.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "typert.js",
+    "verifier.js",
+    "cordis.patch.yml"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1-rc.1"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}

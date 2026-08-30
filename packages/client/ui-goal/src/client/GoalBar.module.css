@@ -74,15 +74,29 @@
 .objectiveInput {
   flex: 1;
   min-width: 0;
-  height: 26px;
-  padding: 0 8px;
-  border: 0.5px solid var(--dsw-alias-border-l4);
+  height: auto;
+  min-height: 66px;
+  max-height: 248px;
+  resize: vertical;
+  padding: 4px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 6px;
   background: var(--dsw-alias-bg-base);
+  font: inherit;
   font-size: 13px;
   line-height: 20px;
   color: var(--dsw-alias-label-primary);
   outline: none;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.editingBar {
+  height: auto;
+  min-height: 36px;
+  align-items: flex-start;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }
 
 .objectiveInput:focus {
