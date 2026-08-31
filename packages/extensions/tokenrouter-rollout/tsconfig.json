@@ -36,6 +36,9 @@
       "path": "../../subagent/subagent"
     },
     {
+      "path": "../../todo/tool-todo"
+    },
+    {
       "path": "../../core/tools"
     },
     {

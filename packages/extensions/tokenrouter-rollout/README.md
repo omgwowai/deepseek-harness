@@ -1,12 +1,56 @@
-# dsh-tokenrouter-rollout
+---
+description: "Decision-point rollout with a SOTA judge for deployments choosing, configuring, or debugging parallel worker trajectories and judge-picked plans."
+kind: "package-reference"
+---
+
+# @deepseek-ai/dsh-tokenrouter-rollout
 
 English | [中文](README.zh.md)
 
-Decision-point rollout with a SOTA judge. At decision boundaries (a `/rollout` command, or a completed milestone with a next one pending), the plugin runs N parallel diverse trajectories on the cheap worker model — the deepseek route dsh already chose — and lets a SOTA judge model (`claude-opus-5` by default, validated alternatives include `gpt-5.6-sol`) score the plans and pick the winner. The winning plan is steered back into the agent's session as the working decision, so SOTA tokens are spent only on review, not on generation.
+## Summary
 
-The judge endpoint is not shipped: `judgeBaseURL` has no default, and an enabled plugin without one fails at load (composition) or refuses the round with a message (settings). Point it at any OpenAI-compatible gateway.
+At a decision point this plugin buys a better plan with cheap tokens: it runs N parallel diverse trajectories on the worker model the harness already routes to, has one SOTA judge score them, and steers the winning plan back into the session as the working decision. SOTA tokens are therefore spent only on review, never on generation. Trigger it manually with `/rollout` or automatically at a completed milestone that leaves a next one pending. The cost is real and multiplied — one full subagent turn per trajectory plus one judge call per round — and a round takes minutes, outliving the turn that asked for it. The judge endpoint is not shipped: `judgeBaseURL` has no default, and an enabled plugin without one fails at load (composition) or refuses the round with a message (settings). Point it at any OpenAI-compatible gateway.
 
-## Service
+## Table of Contents
+
+- [Use this package](#use-this-package)
+- [Understand the implementation](#understand-the-implementation)
+- [Further Exploration](#further-exploration)
+- [Model Experience](#model-experience)
+- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Dev Note](#dev-note)
+
+-----
+
+<a id="use-this-package"></a>
+## Use this package
+
+Mount the plugin, point `judgeBaseURL` at an OpenAI-compatible gateway, and set `enabled: true`; users then reach a round through `/rollout`, or through the Web button when `@deepseek-ai/dsh-client-ui-rollout` is composed too.
+
+### When to choose it
+
+Choose it when plan quality at a decision point is worth minutes of latency and `rolloutCount` extra worker turns, and when a SOTA endpoint is available for review. Leave it disabled for latency-sensitive or cost-capped deployments: the plugin is inert while `enabled: false`, and the ordinary agent loop already plans on the routed model. `autoMilestone` is the aggressive setting — it spends a round at every milestone boundary without asking.
+
+### Minimal configuration
+
+```yaml
+- name: '@deepseek-ai/dsh-tokenrouter-rollout'
+  config:
+    enabled: true
+    judgeBaseURL: 'https://your-gateway.example/v1'
+```
+
+The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-tokenrouter-rollout) is the exhaustive source for every accepted field.
+
+-----
+
+<a id="understand-the-implementation"></a>
+## Understand the implementation
+
+<details>
+<summary>Implementation internals — click to expand</summary>
+
+### Service
 
 `ctx.tokenRouterRollout` — one `TokenRouterRollout` service owning the round lifetime.
 
@@ -18,7 +62,7 @@ The judge endpoint is not shipped: `judgeBaseURL` has no default, and an enabled
 
 A round outlives the turn that asked for it, so both triggers pass `roundSignal` rather than the caller's signal — a UI request's signal aborts when its response closes, which is before the first worker has answered.
 
-## Events
+### Events
 
 | Session event | Payload | When |
 |---|---|---|
@@ -27,16 +71,16 @@ A round outlives the turn that asked for it, so both triggers pass `roundSignal`
 | `rollout/selected` | `{ best, judgeModel, scores[], judgeOutputTokens? }` | The judge picked a winner. |
 | `rollout/error` | `{ trigger, reason }` | The round failed before selection. |
 
-## Projection
+### Projection
 
 `rolloutStats` (registered through the session-projection seam when composed): whole-log rounds, trajectories, winner scores, and worker/judge token figures — the data behind the session-details stats panel.
 
-## Extension points
+### Extension points
 
 - `ctx.commands` `/rollout` — manual trigger (UI button and slash command).
 - `session/event` `todo/write` — milestone boundary detection (auto trigger when a completed milestone leaves a pending next one). The feed is global, so the watcher ignores sessions whose header records `origin: 'subagent'`; without that a round's own workers would spawn further rounds.
 
-## Configuration
+### Configuration
 
 All fields optional except `judgeBaseURL` once enabled; the plugin is inert while `enabled: false`.
 
@@ -62,6 +106,24 @@ Diversity is prompt-level. A child is routed through `AgentOptions`, which carri
 
 The settings section (`tokenrouter-rollout`) owns `enabled`, `rolloutCount`, `judgeModel`, `judgeBaseURL`, `workerModels`, and `autoMilestone`. An empty `judgeBaseURL` in the section leaves the composition's value standing, so a deployment that supplies an endpoint is not cleared by a user who never set one.
 
+</details>
+
+-----
+
+<a id="further-exploration"></a>
+## Further Exploration
+
+Read these pages when the rollout round itself is not the whole question. They move from this plugin to the surfaces, the delegation seam, and the projection seam it builds on.
+
+- [dsh-client-ui-rollout](../../client/ui-rollout/README.md) — the Web button, settings page, and stats footer over this plugin.
+- [dsh-subagent](../../subagent/subagent/README.md) — the delegation seam that runs each worker trajectory.
+- [dsh-session-projection](../../session/session-projection/README.md) — the seam the `rolloutStats` unit registers through.
+- [dsh-tool-todo](../../todo/tool-todo/README.md) — owns the `todo/write` event the milestone watcher reads.
+- [Configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-tokenrouter-rollout) — every accepted config field.
+
+-----
+
+<a id="model-experience"></a>
 ## Model Experience
 
 ### Worker planning prompt (per trajectory)
@@ -127,8 +189,23 @@ Append-only: the message lands at the end of the conversation, so the already-ca
 
 ## Known Limitations and Deferred Work
 
+<a id="known-limitations-and-deferred-work"></a>
+
+
+These limits define the current rollout round. They are current package constraints, not a comparison with other planning strategies or a task backlog.
+
 - **A round survives its trigger but not a reload** — rounds are cancelled only by plugin disposal, so a `/rollout` continues after the dispatching UI request closes; there is no way to cancel one round without unloading the plugin, and a round in flight when the process exits is lost.
 - **Worker plans are not persisted in full** — only summaries and scores land in the session log; the full winning plan is delivered through the steered user message (which is logged), while losing plans exist only in worker sessions.
 - **Single judge with one retry, no ensemble** — a second judge model or majority voting is deferred work; the judge call is the only SOTA-token spend per round, and a double failure degrades to deterministic selection (longest complete plan among `ok` trajectories).
 - **Milestone detection keys on `todo/write` status diffs** — a milestone completed by a write that also marks the final todo completed (no pending next) does not trigger, by design; the recent-work-trail context is capped to the last three assistant outputs.
 - **Diversity cannot vary sampling** — per-trajectory temperature would need the `agent/request` waterfall on each child; until that exists, slots differ only by prompt strategy.
+
+<a id="dev-note"></a>
+### Dev Note
+
+<details>
+<summary>Working context for maintainers — click to expand</summary>
+
+None.
+
+</details>

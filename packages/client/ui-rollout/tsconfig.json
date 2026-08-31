@@ -15,22 +15,31 @@
       "path": "../../../vendor/cordis"
     },
     {
-      "path": "../runtime"
+      "path": "../locale"
     },
     {
-      "path": "../locale"
+      "path": "../store"
+    },
+    {
+      "path": "../ui-chat"
     },
     {
       "path": "../ui-conversation"
     },
     {
-      "path": "../ui-primitives"
+      "path": "../ui-renderer"
+    },
+    {
+      "path": "../ui-session"
     },
     {
       "path": "../ui-settings"
     },
     {
       "path": "../ui-slots"
+    },
+    {
+      "path": "../../core/session"
     },
     {
       "path": "../../extensions/tokenrouter-rollout"
