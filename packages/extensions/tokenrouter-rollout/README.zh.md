@@ -1,12 +1,56 @@
-# dsh-tokenrouter-rollout
+---
+description: "带 SOTA judge 的决策点 rollout，面向选型、配置或排查并行 worker trajectory 与 judge 选定方案的部署。"
+kind: "package-reference"
+---
+
+# @deepseek-ai/dsh-tokenrouter-rollout
 
 [English](README.md) | 中文
 
-决策点 rollout 加 SOTA judge。在决策边界（`/rollout` 命令，或某个 milestone 完成且还有下一个待办时），本插件在廉价 worker 模型——dsh 已经选定的 deepseek 路由——上并行跑 N 条多样化 trajectory，再让 SOTA judge 模型（默认 `claude-opus-5`，已验证的备选包括 `gpt-5.6-sol`）给这些方案打分并挑出胜者。获胜方案经 steering（中途引导）回到 agent（智能体）会话中作为工作决策，因此 SOTA token 只花在评审上，不花在生成上。
+## 概述
 
-judge 端点不随包发布：`judgeBaseURL` 没有默认值，已启用却缺少该值的插件会在加载时失败（组合方式）或以一条消息拒绝该轮（设置方式）。把它指向任意 OpenAI 兼容网关即可。
+在决策点上，本插件用廉价 token 换取更好的方案：它在 harness 已经路由到的 worker 模型上并行跑 N 条多样化 trajectory，由一个 SOTA judge 打分，再把获胜方案经 steering（中途引导）送回会话作为工作决策。因此 SOTA token 只花在评审上，绝不花在生成上。触发方式有两种：手动执行 `/rollout`，或在某个 milestone 完成且还有下一个待办时自动触发。代价是真实且成倍的——每条 trajectory 一整个 subagent 轮次，每轮再加一次 judge 调用——而且一轮要几分钟，会活得比请求它的那个轮次更久。judge 端点不随包发布：`judgeBaseURL` 没有默认值，已启用却缺少该值的插件会在加载时失败（组合方式）或以一条消息拒绝该轮（设置方式）。把它指向任意 OpenAI 兼容网关即可。
 
-## 服务
+## 目录
+
+- [使用本包](#use-this-package)
+- [理解实现](#understand-the-implementation)
+- [延伸阅读](#further-exploration)
+- [模型体验](#model-experience)
+- [已知限制与暂缓事项](#known-limitations-and-deferred-work)
+- [开发备注](#dev-note)
+
+-----
+
+<a id="use-this-package"></a>
+## 使用本包
+
+挂载本插件，把 `judgeBaseURL` 指向一个 OpenAI 兼容网关，再设 `enabled: true`；此后用户即可通过 `/rollout` 发起一轮，若同时组合了 `@deepseek-ai/dsh-client-ui-rollout`，也可以通过 Web 按钮发起。
+
+### 何时选用
+
+当决策点上的方案质量值得用几分钟延迟和 `rolloutCount` 个额外 worker 轮次去换，且手上有可用于评审的 SOTA 端点时选用它。对延迟敏感或有成本上限的部署请保持关闭：`enabled: false` 期间插件不产生任何作用，而普通 agent 循环本就会在已路由的模型上做规划。`autoMilestone` 是其中较激进的一项——它会在每个 milestone 边界上不加询问地花掉一轮。
+
+### 最小配置
+
+```yaml
+- name: '@deepseek-ai/dsh-tokenrouter-rollout'
+  config:
+    enabled: true
+    judgeBaseURL: 'https://your-gateway.example/v1'
+```
+
+生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tokenrouter-rollout)是全部可接受字段的完整来源。
+
+-----
+
+<a id="understand-the-implementation"></a>
+## 理解实现
+
+<details>
+<summary>实现内部细节——点击展开</summary>
+
+### 服务
 
 `ctx.tokenRouterRollout` —— 一个 `TokenRouterRollout` 服务，拥有轮次生命周期。
 
@@ -18,7 +62,7 @@ judge 端点不随包发布：`judgeBaseURL` 没有默认值，已启用却缺�
 
 一轮的存活时间长于发起它的那个轮次，因此两种触发方式都传 `roundSignal` 而非调用方的信号——UI 请求的信号在响应关闭时就会中止，那时第一个 worker 还没给出答复。
 
-## 事件
+### 事件
 
 | 会话事件 | 载荷 | 触发时机 |
 |---|---|---|
@@ -27,16 +71,16 @@ judge 端点不随包发布：`judgeBaseURL` 没有默认值，已启用却缺�
 | `rollout/selected` | `{ best, judgeModel, scores[], judgeOutputTokens? }` | judge 已选出胜者。 |
 | `rollout/error` | `{ trigger, reason }` | 该轮在选出胜者前失败。 |
 
-## 投影
+### 投影
 
 `rolloutStats`（组合时经会话投影 seam 注册）：全日志范围的轮数、trajectory、胜者分数，以及 worker 与 judge 的 token 数字——会话详情统计面板背后的数据。
 
-## 扩展点
+### 扩展点
 
 - `ctx.commands` `/rollout` —— 手动触发（UI 按钮与斜杠命令）。
 - `session/event` `todo/write` —— milestone 边界检测（某个 milestone 完成且留有待办的下一项时自动触发）。该事件流是全局的，因此 watcher 会忽略 header 中记录 `origin: 'subagent'` 的会话；没有这道判断，一轮自己的 worker 会再派生出新的轮次。
 
-## 配置
+### 配置
 
 启用之后除 `judgeBaseURL` 外全部可选；`enabled: false` 期间插件不产生任何作用。
 
@@ -62,6 +106,24 @@ judge 端点不随包发布：`judgeBaseURL` 没有默认值，已启用却缺�
 
 设置分节（`tokenrouter-rollout`）拥有 `enabled`、`rolloutCount`、`judgeModel`、`judgeBaseURL`、`workerModels` 和 `autoMilestone`。分节里 `judgeBaseURL` 为空时保留组合中已有的值，因此已提供端点的部署不会被从未设置过该项的用户清空。
 
+</details>
+
+-----
+
+<a id="further-exploration"></a>
+## 延伸阅读
+
+当问题不止于 rollout 轮次本身时阅读以下页面。它们从本插件走向各处界面、委派 seam（能力接缝）以及它所依赖的投影 seam。
+
+- [dsh-client-ui-rollout](../../client/ui-rollout/README.zh.md) —— 建立在本插件之上的 Web 按钮、设置页与统计底栏。
+- [dsh-subagent](../../subagent/subagent/README.zh.md) —— 运行每条 worker trajectory 的委派 seam。
+- [dsh-session-projection](../../session/session-projection/README.zh.md) —— `rolloutStats` 单元所注册的 seam。
+- [dsh-tool-todo](../../todo/tool-todo/README.zh.md) —— 拥有 milestone 侦测所读取的 `todo/write` 事件。
+- [配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-tokenrouter-rollout) —— 全部可接受的配置字段。
+
+-----
+
+<a id="model-experience"></a>
 ## 模型体验
 
 ### worker 规划提示词（每条 trajectory）
@@ -127,8 +189,23 @@ You are a senior engineering evaluator. Given a task and candidate plans, score 
 
 ## 已知限制与暂缓事项
 
+<a id="known-limitations-and-deferred-work"></a>
+
+
+以下限制界定了当前的 rollout 轮次。它们是本包当下的约束，既不是与其他规划策略的横向对比，也不是任务待办清单。
+
 - **一轮能活过它的触发者，但活不过一次重载** —— 轮次只由插件卸载取消，因此 `/rollout` 在派发它的 UI 请求关闭之后仍继续；没有办法在不卸载插件的前提下取消单独一轮，进程退出时进行中的轮次也就丢失了。
 - **worker 方案不会完整持久化** —— 只有摘要与分数落入会话日志；获胜方案全文经被送入的 user 消息投递（该消息会记录），落败方案则只存在于 worker 会话中。
 - **单 judge 加一次重试，没有集成投票** —— 第二个 judge 模型或多数投票属于暂缓事项；judge 调用是每轮唯一的 SOTA token 开销，两次都失败则退化为确定性选择（在 `ok` trajectory 中取最长的完整方案）。
 - **milestone 检测依据 `todo/write` 的状态差分** —— 某次写入在完成一个 milestone 的同时也把最后一项 todo 标记为完成（没有待办的下一项）时不会触发，这是有意为之；最近工作轨迹的上下文上限为最近三条 assistant 输出。
 - **多样化无法改变采样** —— 每条 trajectory 各自的 temperature 需要在每个子级上走 `agent/request` waterfall（瀑布式事件）；在那之前，slot 之间只有提示词策略的差别。
+
+<a id="dev-note"></a>
+### 开发备注
+
+<details>
+<summary>维护者工作上下文——点击展开</summary>
+
+无。
+
+</details>

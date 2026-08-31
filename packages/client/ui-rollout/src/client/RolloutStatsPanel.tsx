@@ -1,12 +1,14 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-// Type-only: pulls the sessionStats-style projection merge for useProjection.
+// Type-only: merges the session standard kit (useProjection) into the slot props.
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+// Type-only: merges the rolloutStats key into SessionProjectionMap for useProjection.
 import type {} from '@deepseek-ai/dsh-tokenrouter-rollout/types'
 import type { RolloutKey } from './locales.ts'
 import css from './RolloutStatsPanel.module.css'
 
 /** Full stats-panel props: the standard kit's useProjection seat + locale. */
 export type RolloutStatsPanelProps =
-  PropsRuntime<'details'> & PropsLocale<'rollout'>
+  PropsRuntime<'conversation.details.footer'> & PropsLocale<'rollout'>
 
 /**
  * Session-details readout of the `rolloutStats` projection. Renders nothing

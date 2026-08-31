@@ -17,10 +17,12 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-projection'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-subagent'
+// Type-only: pulls the 'todo/write' SessionEventMap declaration the milestone watcher reads.
+import type {} from '@deepseek-ai/dsh-tool-todo'
 import { DEFAULT_DIVERSITY_SLOTS, resolveConfig } from './config.ts'
 import type { Config, ResolvedConfig } from './config.ts'
 import { runRollout, type RolloutResult } from './rollout.ts'
@@ -41,7 +43,7 @@ export { judge, JudgeError } from './judge.ts'
 export type { JudgeVerdict } from './judge.ts'
 export { rolloutStatsProjectionDefinition, foldRolloutStats } from './stats.ts'
 
-const NS = settingsNamespace('tokenrouter-rollout')
+const NS = 'tokenrouter-rollout'
 
 /** Settings section shape: a strict subset of the plugin config a user owns. */
 export interface TokenRouterRolloutSettings {
@@ -182,28 +184,30 @@ export class TokenRouterRollout extends Service {
     this.liveConfig = resolved
 
     // Settings section: user-owned fields overlay the composition entry.
-    installSettingsSection(ctx, NS, TOKEN_ROUTER_ROLLOUT_SETTINGS_SCHEMA, {
-      enabled: resolved.enabled,
-      rolloutCount: resolved.rolloutCount,
-      judgeModel: resolved.judgeModel,
-      judgeBaseURL: resolved.judgeBaseURL,
-      workerModels: resolved.workerModels,
-      autoMilestone: resolved.autoMilestone,
-    }, {
-      setSource: (source) => {
-        const section = source()
-        this.liveConfig = Object.assign({}, this.liveConfig, {
-          enabled: section.enabled,
-          rolloutCount: section.rolloutCount,
-          judgeModel: section.judgeModel,
-          // An empty section value means the user never set an endpoint; the
-          // composition's value (when the deployment supplied one) stands.
-          ...section.judgeBaseURL.trim() === '' ? {} : { judgeBaseURL: section.judgeBaseURL },
-          workerModels: section.workerModels,
-          autoMilestone: section.autoMilestone,
-        })
-      },
-      onChange: () => {},
+    ctx.inject(['settings'], (settingsCtx) => {
+      settingsCtx.settings.installSection(ctx, NS, TOKEN_ROUTER_ROLLOUT_SETTINGS_SCHEMA, {
+        enabled: resolved.enabled,
+        rolloutCount: resolved.rolloutCount,
+        judgeModel: resolved.judgeModel,
+        judgeBaseURL: resolved.judgeBaseURL,
+        workerModels: resolved.workerModels,
+        autoMilestone: resolved.autoMilestone,
+      }, {
+        setSource: (source) => {
+          const section = source()
+          this.liveConfig = Object.assign({}, this.liveConfig, {
+            enabled: section.enabled,
+            rolloutCount: section.rolloutCount,
+            judgeModel: section.judgeModel,
+            // An empty section value means the user never set an endpoint; the
+            // composition's value (when the deployment supplied one) stands.
+            ...section.judgeBaseURL.trim() === '' ? {} : { judgeBaseURL: section.judgeBaseURL },
+            workerModels: section.workerModels,
+            autoMilestone: section.autoMilestone,
+          })
+        },
+        onChange: () => {},
+      })
     })
 
     // The /rollout command: manual trigger from the UI or a human.

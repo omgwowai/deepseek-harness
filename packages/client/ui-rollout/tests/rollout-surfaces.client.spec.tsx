@@ -7,7 +7,8 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { createSnapshotStore, type SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
 import type { RolloutStatsProjection } from '@deepseek-ai/dsh-tokenrouter-rollout/types'
 import { RolloutButton, type RolloutButtonProps } from '../src/client/RolloutButton.tsx'
@@ -64,9 +65,11 @@ describe('RolloutButton', () => {
     expect(trigger().disabled).toBe(true)
     fireEvent.click(trigger())
     expect(run).toHaveBeenCalledTimes(1)
+    expect(trigger().textContent).toBe(zh['button.running'])
     resolve(null)
     await waitFor(() => { expect(trigger().disabled).toBe(false) })
-    expect(screen.queryByRole('status')).toBeNull()
+    expect(trigger().textContent).toBe(zh['button.label'])
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('surfaces admission and transport failures', async () => {
@@ -76,7 +79,7 @@ describe('RolloutButton', () => {
       .mockRejectedValueOnce('raw reason')
     mountButton(true, run as RolloutButtonProps['run'])
     fireEvent.click(trigger())
-    expect((await screen.findByText('rollout failed')).getAttribute('title')).toBe('unknown command: /rollout')
+    expect((await screen.findByText(zh['button.error'])).getAttribute('title')).toBe('unknown command: /rollout')
 
     fireEvent.click(trigger())
     expect(await screen.findByTitle('socket closed')).toBeTruthy()

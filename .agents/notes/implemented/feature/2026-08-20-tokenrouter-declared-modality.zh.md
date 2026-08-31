@@ -12,7 +12,7 @@ rc8 为 pi-ai 路由和[直连 DeepSeek 适配器](2026-08-20-unified-image-requ
 
 ## Decision
 
-`examples/headless-agent/tokenrouter-vision.cordis.yml` 把网关组合为一个 pi-ai provider，其每一项线缆事实都是声明而非推断：`api: openai-completions`、显式的 `baseURL`、`compat.supportsDeveloperRole: false` 与 `compat.maxTokensField: max_tokens`，以及逐模型的目录。凭据以引用形式给出（`apiKeyEnv: DSH_TOKENROUTER_API_KEY`），绝不内联密钥。该覆盖层关闭 `llm-deepseek`，避免直连适配器遮挡此路由，并插入 `attachment-local`——缺少它时，携带图像的请求会以 `UNSUPPORTED_CONTENT` 失败。
+`apps/cli/config/examples/tokenrouter-vision/cordis.yml` 把网关组合为一个 pi-ai provider，其每一项线缆事实都是声明而非推断：`api: openai-completions`、显式的 `baseURL`、`compat.supportsDeveloperRole: false` 与 `compat.maxTokensField: max_tokens`，以及逐模型的目录。凭据以引用形式给出（`apiKeyEnv: DSH_TOKENROUTER_API_KEY`），绝不内联密钥。出厂组合已经以休眠方式挂载 `llm-pi-ai` 与 `attachment-local`，因此该覆盖层只需提供唤醒此路由的 provider 配置，并重新指向 `agent-default-model`；缺少这个持久化图像后端时，携带图像的请求会以 `UNSUPPORTED_CONTENT` 失败。调用方式由[用户指南](../../../../docs/user/guide/tokenrouter-vision.zh.md)负责说明。
 
 每个模型的 `input` 列表记录的是**经实测验证**的模态，而非其宣称的模态。在这把密钥上，有六条路由会接受图像部分并静默丢弃；`deepseek-v3.2` 正因如此被声明为 `input: [text]`。路由级的 `defaultInput: [text]` 让未声明的模型保持「盲」，因此后续新增的模型会向安全侧失败。`maxRequestImageBytes: 12582912` 处于网关的请求体上限之下，也低于[请求图像上限](2026-08-20-unified-image-request-pipeline.zh.md)设定的 20 MiB 默认值。
 

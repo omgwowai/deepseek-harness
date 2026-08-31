@@ -4,7 +4,9 @@
 export const zh = {
   'button.aria': '运行 rollout：并行生成多份方案并由 SOTA 模型评审',
   'button.title': 'Rollout — 并行生成多份方案，SOTA 评审选优（/rollout）',
+  'button.label': 'Rollout',
   'button.running': 'rollout 进行中…',
+  'button.error': 'rollout 失败',
   'settings.section.title': 'TokenRouter Rollout',
   'settings.enabled.label': '启用 rollout',
   'settings.enabled.desc': '在规划/里程碑决策点并行生成多样方案，用 SOTA 模型评审选优（默认关闭）',
@@ -35,7 +37,9 @@ export type RolloutKey = keyof typeof zh
 export const en = {
   'button.aria': 'Run rollout: generate diverse plans in parallel and let a SOTA model judge them',
   'button.title': 'Rollout — parallel diverse plans, SOTA judge picks the best (/rollout)',
+  'button.label': 'Rollout',
   'button.running': 'rollout in progress…',
+  'button.error': 'rollout failed',
   'settings.section.title': 'TokenRouter Rollout',
   'settings.enabled.label': 'Enable rollout',
   'settings.enabled.desc': 'At plan/milestone decision points, generate diverse plans in parallel and pick the best with a SOTA judge (off by default)',

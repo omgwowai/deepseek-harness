@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write docs/user/guide/tokenrouter-vision.md
+tokenrouter-vision.md: e88f0cd316e9efc710154b179d9cff75fac77d4b
+tokenrouter-vision.zh.md: efff44210a90ce1ee3498cc6e2fdc16842fe123f

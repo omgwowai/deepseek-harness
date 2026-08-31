@@ -58,10 +58,11 @@ export function RolloutButton({ sessionId, useStore, run, t }: RolloutButtonProp
         disabled={!enabled || running}
         onClick={start}
       >
-        Rollout
+        {t((running ? 'button.running' : 'button.label') satisfies RolloutKey)}
       </button>
-      {/* Failure copy stays English (error-surface policy: not localized). */}
-      {error !== null && <span className={css.error} role="status" title={error}>rollout failed</span>}
+      {/* The provider's failure detail stays verbatim in `title`; only the label is localized. */}
+      {error !== null
+        && <span className={css.error} role="alert" title={error}>{t('button.error' satisfies RolloutKey)}</span>}
     </span>
   )
 }

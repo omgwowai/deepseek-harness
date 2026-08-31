@@ -6,13 +6,16 @@
  * the settings page owns the section and writes through the scope; the stats
  * footer renders the `rolloutStats` projection.
  */
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
-import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { BoundActions } from '@deepseek-ai/dsh-client-ui-slots'
+// Type-only: pulls the slot registry's Context merge (ctx.slots).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls the ui-conversation SlotMap merge (input.right, composer.dock).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-// Type-only: pulls the ui-layout SlotMap merge (details slot props).
-import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
+// Type-only: pulls the Chat target's SlotMap merge (conversation.details.footer).
+import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 // Type-only: pulls the settings slot declarations.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
