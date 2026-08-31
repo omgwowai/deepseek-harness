@@ -1,8 +1,10 @@
 # Multimodal image input over an OpenAI-compatible gateway (tokenrouter), using
-# rc8's pi-ai vision surface. Run it with an image on the prompt:
+# rc8's pi-ai vision surface. A leaf config is not a profile, so it is run
+# through the example driver rather than `dsh --profile`:
 #
-#   DSH_TOKENROUTER_API_KEY=... pnpm dsh --config \
-#     examples/headless-agent/tokenrouter-vision.cordis.yml "what is in @./shot.png"
+#   cd examples/headless-agent
+#   DSH_TOKENROUTER_API_KEY=... node --import tsx/esm tests/fixtures/headless-driver.ts \
+#     tokenrouter-vision.cordis.yml "read_image ./shot.png and describe it"
 #
 # The gateway multiplexes one OpenAI-compatible endpoint over many vendors, so
 # pi-ai's URL-derived detection cannot recognize it and would address it as
@@ -84,7 +86,34 @@
                   # not the advertised one. Re-verify before adding a model;
                   # `deepseek-v3.2`, `deepseek-v4-flash`, `glm-5`, `glm-5.1`,
                   # `glm-5.2`, and `hy3` are the known silent droppers.
+                  #
+                  # The DeepSeek V4 Flash family is three distinct ids and only
+                  # one of them sees: re-probed 2026-08-27, `-vision-exp`
+                  # answered the quadrant order correctly on 3 of 3 attempts,
+                  # while bare `deepseek-v4-flash` and `-flash-preview` both
+                  # reasoned that no image was provided. Do not widen the
+                  # sibling entries to `[text, image]` on the family name.
                   models:
+                    - id: deepseek-v4-flash-vision-exp
+                      name: DeepSeek V4 Flash Vision (experimental)
+                      # The gateway discloses no capacities and enforces no
+                      # context limit of its own: 900k prompt tokens were
+                      # accepted on 2026-08-27, so this is pi-ai's own figure
+                      # for the V4 Flash family rather than a probed ceiling.
+                      contextWindow: 1000000
+                      maxTokens: 32768
+                      input: [text, image]
+                      # A reasoning model whose thinking is separately
+                      # controllable: `off` sends deepseek's explicit
+                      # `thinking: {type: disabled}`, verified to return empty
+                      # `reasoning_content`, and each named level was accepted
+                      # with reasoning present.
+                      reasoningEfforts:
+                        off:
+                        minimal: minimal
+                        low: low
+                        medium: medium
+                        high: high
                     - id: claude-opus-5
                       name: Claude Opus 5
                       contextWindow: 200000
@@ -124,6 +153,21 @@
                       contextWindow: 128000
                       maxTokens: 32768
                       input: [text]
+                    # The vision model's siblings, declared blind on purpose:
+                    # both accept an image part and discard it, so `[text]`
+                    # turns a plausible invented description into a refusal
+                    # naming the model. They are listed rather than omitted
+                    # because their ids differ from the vision one by a suffix.
+                    - id: deepseek-v4-flash
+                      name: DeepSeek V4 Flash (text only)
+                      contextWindow: 1000000
+                      maxTokens: 32768
+                      input: [text]
+                    - id: deepseek-v4-flash-preview
+                      name: DeepSeek V4 Flash Preview (text only)
+                      contextWindow: 1000000
+                      maxTokens: 32768
+                      input: [text]
 
       # Point the agent at the gateway's vision route. A config patch replaces
       # the entry's config rather than merging into it, so the base entry's
@@ -134,7 +178,7 @@
           agents:
             - id: main
               provider: tokenrouter
-              model: claude-opus-5
+              model: deepseek-v4-flash-vision-exp
               cwd: !!js process.cwd()
           workspaceContext:
             maxBytes: 65536

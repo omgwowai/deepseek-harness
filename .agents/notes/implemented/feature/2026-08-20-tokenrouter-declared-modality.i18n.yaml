@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-08-20-tokenrouter-declared-modality.md
-2026-08-20-tokenrouter-declared-modality.md: 4138d6c195270d4f583394c20a99920966898324
-2026-08-20-tokenrouter-declared-modality.zh.md: 27d648ae31379ae950aa53eedd6d41597094d542
+2026-08-20-tokenrouter-declared-modality.md: f3e2f58aaeeb090302c5b80fe7bc29fd7d0da14e
+2026-08-20-tokenrouter-declared-modality.zh.md: ddb383a2c9bc983aebae0ba189640ef11c07593c

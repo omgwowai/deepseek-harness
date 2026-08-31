@@ -16,6 +16,8 @@ rc8 为 pi-ai 路由和[直连 DeepSeek 适配器](2026-08-20-unified-image-requ
 
 每个模型的 `input` 列表记录的是**经实测验证**的模态，而非其宣称的模态。在这把密钥上，有六条路由会接受图像部分并静默丢弃；`deepseek-v3.2` 正因如此被声明为 `input: [text]`。路由级的 `defaultInput: [text]` 让未声明的模型保持「盲」，因此后续新增的模型会向安全侧失败。`maxRequestImageBytes: 12582912` 处于网关的请求体上限之下，也低于[请求图像上限](2026-08-20-unified-image-request-pipeline.zh.md)设定的 20 MiB 默认值。
 
+2026-08-27 的一次重新探测把 `deepseek-v4-flash-vision-exp` 加入目录，并将其设为该组合的默认代理模型；它正是「按系列名推断」这一陷阱所针对的情形：网关提供三个 V4 Flash id，只有带 `-vision-exp` 后缀的那个能看见。它在 3 次尝试中 3 次答对色块顺序，在 SSE 流式下同样输出这些 token，并能返回工具调用；而裸 `deepseek-v4-flash` 与 `deepseek-v4-flash-preview` 都在推理中表示没有收到图像。因此两个同系列 id 被显式列为 `input: [text]` 而非省略，让误取较短 id 的读者得到一条点名该模型的拒绝，而不是一次路由级默认值的猜测。其 `contextWindow` 取 pi-ai 目录对该系列给出的 1,000,000，而非探测所得的上限：网关自身不施加长度限制（90 万 prompt token 被接受，再往上一档失败于 TPM 配额而非长度），因此没有探测能够确立这个上限。
+
 声明 `[text]` 是承重的，而不是说明性的。harness 会在三个彼此独立的位置提前拒绝图像——`read_image`、MCP 工具桥接与 ACP 内容转换——报出 `model "<id>" does not declare image input`。模型根本不会收到图像块，也就无法描述它没看过的东西，于是一个静默的错误答案变成了一次可读的拒绝。
 
 验证这类声明需要一个无法靠猜命中的探针。单色图像会让「盲」模型凭说出一个合理颜色而通过；这里的夹具是一张四象限 PNG，其颜色与顺序都难以凭运气猜对。
