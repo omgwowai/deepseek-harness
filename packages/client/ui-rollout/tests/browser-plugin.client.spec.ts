@@ -1,12 +1,15 @@
 // @vitest-environment jsdom
 /**
  * ui-rollout browser half: the composer button executes /rollout through the
- * command channel, the settings page binds the settings scope, and the stats
- * footer reads the rolloutStats projection. Node-half apply is a no-op.
+ * command channel and the settings page binds the settings scope. Those are
+ * the plugin's only seats — the stats panel lost its own when upstream
+ * 0.1.5-alpha.1 retired `conversation.details.footer`. Node-half apply is a
+ * no-op.
  */
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type { LiveSlotNode } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { apply, inject } from '../src/client/index.ts'
@@ -58,6 +61,23 @@ function fakeSettingsScope(loaded = true) {
   }
 }
 
+/**
+ * Slot keys the plugin registered an entry into, sorted. The bench still
+ * declares `conversation.details.footer` even though upstream retired it, so
+ * an entry the plugin contributed there would show up here.
+ * @param slots - the bench registry.
+ * @returns keys carrying a `rollout` occupant.
+ */
+function registeredSeats(slots: SlotRegistry): string[] {
+  const seats: string[] = []
+  const walk = (node: LiveSlotNode) => {
+    if (node.occupants.some(occupant => occupant.id === 'rollout')) seats.push(node.name)
+    for (const child of node.children) walk(child)
+  }
+  for (const root of slots.snapshot()) walk(root)
+  return seats.sort()
+}
+
 async function bench() {
   const ctx = new Context()
   await ctx.plugin(SlotRegistry).await()
@@ -90,13 +110,21 @@ describe('ui-rollout browser apply', () => {
     expect(() => { nodeApply() }).not.toThrow()
   })
 
-  it('registers the button, settings page, and stats footer once their seats exist', async () => {
+  it('registers the button and settings page once their seats exist', async () => {
     const { ctx } = await bench()
     await ctx.plugin({ inject: [...inject], apply }).await()
     await Promise.resolve()
     expect(ctx.slots.entries('conversation.input.right').some(e => e.options.id === 'rollout')).toBe(true)
     expect(ctx.slots.entries('settings.section').some(e => e.options.id === 'rollout')).toBe(true)
-    expect(ctx.slots.entries('conversation.details.footer').some(e => e.options.id === 'rollout-stats')).toBe(true)
+  })
+
+  it('registers nothing beyond those two seats while the details seat is retired', async () => {
+    const { ctx, slots } = await bench()
+    await ctx.plugin({ inject: [...inject], apply }).await()
+    await Promise.resolve()
+    // The stats panel had the only other registration; upstream 0.1.5-alpha.1
+    // retired the seat that carried it, so the plugin now occupies two seats.
+    expect(registeredSeats(slots)).toEqual(['conversation.input.right', 'settings.section'])
   })
 
   it('button run() executes /rollout and folds failure lines', async () => {

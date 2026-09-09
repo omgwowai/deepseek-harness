@@ -143,7 +143,9 @@ describe('runRollout selection', () => {
           id: request.label,
           localAgent: {
             session: {
-              events: [{
+              // Child-owned events only: a forked worker's inherited prefix is
+              // the parent's spend, and `ownEvents` is the face that excludes it.
+              ownEvents: () => [{
                 type: 'assistant/message',
                 data: { message: { content: [] }, usage: { outputTokens: 10 * (index + 1) } },
               }],

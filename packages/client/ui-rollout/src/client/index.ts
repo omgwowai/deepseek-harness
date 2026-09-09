@@ -1,10 +1,14 @@
 /**
- * TokenRouter rollout web surface, browser half: the composer rollout button,
- * the settings page, and the session-details stats footer. The button reads
- * the `tokenrouter-rollout` settings namespace through a shared synced store
- * for its enabled state and executes `/rollout` through the command channel;
- * the settings page owns the section and writes through the scope; the stats
- * footer renders the `rolloutStats` projection.
+ * TokenRouter rollout web surface, browser half: the composer rollout button
+ * and the settings page. The button reads the `tokenrouter-rollout` settings
+ * namespace through a shared synced store for its enabled state and executes
+ * `/rollout` through the command channel; the settings page owns the section
+ * and writes through the scope.
+ *
+ * The `rolloutStats` readout has no seat: upstream 0.1.5-alpha.1 retired the
+ * session-details panel that owned `conversation.details.footer`, so
+ * {@link RolloutStatsPanel} stays unmounted until it is rebound to a surviving
+ * seat. The host projection it renders is unaffected and still recorded.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
@@ -14,8 +18,6 @@ import type { BoundActions } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls the ui-conversation SlotMap merge (input.right, composer.dock).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-// Type-only: pulls the Chat target's SlotMap merge (conversation.details.footer).
-import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 // Type-only: pulls the settings slot declarations.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
@@ -24,7 +26,6 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-tokenrouter-rollout/types'
 import { RolloutButton } from './RolloutButton.tsx'
 import { RolloutSettings } from './RolloutSettings.tsx'
-import { RolloutStatsPanel } from './RolloutStatsPanel.tsx'
 import { createRolloutSettingsStore, ROLLOUT_DEFAULTS, type RolloutSettingsState } from './settings-store.ts'
 import { en, zh, type RolloutKey } from './locales.ts'
 
@@ -171,12 +172,4 @@ export function apply(ctx: ClientContext): void {
       }
     },
   }, RolloutSettings))
-
-  // Session-details footer: the rollout stats readout.
-  ctx.slots.inject('conversation.details.footer', () => ctx.slots.register({
-    name: 'conversation.details.footer',
-    id: 'rollout-stats',
-    order: 0,
-    locale: NS,
-  }, RolloutStatsPanel))
 }
