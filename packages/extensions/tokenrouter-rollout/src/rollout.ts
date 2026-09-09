@@ -88,12 +88,14 @@ function truncate(text: string, maxChars: number): string {
  * messages. A remote run exposes no local session, and an adapter may report
  * no usage at all, so the figure is absent rather than zero when unknown —
  * `rolloutStats` must not read a missing measurement as a free trajectory.
+ * Only child-owned events count: a forked child inherits its parent's prefix,
+ * whose tokens the parent already spent and this round did not.
  */
 function childOutputTokens(run: SubagentRun): number | undefined {
   const child = run.localAgent
   if (child === undefined) return undefined
   let total: number | undefined
-  for (const event of child.session.events) {
+  for (const event of child.session.ownEvents()) {
     if (event.type !== 'assistant/message') continue
     const reported = event.data.usage?.outputTokens
     if (reported === undefined) continue

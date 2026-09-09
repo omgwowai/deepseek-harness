@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-At a decision point this plugin buys a better plan with cheap tokens: it runs N parallel diverse trajectories on the worker model the harness already routes to, has one SOTA judge score them, and steers the winning plan back into the session as the working decision. SOTA tokens are therefore spent only on review, never on generation. Trigger it manually with `/rollout` or automatically at a completed milestone that leaves a next one pending. The cost is real and multiplied — one full subagent turn per trajectory plus one judge call per round — and a round takes minutes, outliving the turn that asked for it. The judge endpoint is not shipped: `judgeBaseURL` has no default, and an enabled plugin without one fails at load (composition) or refuses the round with a message (settings). Point it at any OpenAI-compatible gateway.
+At a decision point this plugin buys a better plan with cheap tokens: it runs N parallel diverse trajectories on the harness's routed worker model, has one SOTA judge score them, and steers the winner back into the session as the working decision. SOTA tokens go to review, never generation. Trigger it manually with `/rollout`, or automatically at a completed milestone. The cost is multiplied — one subagent turn per trajectory plus a judge call — and a round takes minutes, outliving the turn that asked for it. The judge endpoint is not shipped: point `judgeBaseURL` at any OpenAI-compatible gateway.
 
 ## Table of Contents
 
@@ -82,7 +82,7 @@ A round outlives the turn that asked for it, so both triggers pass `roundSignal`
 
 ### Configuration
 
-All fields optional except `judgeBaseURL` once enabled; the plugin is inert while `enabled: false`.
+All fields optional except `judgeBaseURL` once enabled; the plugin is inert while `enabled: false`. An enabled plugin without an endpoint fails at load when the composition omits it, and refuses the round with a message when the settings section clears it.
 
 | Field | Default | Meaning |
 |---|---|---|

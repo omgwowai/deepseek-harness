@@ -1,5 +1,5 @@
 ---
-description: "TokenRouter rollout Web surface for users and maintainers configuring the composer rollout button, the judge endpoint settings page, and the session-details stats footer."
+description: "TokenRouter rollout Web surface for users and maintainers configuring the composer rollout button and the judge endpoint settings page."
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-This package gives the Web GUI three rollout surfaces: a composer button that starts a rollout round, a settings page that supplies the judge endpoint and round shape, and a session-details footer that reads the round statistics back. Mount it when a deployment wants users to drive TokenRouter rollout from the GUI instead of typing `/rollout`; the host plugin `@deepseek-ai/dsh-tokenrouter-rollout` still owns the round, its session events, and the steered winning plan. The one field a deployment cannot skip is `judgeBaseURL` — no shipped composition carries a judge endpoint, so this settings page is where a user supplies their own OpenAI-compatible URL. The surfaces are read-and-dispatch only: they append no session event and make no model request of their own.
+This package gives the Web GUI two rollout surfaces: a composer button that starts a rollout round and a settings page that supplies the judge endpoint and round shape. Mount it when a deployment wants users to drive TokenRouter rollout from the GUI instead of typing `/rollout`; the host plugin `@deepseek-ai/dsh-tokenrouter-rollout` still owns the round, its session events, and the steered winning plan. The one field a deployment cannot skip is `judgeBaseURL` — no shipped composition carries a judge endpoint, so this settings page is where a user supplies their own OpenAI-compatible URL. Both surfaces are read-and-dispatch only.
 
 ## Table of Contents
 
@@ -37,9 +37,8 @@ Mount it for any Web composition whose users should reach rollout without the co
 |---|---|---|
 | `conversation.input.right` | Rollout button (`id: rollout`) | Executes `/rollout` through the command channel; disabled while the settings namespace says `enabled: false`. |
 | `settings.section` | Rollout settings page (`id: rollout`) | Master switch (default off), judge endpoint, round size, judge model, worker pool, milestone auto-trigger. |
-| `conversation.details.footer` | Rollout stats (`id: rollout-stats`) | Reads the `rolloutStats` projection; renders nothing before the first rollout. |
 
-The `conversation.details.footer` seat is declared by `@deepseek-ai/dsh-client-ui-chat`'s details panel — a per-session readout under the selected-call body.
+`RolloutStatsPanel` occupies no seat. It used to fill `conversation.details.footer`, which upstream 0.1.5-alpha.1 retired along with the session-details panel that declared it; the component and the `rolloutStats` projection it reads are both intact, awaiting a surviving seat.
 
 ### Settings namespace
 
@@ -57,14 +56,14 @@ The `conversation.details.footer` seat is declared by `@deepseek-ai/dsh-client-u
 
 One `settingsScope` binding on the `tokenrouter-rollout` namespace feeds two store handles, because a slot handle pins to one scope and the button is session-scoped while the settings page is root-scoped. The scope subscription mirrors each new snapshot into whichever handles have injected, and each handle also adopts the current snapshot at inject time, so no update is lost between subscribe and first inject. A revision guard drops repeat snapshots.
 
-The button's injected face carries one verb, `run`, which dispatches `/rollout` through `ctx.remote.commands.execute` and maps an admission failure to a user-visible line. The settings page's face carries `set` and `unset`, both writing straight through the scope so the host applies them live. The stats footer takes no injected face at all: it reads the `rolloutStats` projection through the session standard kit's `useProjection` and returns `null` while no rollout has run.
+The button's injected face carries one verb, `run`, which dispatches `/rollout` through `ctx.remote.commands.execute` and maps an admission failure to a user-visible line. The settings page's face carries `set` and `unset`, both writing straight through the scope so the host applies them live. The stats panel takes no injected face at all: it reads the `rolloutStats` projection through the session standard kit's `useProjection` and returns `null` while no rollout has run.
 
 | File | Role |
 |---|---|
-| `src/client/index.ts` | Plugin body: locale registration, scope mirror, three slot registrations. |
+| `src/client/index.ts` | Plugin body: locale registration, scope mirror, two slot registrations. |
 | `src/client/RolloutButton.tsx` | Composer button. |
 | `src/client/RolloutSettings.tsx` | Settings page. |
-| `src/client/RolloutStatsPanel.tsx` | Session-details stats readout. |
+| `src/client/RolloutStatsPanel.tsx` | Stats readout, typed against the session standard kit; currently unmounted. |
 | `src/client/settings-store.ts` | The shared draft store and its defaults. |
 
 </details>
@@ -77,7 +76,6 @@ The button's injected face carries one verb, `run`, which dispatches `/rollout` 
 Read these pages when the Web surface is not enough. They move from the surfaces to the host domain and the slot hosts.
 
 - [dsh-tokenrouter-rollout](../../extensions/tokenrouter-rollout/README.md) — owns the round, the judge, the settings namespace, and the `rolloutStats` projection.
-- [ui-chat](../ui-chat/README.md) — declares the `conversation.details.footer` seat this package's stats panel fills.
 - [ui-conversation](../ui-conversation/README.md) — declares the composer's `conversation.input.right` seat.
 - [ui-settings](../ui-settings/README.md) — declares the `settings.section` seat and owns the settings page shell.
 - [Client package map](../README.md) — adjacent browser UI packages.
@@ -102,7 +100,8 @@ These limits define the current rollout surfaces. They are current package const
 
 - **Button state is a snapshot read at inject time** — a settings change in another tab re-registers the contribution through the ledger, but a live toggle in the settings page does not re-render the composer button until the contribution re-injects; the settings page itself always shows current state.
 - **The button does not surface a missing judge endpoint** — it enables as soon as `enabled` is true, and the refusal message arrives only after the user presses it; a pre-flight disabled state keyed on `judgeBaseURL` is deferred work.
-- **Stats footer is a whole-session readout** — per-round detail (each round's scores and winner) is deferred; the projection currently exposes only aggregates.
+- **The stats readout is unmounted** — upstream 0.1.5-alpha.1 retired `conversation.details.footer`, so nothing renders `RolloutStatsPanel`; a user reads round statistics only through the host. Rebinding it to a surviving seat is deferred work.
+- **Stats are a whole-session readout** — per-round detail (each round's scores and winner) is deferred; the projection currently exposes only aggregates.
 
 <a id="dev-note"></a>
 ### Dev Note

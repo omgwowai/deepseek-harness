@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write packages/extensions/tokenrouter-rollout/README.md
-README.md: 7a02d35bf73ce7fb672b1f60ada69e4857f12da0
-README.zh.md: 64490618b76714a7ecfce2b3ca3eda9c6c79c2a1
+README.md: 8f4ce3f7db30039c71f4e6312cf226b3b87af323
+README.zh.md: cc9bf1864f0655475784d01ed68522f4f543f4f1

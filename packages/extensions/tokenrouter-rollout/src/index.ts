@@ -308,7 +308,7 @@ export class TokenRouterRollout extends Service {
     // Find the previous todo/write to diff statuses against: todo_write
     // replaces the whole list, so a completed milestone keeps its content but
     // its status flips from pending/in_progress to completed.
-    const previous = session.events
+    const previous = session.snapshotEvents()
       .filter((e): e is SessionEvent<'todo/write'> => e.type === 'todo/write')
       .findLast(e => e.seq < event.seq)
     const before = new Map(previous?.data.todos.map(t => [t.content, t.status]) ?? [])
@@ -332,7 +332,7 @@ export class TokenRouterRollout extends Service {
 /** Last model-visible text of the session, capped at `maxChars`. */
 function recentWorkTrail(session: SessionLike, maxChars: number): string {
   const parts: string[] = []
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (event.type === 'assistant/message') {
       const text = event.data.message.content
         .filter(block => block.type === 'text')
@@ -348,7 +348,8 @@ function recentWorkTrail(session: SessionLike, maxChars: number): string {
 /** The session fields the milestone watcher reads. */
 interface SessionLike {
   readonly id: SessionId
-  readonly events: readonly SessionEvent[]
+  /** Whole-log snapshot; the watcher diffs across the full history, including any forked prefix. */
+  snapshotEvents: () => readonly SessionEvent[]
   /** Durable creation metadata; `origin` distinguishes a subagent child. */
   readonly header: { readonly origin?: 'subagent' }
 }

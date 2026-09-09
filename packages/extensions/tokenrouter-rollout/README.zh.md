@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-在决策点上，本插件用廉价 token 换取更好的方案：它在 harness 已经路由到的 worker 模型上并行跑 N 条多样化 trajectory，由一个 SOTA judge 打分，再把获胜方案经 steering（中途引导）送回会话作为工作决策。因此 SOTA token 只花在评审上，绝不花在生成上。触发方式有两种：手动执行 `/rollout`，或在某个 milestone 完成且还有下一个待办时自动触发。代价是真实且成倍的——每条 trajectory 一整个 subagent 轮次，每轮再加一次 judge 调用——而且一轮要几分钟，会活得比请求它的那个轮次更久。judge 端点不随包发布：`judgeBaseURL` 没有默认值，已启用却缺少该值的插件会在加载时失败（组合方式）或以一条消息拒绝该轮（设置方式）。把它指向任意 OpenAI 兼容网关即可。
+在决策点上，本插件用廉价 token 换取更好的方案：它在 harness 路由到的 worker 模型上并行跑 N 条多样化 trajectory，由一个 SOTA judge 打分，再把获胜者经 steering（中途引导）送回会话作为工作决策。SOTA token 只花在评审上，绝不花在生成上。触发方式有两种：手动执行 `/rollout`，或在某个 milestone 完成时自动触发。代价是成倍的——每条 trajectory 一个 subagent 轮次，再加一次 judge 调用——而且一轮要几分钟，会活得比请求它的那个轮次更久。judge 端点不随包发布：把 `judgeBaseURL` 指向一个 OpenAI 兼容网关即可。
 
 ## 目录
 
@@ -82,7 +82,7 @@ kind: "package-reference"
 
 ### 配置
 
-启用之后除 `judgeBaseURL` 外全部可选；`enabled: false` 期间插件不产生任何作用。
+启用之后除 `judgeBaseURL` 外全部可选；`enabled: false` 期间插件不产生任何作用。已启用却缺少端点时：组合里省略它会在加载时失败，设置页清空它则会以一条消息拒绝该轮。
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|

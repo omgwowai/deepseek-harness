@@ -101,7 +101,7 @@ kind: "package-reference"
 | [`src/provider.ts`](src/provider.ts) | `DeepSeekSearchProvider`：Messages 请求分发、块解析、引用拼接、凭据解析 |
 | [`src/types.ts`](src/types.ts) | 搜索响应的 Anthropic 协议类型 |
 | [`src/stream.ts`](src/stream.ts) | 将 Messages 事件流重组为单次响应体 |
-| [`src/invariant.ts`](src/invariant.ts) | 不变式伴生插件（无运行时不变式；约定在服务处强制执行） |
+| — | 不发布运行时不变式伴生入口；约定在服务处强制执行。 |
 
 ### 请求流程
 
