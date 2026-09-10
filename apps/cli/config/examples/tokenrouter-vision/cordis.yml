@@ -17,8 +17,10 @@
         # Pinned in composition, which outranks the environment by design:
         # omitting it would silently fall back to the installed catalog's
         # DeepSeek endpoint, and this route's model ids only exist on the
-        # gateway.
-        baseURL: http://tokenrouter.omgwow.tech:8081/v1
+        # gateway. TLS keeps the per-request bearer credential off the wire in
+        # cleartext; verified 2026-09-09 to serve the same 83-model list as
+        # the `:8081` origin it replaces, every model declared below included.
+        baseURL: https://tokenrouter.omgwow.tech/v1
         # Credential *reference*, resolved per request; no key here.
         apiKeyEnv: DSH_TOKENROUTER_API_KEY
 
@@ -79,6 +81,29 @@
               low: low
               medium: medium
               high: high
+          - id: xai.grok-4.6
+            name: Grok 4.6
+            # Probed 2026-09-09, not advertised: the backend rejects a longer
+            # prompt with `This model's maximum prompt length is 500000`, and
+            # 499k tokens were accepted.
+            contextWindow: 500000
+            maxTokens: 32768
+            input: [text, image]
+            # 3 of 3 quadrant orders answered correctly across three separate
+            # unguessable color permutations, each billed `image_tokens: 66`,
+            # so the image reached the model rather than being dropped.
+            #
+            # A reasoning model whose thinking cannot be turned off: the
+            # backend rejects `reasoning_effort` values `none`, `off`, and
+            # `disabled` outright, so `off` is omitted rather than mapped, and
+            # dispatch keeps the model's own always-on reasoning. `max` is
+            # rejected too; the five levels below were each accepted.
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: claude-opus-5
             name: Claude Opus 5
             contextWindow: 200000

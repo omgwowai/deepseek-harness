@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-09-09-tokenrouter-grok-4-6-route.md
+2026-09-09-tokenrouter-grok-4-6-route.md: ddfd778640ae1f07c7c8773d7d3e02743d1477a3
+2026-09-09-tokenrouter-grok-4-6-route.zh.md: 91038b5e36f1509f18705aef61635bb0c4628d40
