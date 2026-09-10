@@ -18,4 +18,22 @@ Each model's `input` list records verified behavior, not the advertised capabili
 
 Model ids matter more than model families here. The gateway serves three DeepSeek V4 Flash ids and only `deepseek-v4-flash-vision-exp` sees; bare `deepseek-v4-flash` and `deepseek-v4-flash-preview` both discard the image. Both siblings are listed as `[text]` rather than omitted, so reaching for the shorter id gets a refusal naming the model instead of a route-default guess.
 
-The [Agent Note](../../../.agents/notes/implemented/feature/2026-08-20-tokenrouter-declared-modality.md) owns the rationale and the probe method.
+`xai.grok-4.6` is the catalog's other vision route, on a 500k context the gateway states in its own rejection message. The overlay's default stays the cheaper V4 Flash route, so reaching Grok 4.6 means repointing `agent-default-model` — there is no model flag. A second overlay does it without editing the shipped one:
+
+```sh
+cat > /tmp/grok.yml <<'YAML'
+- id: agent-default-model
+  config:
+    provider: tokenrouter
+    model: xai.grok-4.6
+YAML
+
+DSH_TOKENROUTER_API_KEY=… dsh --profile headless \
+  --patch apps/cli/config/examples/tokenrouter-vision/cordis.yml \
+  --patch /tmp/grok.yml \
+  "read_image ./shot.png and describe it"
+```
+
+Its reasoning cannot be turned off — the gateway rejects `reasoning_effort` values `none`, `off`, and `disabled` — so the entry offers `minimal` through `xhigh` and no `off`, and a request always spends reasoning tokens.
+
+The [Agent Note](../../../.agents/notes/implemented/feature/2026-08-20-tokenrouter-declared-modality.md) owns the rationale and the probe method; [the Grok 4.6 note](../../../.agents/notes/implemented/feature/2026-09-09-tokenrouter-grok-4-6-route.md) covers that route and the TLS endpoint.
