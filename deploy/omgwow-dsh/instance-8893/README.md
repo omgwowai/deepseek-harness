@@ -81,7 +81,7 @@ docker logs dsh-v2-015 2>&1 | tail -3                                # 启动无
 
 ## 与本适配层相关的已知问题
 
-- `dsh-outline@0.1.6` 在 0.1.5 上崩溃（`snapshot.nodes is not iterable`），大纲功能静默失效。
+- `dsh-outline` 已移除（读 `snapshot.nodes` 取错快照对象，见 ../README.md 说明）。
 - `dsh-mem-watch` / `dsh-service-hub` 的控件在 `conversation.composer.dock`（session 作用域），只有会话有内容时才显示；停在欢迎态时不显示，属上游设计。
 - `dsh-service-hub` 插件的自动实例上报在 0.1.5 上未触发；配置了 `hubUrl` 且网络可达时
   仍需手动确认面板是否出现本实例。

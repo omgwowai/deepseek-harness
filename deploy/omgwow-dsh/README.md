@@ -83,9 +83,11 @@ DSH_HOME=<你的 dsh-home> bash deploy/omgwow-dsh/launcher/start.sh
 
 ## 已知问题（0.1.5 实测）
 
-- **`dsh-outline@0.1.6`（该插件最新版）在 0.1.5 上会崩**：`TypeError: snapshot.nodes is not iterable`
-  at `buildOutlineItems` —— 新版本会话快照不再提供 `nodes`。失败被 slot 边界兜住，
-  应用照常可用，但大纲功能静默失效。
+- `dsh-outline` 已移除（2026-09-11）。它读 `ctx.sessions.binding(id).session.getSnapshot().nodes`，
+  而该快照是 `SessionSnapshot`（只有 `queue` / `pendingSubmissions` / `running` / `subagent` … ），
+  **从来没有 `nodes`** —— 对话节点在 `ui-chat` 自己的 `ChatSnapshot` 上。取错对象导致
+  `for…of undefined` 抛错，被 slot 边界兜住：应用可用、大纲静默失效。该插件最新版 0.1.6 仍如此。
+  官方右栏栈（`ui-sidebar-right` / `ui-trajectory`）已覆盖同类导航需求，故直接移除而非改插件。
 - `dsh-mem-watch` / `dsh-service-hub` 的控件注册在 `conversation.composer.dock`，该插槽是 **session 作用域**：
   会话有内容时正常显示，停在欢迎态（无会话）时不显示。属上游设计，非缺陷。
 - 细节与证据见 [docs/0.1.5-兼容性报告.md](docs/0.1.5-兼容性报告.md)。
