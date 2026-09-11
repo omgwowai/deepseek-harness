@@ -57,6 +57,15 @@ function processLaunchToken(owner: object): string {
   return created
 }
 
+/**
+ * Whether this process serves the browser session without cookie authentication.
+ * Set only by an operator running a loopback-bound instance they control.
+ * @returns true when `DSH_WEB_NO_AUTH` is exactly `1`.
+ */
+function browserAuthDisabled(): boolean {
+  return process.env.DSH_WEB_NO_AUTH === '1'
+}
+
 function header(
   headers: ConnectionTrustRequest['headers'],
   name: string,
@@ -238,6 +247,11 @@ export class BrowserAuth {
    * @returns true only when the caller may serve index.html.
    */
   authorizeIndex(req: ConnectionIndexRequest, res: ConnectionIndexResponse): boolean {
+    // Local single-machine deployments opt out of browser-session
+    // authentication with DSH_WEB_NO_AUTH=1. Off by default, so a shipped
+    // deployment keeps the cookie check; the caller sets it only for a
+    // loopback-bound instance the operator controls directly.
+    if (browserAuthDisabled()) return true
     /* v8 ignore next -- node:http always supplies url on server requests. */
     const url = new URL(req.url ?? '/', 'http://dsh.invalid')
     const tokens = url.searchParams.getAll(TOKEN_QUERY)
@@ -287,6 +301,7 @@ export class BrowserAuth {
    * @returns true only for an unexpired cookie signed by this activation's loaded secret.
    */
   isAuthenticated(request: ConnectionTrustRequest): boolean {
+    if (browserAuthDisabled()) return true
     const authority = requestAuthority(request.headers)
     const rawCookie = header(request.headers, 'cookie')
     if (authority === undefined || rawCookie === undefined) return false
