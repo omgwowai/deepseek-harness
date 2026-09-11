@@ -1,0 +1,40 @@
+{
+  "name": "dsh-tokenrouter-cost",
+  "version": "0.1.0",
+  "description": "自研 Token Router 计费插件：按 Token Router 页面价格 Input/Cached/CachedWrite/Output 四档计费（CNY/1M），账本落盘并展示当日费用与用量，替代 dsh-cost-meter。",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./typert": "./typert.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./invariant": "./invariant.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "typert.js",
+    "prices.json",
+    "cordis.patch.yml",
+    "invariant.js"
+  ],
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}

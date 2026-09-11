@@ -1,0 +1,37 @@
+{
+  "name": "dsh-mem-watch",
+  "version": "0.1.1",
+  "description": "5s 级全实例内存监控插件：每 5 秒采样进程 RSS/堆/外部内存，滚动窗口统计（5m/30m/2h）与泄漏疑似判定，ndjson 日志落盘，composer dock 常驻展示。",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./typert": "./typert.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "typert.js",
+    "cordis.patch.yml"
+  ],
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}
