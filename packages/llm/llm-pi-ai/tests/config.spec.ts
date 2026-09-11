@@ -57,6 +57,32 @@ describe('reasoning schema boundary', () => {
   })
 })
 
+describe('user-message merge schema boundary', () => {
+  type Materialized = { providers: Record<string, { mergeUserMessages?: unknown }> }
+
+  it('keeps a declared mergeUserMessages on the validated route', () => {
+    const declared = routeWith({ mergeUserMessages: true })() as Materialized
+    expect(declared.providers['acme-gateway']?.mergeUserMessages).toBe(true)
+  })
+
+  it('defaults the flag to false when the route omits it', () => {
+    const absent = routeWith({})() as Materialized
+    expect(absent.providers['acme-gateway']?.mergeUserMessages).toBe(false)
+  })
+
+  it('carries the flag into the resolved profile', () => {
+    const resolved = resolveProfiles({
+      acme: {
+        api: 'openai-completions',
+        baseURL: 'https://acme.test',
+        models: [{ id: 'm' }],
+        mergeUserMessages: true,
+      },
+    }, 'deferred')
+    expect(resolved.get('acme')?.mergeUserMessages).toBe(true)
+  })
+})
+
 describe('modality schema boundary', () => {
   it('rejects a modality pi-ai does not know, at either level', () => {
     expect(configWith({ input: ['audio'] })).toThrow(/expected/)

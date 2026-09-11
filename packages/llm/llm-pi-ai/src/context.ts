@@ -46,6 +46,29 @@ function assertSupportedImageRoles(messages: readonly Message[]): void {
   }
 }
 
+/**
+ * Fold every run of consecutive user messages into the first one of the run,
+ * concatenating their content blocks in order. Gateways that re-merge
+ * consecutive user turns upstream have been observed dropping image parts in
+ * that merge; collapsing the run on this side keeps the parts in one message
+ * no upstream merge can split. Message identity (id, source) stays the run's
+ * first message.
+ * @param messages - the request history.
+ * @returns the history with consecutive user runs collapsed.
+ */
+function mergeConsecutiveUserMessages(messages: readonly Message[]): readonly Message[] {
+  const merged: Message[] = []
+  for (const message of messages) {
+    const last = merged[merged.length - 1]
+    if (message.role === 'user' && last?.role === 'user') {
+      merged[merged.length - 1] = { ...last, content: [...last.content, ...message.content] }
+      continue
+    }
+    merged.push(message)
+  }
+  return merged
+}
+
 async function userContent(
   blocks: readonly ContentBlock[],
   requestImages: ReadonlyMap<AttachmentId, RequestImageAttachment>,
@@ -248,27 +271,31 @@ export function toPiContext(
  * @param options - the harness request; `options.system`, else a leading `system` message, maps to pi-ai's single `systemPrompt` slot.
  * @param images - attachment provider, current path resolver, and request limits.
  * @param onReplayDegrade - forwarded to {@link toPiAssistant} for each assistant message.
+ * @param mergeUserMessages - collapse consecutive user messages into one; see {@link mergeConsecutiveUserMessages}.
  * @returns the asynchronously resolved pi-ai context.
  */
 export function toPiContext(
   options: GenerateOptions,
   images: PiImageRequestContext,
   onReplayDegrade?: (reason: string) => void,
+  mergeUserMessages?: boolean,
 ): Promise<PiContext>
 export function toPiContext(
   options: GenerateOptions,
   images?: PiImageRequestContext,
   onReplayDegrade?: (reason: string) => void,
+  mergeUserMessages?: boolean,
 ): PiContext | Promise<PiContext> {
   return images === undefined
     ? textOnlyContext(options, onReplayDegrade)
-    : toPiContextWithImages(options, images, onReplayDegrade)
+    : toPiContextWithImages(options, images, onReplayDegrade, mergeUserMessages)
 }
 
 async function toPiContextWithImages(
   options: GenerateOptions,
   images: PiImageRequestContext,
   onReplayDegrade?: (reason: string) => void,
+  mergeUserMessages?: boolean,
 ): Promise<PiContext> {
   const { attachments, resolveImageAccess, maxRequestImageBytes } = images
   const requestImagePolicy = images.requestImagePolicy ?? {
@@ -277,7 +304,8 @@ async function toPiContextWithImages(
   }
   assertSupportedImageRoles(options.messages)
   const split = splitSystemPrompt(options)
-  const requestMessages = offloadRequestImagesWithPolicy(split.messages, {
+  const history = mergeUserMessages === true ? mergeConsecutiveUserMessages(split.messages) : split.messages
+  const requestMessages = offloadRequestImagesWithPolicy(history, {
     representation: 'base64',
     ...maxRequestImageBytes === undefined ? {} : { maxBytes: maxRequestImageBytes },
     byteQuantum: 1,

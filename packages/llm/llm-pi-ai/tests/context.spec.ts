@@ -540,4 +540,41 @@ describe('pi-ai system prompt source', () => {
     expect(toPiContext(options)).toEqual(expected)
     await expect(toPiContext(options, imageContext(attachments))).resolves.toEqual(expected)
   })
+
+  it('collapses consecutive user messages when mergeUserMessages is set', async () => {
+    const context = await toPiContext(request([
+      user([
+        { type: 'image', attachment: ref },
+        { type: 'text', text: 'caption' },
+      ]),
+      user([{ type: 'text', text: 'injected context' }]),
+      history('assistant', [{ type: 'text', text: 'answer' }]),
+      user([{ type: 'text', text: 'follow-up' }]),
+      user([{ type: 'text', text: 'more context' }]),
+    ]), imageContext(attachments), undefined, true)
+
+    // The two leading user messages become one wire message, so the image and
+    // both texts reach the gateway unsplittable; the trailing run collapses too.
+    expect(context.messages).toHaveLength(3)
+    const first = context.messages[0] as { role: string; content: unknown[] }
+    expect(first.role).toBe('user')
+    expect(first.content).toContainEqual({ type: 'image', data: 'AQ==', mimeType: 'image/png' })
+    expect(JSON.stringify(first.content)).toContain('caption')
+    expect(JSON.stringify(first.content)).toContain('injected context')
+    expect(context.messages[1]).toMatchObject({ role: 'assistant' })
+    expect(context.messages[2]).toEqual({ role: 'user', content: 'follow-upmore context', timestamp: 0 })
+  })
+
+  it('keeps consecutive user messages apart when mergeUserMessages is unset', async () => {
+    const context = await toPiContext(request([
+      user([{ type: 'image', attachment: ref }, { type: 'text', text: 'caption' }]),
+      user([{ type: 'text', text: 'injected context' }]),
+    ]), imageContext(attachments))
+
+    expect(context.messages).toHaveLength(2)
+    const first = context.messages[0] as { role: string; content: unknown[] }
+    expect(first.role).toBe('user')
+    expect(first.content).toContainEqual({ type: 'image', data: 'AQ==', mimeType: 'image/png' })
+    expect(context.messages[1]).toEqual({ role: 'user', content: 'injected context', timestamp: 0 })
+  })
 })
