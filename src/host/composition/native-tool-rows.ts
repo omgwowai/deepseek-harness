@@ -234,7 +234,9 @@ function resultContent(
     if (item['type'] === 'terminal') {
       // The real output, in order of what this adapter can actually obtain: the
       // terminal the adapter itself still holds for this id, then the call's own
-      // `_meta` chunks. Only a call with neither records the omission marker.
+      // `_meta` chunks. An exit fact with no bytes anywhere means the command
+      // produced none (`(no output)`, as DSH bash renders an empty run); only a
+      // call with no bytes *and* no exit fact records the omission marker.
       const terminalId = typeof item['terminalId'] === 'string' ? item['terminalId'] : ''
       const peeked = terminalId === '' ? undefined : sources.peek?.(terminalId)
       if (peeked !== undefined && peeked.output.trim() !== '') {
@@ -246,7 +248,10 @@ function resultContent(
         content.push({ type: 'text', text: capturedText })
         capturedUsed = true
       } else {
-        content.push({ type: 'text', text: TERMINAL_OUTPUT_OMITTED })
+        content.push({
+          type: 'text',
+          text: exitCode === undefined && signal === undefined ? TERMINAL_OUTPUT_OMITTED : '(no output)',
+        })
       }
       continue
     }

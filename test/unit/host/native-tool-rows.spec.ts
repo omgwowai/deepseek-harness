@@ -109,6 +109,23 @@ describe('native ACP tool rows', () => {
     expect(result().content).toEqual([{ type: 'text', text: '[terminal output omitted from the native row]' }])
   })
 
+  it('records (no output) when the terminal reported its exit without any bytes', () => {
+    const { rows, result } = harness()
+    rows.observe(codexCall({}))
+    rows.observe(codexCall({ status: 'completed' }), { terminal_exit: { exit_code: 0, signal: null } })
+    expect(result().content).toEqual([{ type: 'text', text: '(no output)' }])
+  })
+
+  it('records (no output) plus the exit marker for an empty run that failed', () => {
+    const { rows, result } = harness()
+    rows.observe(codexCall({}))
+    rows.observe(codexCall({ status: 'failed' }), { terminal_exit: { exit_code: 2, signal: null } })
+    expect(result().content).toEqual([
+      { type: 'text', text: '(no output)' },
+      { type: 'text', text: '[exit code: 2]' },
+    ])
+  })
+
   it('appends captured output for a command whose content carries no terminal item', () => {
     const { rows, result } = harness()
     const call: AcpToolCallSnapshot = {
