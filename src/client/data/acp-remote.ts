@@ -10,7 +10,7 @@
  *
  * wire payload 类型直接复用 src/contract/remote.ts 的收窄 contract（host 侧
  * strict zod codec 已校验过线数据；本层仍喂防御性 decode 函数，双重保险）。
- * @module @zaimokuza/dsh-acp-adapter/client/acp-remote
+ * @module @local/dsh-acp-adapter/client/acp-remote
  */
 
 import type { TypertRemoteNamespace } from '@deepseek-ai/dsh-typert-protocol'

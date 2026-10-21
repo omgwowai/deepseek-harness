@@ -32,7 +32,7 @@
  * 本包 tsconfig 用 `types: []`（不含 node 全局类型）；本文件是 host 侧
  * 子进程模块，经下方 triple-slash reference 显式引入 @types/node
  * （src/protocol/v1/connection.ts 同款先例），不改动共享 tsconfig。
- * @module @zaimokuza/dsh-acp-adapter/remote/service
+ * @module @local/dsh-acp-adapter/remote/service
  */
 
 /// <reference types="node" />

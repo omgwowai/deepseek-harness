@@ -316,6 +316,15 @@ function toolContentIdentity(row: AcpActivityView): { readonly toolCallId: strin
 }
 
 /**
+ * The ACP call id one sidecar row belongs to: the tool row itself or one of its
+ * content children (diff/terminal/resource/output). Undefined for rows that are
+ * not part of an ACP Tool call.
+ */
+export function activityToolCallId(row: AcpActivityView): string | undefined {
+  return row.kind === 'tool' ? toolCallIdOfRoot(row) : toolContentIdentity(row)?.toolCallId
+}
+
+/**
  * A projected child is navigation metadata for its source Tool call, not a
  * second operation in the parent transcript. Keep the source call, suppress
  * the link-only sidecar row, and suppress the content children already folded

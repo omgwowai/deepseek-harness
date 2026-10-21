@@ -22,7 +22,7 @@
  * - 各模块的 message 维持既有 `dsh-acp: ` 前缀习惯，本包装不再加前缀。
  *
  * 零 import 叶子（domain/observability 层；分层守卫见 test/contracts/architecture.spec.ts）。
- * @module @zaimokuza/dsh-acp-adapter/domain/observability/logging
+ * @module @local/dsh-acp-adapter/domain/observability/logging
  */
 
 /** 结构化日志字段（封闭词表，见模块头注释）；全部可选，缺失即省略。 */

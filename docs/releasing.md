@@ -14,7 +14,7 @@
 发布后核对 npm 上的实际版本、integrity 和下载地址，再核对 GitHub Release 资产。下游清单应使用已发布包的校验值；本地 pnpm 打包与 CI npm 包可能因 manifest 元数据而不同。GitHub 自动生成的 Source code ZIP/TAR 是源码归档，不是预构建插件包。
 
 ```sh
-npm view '@zaimokuza/dsh-acp-adapter@<version>' version dist.integrity dist.tarball
+npm view '@local/dsh-acp-adapter@<version>' version dist.integrity dist.tarball
 ```
 
 ## 失败恢复与历史补录

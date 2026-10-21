@@ -99,7 +99,7 @@ describe('client contribution', () => {
     expect(definitions).toHaveLength(4)
     expect(injections).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: 'plugins.bundle.config', key: '@zaimokuza/dsh-acp-adapter' }),
+        expect.objectContaining({ name: 'plugins.bundle.config', key: '@local/dsh-acp-adapter' }),
         expect.objectContaining({ key: 'acp-activity' }),
         expect.objectContaining({ key: 'acp-inline-activity' }),
         expect.objectContaining({ id: 'dsh-acp-agent-control' }),

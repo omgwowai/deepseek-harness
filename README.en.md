@@ -10,9 +10,9 @@ Plugin version [`0.2.1-rc.2.3`](https://github.com/zaimokuza-yoshiteru/dsh-acp-a
 
 **Recommended:** In DSH Creator mode, send:
 
-> Install and enable the ACP plugin: `@zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3`.
+> Install and enable the ACP plugin: `@local/dsh-acp-adapter@0.2.1-rc.2.3`.
 
-Confirm the native prompt to install; the new plugin is enabled by default. Alternatively, open **Plugins → Add plugin**, paste `@zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3`, install it, then select **Enable now**.
+Confirm the native prompt to install; the new plugin is enabled by default. Alternatively, open **Plugins → Add plugin**, paste `@local/dsh-acp-adapter@0.2.1-rc.2.3`, install it, then select **Enable now**.
 
 <details>
 <summary>Other installation methods: CLI, Git, and archive</summary>
@@ -23,10 +23,10 @@ Before using the Desktop CLI, fully quit the app; reopen it after the command co
 
 ```bash
 # Desktop
-dsh plugin --profile desktop add @zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3
+dsh plugin --profile desktop add @local/dsh-acp-adapter@0.2.1-rc.2.3
 
 # Web
-npx @deepseek-ai/dsh@0.2.1-rc.2 plugin --profile web add @zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3
+npx @deepseek-ai/dsh@0.2.1-rc.2 plugin --profile web add @local/dsh-acp-adapter@0.2.1-rc.2.3
 ```
 
 Git and archive examples:

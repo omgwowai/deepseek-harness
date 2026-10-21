@@ -90,6 +90,7 @@ class FakeSettingsProvider {
   readonly config = {
     agents: { get: () => acpSettingsSchema(this.section).agents },
     toolApprovalDefault: { get: () => acpSettingsSchema(this.section).toolApprovalDefault },
+    teamBridge: { get: () => acpSettingsSchema(this.section).teamBridge },
   }
   private watchers: WatchCallback[] = []
 
@@ -418,15 +419,23 @@ describe('acpSettingsSchema', () => {
     expect(acpSettingsSchema(undefined)).toEqual({
       agents: {},
       toolApprovalDefault: 'auto',
+      teamBridge: false,
     })
-    expect(acpSettingsSchema({})).toEqual({ agents: {}, toolApprovalDefault: 'auto' })
+    expect(acpSettingsSchema({})).toEqual({ agents: {}, toolApprovalDefault: 'auto', teamBridge: false })
     expect(acpSettingsSchema({ agents: {} })).toEqual({
       agents: {},
       toolApprovalDefault: 'auto',
+      teamBridge: false,
     })
     expect(acpSettingsSchema({ agents: {}, searchableModelPicker: true })).toEqual({
       agents: {},
       toolApprovalDefault: 'auto',
+      teamBridge: false,
+    })
+    expect(acpSettingsSchema({ agents: {}, teamBridge: true })).toEqual({
+      agents: {},
+      toolApprovalDefault: 'auto',
+      teamBridge: true,
     })
   })
 
@@ -487,6 +496,7 @@ describe('acpSettingsSchema', () => {
     expect(resolved).toEqual({
       agents: { devin: { name: 'Devin', command: 'devin', args: [], env: {} } },
       toolApprovalDefault: 'auto',
+      teamBridge: false,
     })
   })
 
@@ -508,6 +518,7 @@ describe('acpSettingsSchema', () => {
       ['args 非 string 元素', { agents: { devin: { name: 'D', command: 'devin', args: ['acp', 1] } } }],
       ['env 值非 string', { agents: { devin: { name: 'D', command: 'devin', env: { A: 1 } } } }],
       ['loginHint 非 string', { agents: { devin: { name: 'D', command: 'devin', loginHint: 42 } } }],
+      ['teamBridge 非 boolean', { agents: {}, teamBridge: 'yes' }],
       // credentialReadPaths 已从用户 schema 删除——作为未知键被 strip，不再校验
     ]
     for (const [label, section] of bad) {

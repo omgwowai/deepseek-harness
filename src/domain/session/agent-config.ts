@@ -1,7 +1,7 @@
 /**
  * Shared ACP profile data: settings shape, `acp-<id>` routes, runtime binding rules and probe cache keys. Profile shapes and binding rules are
  * re-exported from the browser-safe contract. No host composition dependency.
- * @module @zaimokuza/dsh-acp-adapter/domain/session/agent-config
+ * @module @local/dsh-acp-adapter/domain/session/agent-config
  */
 
 import type { AcpAgentConfig, AcpAgentId, AcpStubAgentConfig } from '../../contract/agent-config.ts'

@@ -342,6 +342,10 @@ export function installInstalledProfileRegistry(
             await sidecar.readDispatch(sessionId as Parameters<AcpSidecar['readDispatch']>[0], key),
         }
   let agents: Record<string, AcpAgentConfig> = {}
+  // Opt-in DSH team bridge (adapter config `teamBridge`, default false). Read at
+  // session creation through the closures below, so a config change applies to
+  // every new ACP session without re-creating the registered adapters.
+  let teamBridge = false
   // Desired settings and the last successfully installed snapshot are kept
   // separate. A partially failed registration must never make an old route's
   // closure observe `undefined` just because the settings watcher advanced.
@@ -690,7 +694,7 @@ export function installInstalledProfileRegistry(
   // not leave that caller suspended forever: resolving the barrier lets the
   // authoritative route lookup fail closed below.  `resolve` is idempotent,
   // so normal initialization and disposal may safely race.
-  ctx.effect(() => () => ready.resolve(), '@zaimokuza/dsh-acp-adapter: release ACP route readiness waiters')
+  ctx.effect(() => () => ready.resolve(), '@local/dsh-acp-adapter: release ACP route readiness waiters')
   // Facts are constructed by the sorted builder above, so their JSON is
   // canonical; a string compare replaces a deep-equal helper.
   let registeredKey = ''
@@ -760,17 +764,19 @@ export function installInstalledProfileRegistry(
                 },
             (message) => log.warn(message, { operation: 'claude-draft-subagent-capability' }),
             (sessionId) => resolveTerminalJobs(ctx, sessionId),
-            (sessionId, capabilities, wireProfile, schemas) =>
-              createTeamBridge(
-                ctx,
-                sessionId,
-                capabilities,
-                wireProfile,
-                async () => (await readToolApprovalPolicy(sessionId)).policy,
-                notifyPolicySubscribers,
-                schemas,
-              ),
-            (sessionId, schemas) => teamBridgeKey(ctx, sessionId, schemas),
+            async (sessionId, capabilities, wireProfile, schemas) =>
+              teamBridge
+                ? createTeamBridge(
+                    ctx,
+                    sessionId,
+                    capabilities,
+                    wireProfile,
+                    async () => (await readToolApprovalPolicy(sessionId)).policy,
+                    notifyPolicySubscribers,
+                    schemas,
+                  )
+                : undefined,
+            (sessionId, schemas) => (teamBridge ? teamBridgeKey(ctx, sessionId, schemas) : undefined),
             controlsChanged,
             ctx.root,
             (sessionId) => resolveQwenTaskJobs(ctx, sessionId),
@@ -875,11 +881,12 @@ export function installInstalledProfileRegistry(
       while (retiringProfiles.size > 0) await Promise.allSettled([...retiringProfiles])
       await Promise.allSettled(projections)
     })
-  }, '@zaimokuza/dsh-acp-adapter: drain profile routes and projections before dependencies')
+  }, '@local/dsh-acp-adapter: drain profile routes and projections before dependencies')
 
   const refreshConfig = (): void => {
     if (disposed) return
     agents = structuredClone(config.agents.get())
+    teamBridge = config.teamBridge.get() === true
     onSettingsChange()
   }
   refreshConfig()

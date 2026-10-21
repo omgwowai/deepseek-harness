@@ -26,6 +26,24 @@ export const ACP_TERMINAL_MAX_OUTPUT_BYTES = 8 * 1_024 * 1_024
 export const ACP_TERMINAL_RELEASE_WAIT_MS = 10_000
 export const ACP_TERMINAL_MAX_ACTIVE = 64
 
+/**
+ * Read-only snapshot of one live terminal record for the adapter's own native
+ * rows; this is not an ACP operation and never returns data for a terminal the
+ * host does not currently hold.
+ */
+export interface AcpTerminalOutputPeek {
+  readonly output: string
+  readonly truncated: boolean
+  readonly exitCode: number | null
+  readonly signal: string | null
+}
+
+/** The per-connection terminal host plus the adapter's own bounded peek. */
+export interface AcpTerminalHost extends AcpTerminalHandlers {
+  /** Current output/exit fact for a terminal this host still holds, if any. */
+  peekOutput(terminalId: string): AcpTerminalOutputPeek | undefined
+}
+
 export interface AcpTerminalHandlersOptions {
   readonly subprocess: SubprocessSeam
   readonly profileId: string
@@ -38,7 +56,8 @@ export interface AcpTerminalHandlersOptions {
   readonly startJob?: AcpTerminalJobStarter | undefined
 }
 
-class TerminalOutputRing {
+/** Bounded tail buffer shared by the terminal host and the native tool rows. */
+export class TerminalOutputRing {
   private data = Buffer.alloc(0)
   private didTruncate = false
   readonly limit: number
@@ -183,7 +202,7 @@ function attachOutput(stream: Readable | undefined, append: (chunk: unknown) => 
 }
 
 /** Create a per-connection ACP v1 terminal host. */
-export function createAcpTerminalHandlers(options: AcpTerminalHandlersOptions): AcpTerminalHandlers {
+export function createAcpTerminalHandlers(options: AcpTerminalHandlersOptions): AcpTerminalHost {
   const active = new Map<string, TerminalRecord>()
   let disposed = false
   const releaseWaitMs = options.releaseWaitMs ?? ACP_TERMINAL_RELEASE_WAIT_MS
@@ -380,6 +399,21 @@ export function createAcpTerminalHandlers(options: AcpTerminalHandlersOptions): 
     }
   }
 
+  // Adapter-internal read (never a protocol operation): the native tool row for
+  // an ACP result whose content is a `terminal` item records the same output the
+  // Agent sees, while this host still holds the terminal.
+  const peekOutput = (terminalId: string): AcpTerminalOutputPeek | undefined => {
+    if (disposed) return undefined
+    const record = active.get(terminalId)
+    if (record === undefined) return undefined
+    return {
+      output: record.output.text(),
+      truncated: record.output.truncated,
+      exitCode: record.exit?.exitCode ?? null,
+      signal: record.exit?.signal ?? null,
+    }
+  }
+
   const waitForExit = async (params: acp.WaitForTerminalExitRequest): Promise<acp.WaitForTerminalExitResponse> => {
     const record = get(params.terminalId, params.sessionId)
     await record.done
@@ -456,5 +490,6 @@ export function createAcpTerminalHandlers(options: AcpTerminalHandlersOptions): 
     cancelSession,
     releaseSession,
     dispose,
+    peekOutput,
   }
 }

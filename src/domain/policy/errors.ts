@@ -4,7 +4,7 @@
  *
  * 本包 tsconfig 用 `types: []`；本文件不触碰 node 全局（correlation id 生成
  * 在 src/protocol/v1/errors.ts），无需 triple-slash reference。
- * @module @zaimokuza/dsh-acp-adapter/domain/policy/errors
+ * @module @local/dsh-acp-adapter/domain/policy/errors
  */
 
 import { newAcpCorrelationId } from '../../protocol/v1/errors.ts'

@@ -20,7 +20,7 @@
  * - 中文文案的呈现层分工（测试钉死的协议层英文诊断 message 不动）：选择器/面板
  *   中文文案在 src/host/composition/llm-stub.ts 与 src/client/ui/locales.ts，
  *   恢复/中断说明在 provider runtime。
- * @module @zaimokuza/dsh-acp-adapter/protocol/v1/errors
+ * @module @local/dsh-acp-adapter/protocol/v1/errors
  */
 
 /// <reference types="node" />

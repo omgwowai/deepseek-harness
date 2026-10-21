@@ -33,7 +33,7 @@ const VENDOR_FIXTURE_PATH = path.join(TEST_DIR, '..', 'fixtures', 'unknown-notif
 const INIT_PARAMS: acp.InitializeRequest = {
   protocolVersion: acp.PROTOCOL_VERSION,
   clientCapabilities: {},
-  clientInfo: { name: '@zaimokuza/dsh-acp-adapter-contract-test', version: '0.0.0' },
+  clientInfo: { name: '@local/dsh-acp-adapter-contract-test', version: '0.0.0' },
 }
 const NEW_SESSION_PARAMS: acp.NewSessionRequest = { cwd: '/mock/cwd', mcpServers: [] }
 const PROMPT_BLOCKS: acp.ContentBlock[] = [{ type: 'text', text: 'Say hello to the mock world.' }]

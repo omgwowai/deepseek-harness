@@ -165,7 +165,7 @@ async function registerUi(ctx: ClientContext): Promise<void> {
     ctx.slots.register(
       {
         name: 'plugins.bundle.config',
-        key: '@zaimokuza/dsh-acp-adapter',
+        key: '@local/dsh-acp-adapter',
         locale: 'settings.acp',
         store: createAcpPanelStore,
         inject: (actions: AcpPanelStoreActions) => {

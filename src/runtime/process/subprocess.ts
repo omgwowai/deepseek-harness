@@ -14,7 +14,7 @@
  *
  * 本包 tsconfig 用 `types: []`；本文件需要 node stream 类型，经 triple-slash
  * reference 显式引入 @types/node（同层 agent-process.ts 同款先例）。
- * @module @zaimokuza/dsh-acp-adapter/runtime/process/subprocess
+ * @module @local/dsh-acp-adapter/runtime/process/subprocess
  */
 
 /// <reference types="node" />

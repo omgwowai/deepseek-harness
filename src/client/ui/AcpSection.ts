@@ -14,7 +14,7 @@ import { catalogIdOf } from '../../contract/agent-config.ts'
  * seat is never shadowed. Written with createElement because the frozen
  * tsconfig has no `jsx` option (see react.d.ts); classes come from
  * AcpSection.module.css ( CSS Modules).
- * @module @zaimokuza/dsh-acp-adapter/client/AcpSection
+ * @module @local/dsh-acp-adapter/client/AcpSection
  */
 
 import { createElement as h, Fragment, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'

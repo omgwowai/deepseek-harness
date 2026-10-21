@@ -9,7 +9,7 @@
  * (scope guards and revision fencing read it) and mirrors every transition
  * through these actions, resyncing wholesale on attach so a re-created entry
  * store catches up in one publish.
- * @module @zaimokuza/dsh-acp-adapter/client/stores/panel-store
+ * @module @local/dsh-acp-adapter/client/stores/panel-store
  */
 
 import type { AcpProviderHealth, PanelSettingsState } from '../logic.ts'

@@ -12,8 +12,9 @@ import { AcpClientConnection, supportsFork } from '../../protocol/v1/connection.
 import type { AcpConnectionSpec, AcpSpawnPlanView } from '../process/types.ts'
 import type { SubprocessSeam } from '../process/subprocess.ts'
 import type { AcpFileSystemHandlers } from '../client-capabilities/filesystem.ts'
+import type { AcpTerminalHost, AcpTerminalOutputPeek } from '../client-capabilities/terminal.ts'
 import { acpConfigOptionsSnapshot } from '../../protocol/v1/config-options.ts'
-import type { AcpSessionNotification, AcpTerminalHandlers } from '../../protocol/v1/types.ts'
+import type { AcpSessionNotification } from '../../protocol/v1/types.ts'
 import { waitWithin } from '../process/timeout.ts'
 import { AcpHostSettlementError } from './mcp-lease.ts'
 import type { AcpMcpLease } from './mcp-lease.ts'
@@ -137,7 +138,7 @@ export interface AcpSessionRuntimeOptions {
   readonly createTerminalHandlers?: (context: {
     readonly cwd: string
     readonly env: Readonly<Record<string, string>>
-  }) => AcpTerminalHandlers
+  }) => AcpTerminalHost
   /** Replay/load notifications are staging-only; the DSH log remains authoritative. */
   readonly onSessionUpdate?: (notification: AcpSessionNotification) => void
   /** Host-owned approval bridge. The optional signal is the active prompt lifetime. */
@@ -511,6 +512,9 @@ export class AcpSessionRuntime {
   private closing: Promise<void> | undefined
   private cancelledRefreshController: AbortController | undefined
   private launch: AcpRuntimeLaunch | undefined
+  /** The per-connection terminal host, for the adapter's own read of a tool
+   * result that references a client-side terminal (`peekOutput`). */
+  private terminalHost: AcpTerminalHost | undefined
   private replayHandler: ((notification: AcpSessionNotification) => void) | undefined
   private restoringSessionId: string | undefined
   private connectionAbort: AbortController | undefined
@@ -604,6 +608,11 @@ export class AcpSessionRuntime {
   /** ACP context occupancy/cumulative cost; intentionally not DSH TokenUsage. */
   get contextUsage(): AcpRuntimeContextUsage | undefined {
     return this.usageSnapshot
+  }
+  /** Adapter-internal read of one client-side terminal this connection still
+   * holds; undefined for unknown or already released terminal ids. */
+  readTerminalOutput(terminalId: string): AcpTerminalOutputPeek | undefined {
+    return this.terminalHost?.peekOutput(terminalId)
   }
   get lastRestoreRefreshedCancelledSession(): boolean {
     return this.lastRestoreRefreshedCancelledSessionValue
@@ -1463,6 +1472,7 @@ export class AcpSessionRuntime {
     }
     const fileSystemHandlers = this.options.createFileSystemHandlers?.({ cwd: this.options.cwd, env: launch.env })
     const terminalHandlers = this.options.createTerminalHandlers?.({ cwd: this.options.cwd, env: launch.env })
+    this.terminalHost = terminalHandlers
     const connection = new AcpClientConnection(spec, {
       ...(this.options.enableClaudeDraftSubagents === true ? { enableClaudeDraftSubagents: true } : {}),
       ...(this.options.onCapabilityDegraded === undefined

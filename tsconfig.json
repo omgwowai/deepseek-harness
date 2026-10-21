@@ -20,7 +20,7 @@
     "skipLibCheck": true,
     "types": [],
     "paths": {
-      "@zaimokuza/dsh-acp-adapter/client": ["./src/client/index.ts"]
+      "@local/dsh-acp-adapter/client": ["./src/client/index.ts"]
     }
   },
   "include": ["src/**/*.ts"]

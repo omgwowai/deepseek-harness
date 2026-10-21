@@ -45,7 +45,7 @@ it('unloads and remounts ACP through the native plugin manager without restartin
     const controls = page.getByRole('button', { name: /^Session ·/ })
     await controls.waitFor()
     const manager = host.ctx.pluginManager
-    const entry = required((await manager.listPlugins()).find((row) => row.moduleName === '@zaimokuza/dsh-acp-adapter'))
+    const entry = required((await manager.listPlugins()).find((row) => row.moduleName === '@local/dsh-acp-adapter'))
     expect(entry.readOnlyReason).toBeUndefined()
     for (const active of [false, true]) {
       if (active) {

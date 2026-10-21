@@ -74,7 +74,7 @@ import { AcpPromptContentError, skillRouteForTools, toAcpPrompt } from '../../do
 import { currentModelContextSnapshots } from '../../domain/session/model-context-snapshots.ts'
 import { generatedContextBlock } from '../../runtime/text-block-boundary.ts'
 import { createAcpFileSystemHandlers } from '../../runtime/client-capabilities/filesystem.ts'
-import { createAcpTerminalHandlers } from '../../runtime/client-capabilities/terminal.ts'
+import { createAcpTerminalHandlers, type AcpTerminalOutputPeek } from '../../runtime/client-capabilities/terminal.ts'
 import type { AcpTerminalJobStarter } from '../../runtime/client-capabilities/terminal-job.ts'
 import { createAcpNativePermissionHandler, type AcpNativeApprovalService } from '../../domain/policy/permissions.ts'
 import { createPermissionCheckAudit } from '../../domain/policy/events.ts'
@@ -101,6 +101,7 @@ import { nonTextContentFallback } from '../../domain/session/assistant-content.t
 import type { AcpNonTextContent } from '../../domain/session/assistant-content.ts'
 import { AcpToolCallReducer } from './tool-call-reducer.ts'
 import type { AcpToolCallPatch, AcpToolCallSnapshot } from './tool-call-reducer.ts'
+import { AcpNativeToolRows, dshUsageFromAcp } from './native-tool-rows.ts'
 import {
   AcpLocalSettlementError,
   localSettlementStatus as readLocalSettlementStatus,
@@ -659,6 +660,8 @@ export interface AcpProfileRuntime {
   readonly protocolVersion?: number | undefined
   /** Latest ACP session-scoped configuration used for configuration convergence. */
   readonly configOptions?: readonly acp.SessionConfigOption[] | undefined
+  /** Adapter-internal read of one client-side terminal this connection holds. */
+  readTerminalOutput?(terminalId: string): AcpTerminalOutputPeek | undefined
   readonly currentModeId?: string | undefined
   readonly modes?: acp.SessionModeState | undefined
   readonly contextUsage?: AcpRuntimeContextUsage | undefined
@@ -2863,6 +2866,15 @@ export class AcpProfileAdapter extends LlmAdapter {
         // one prompt projection.  Never carry a partially observed call into a
         // later DSH turn, even if an Agent reuses its id.
         const toolCallReducer = new AcpToolCallReducer()
+        // Native tool rows for calls the Agent executes itself: appended live to the
+        // open DSH step so the Trajectory tab reads them from the session log.
+        const nativeToolRows = new AcpNativeToolRows(session, String(options.provider ?? ''), String(options.model ?? ''), (message) => {
+          try {
+            self.log?.(message)
+          } catch {
+            /* row diagnostics never change the prompt outcome */
+          }
+        }, (terminalId) => runtime.readTerminalOutput?.(terminalId))
         const activityPositions = new Map<string, number>()
         let currentAnchor = admissionProof?.anchorMessageId ?? `prompt:${dispatchKey}`
         let activityIndexOffset = 0
@@ -3045,6 +3057,7 @@ export class AcpProfileAdapter extends LlmAdapter {
               ...(update.content === undefined ? {} : { content: update.content }),
             }
             toolCall = toolCallReducer.apply(patch, { externalSignalAborted: options.signal?.aborted === true })
+            nativeToolRows.observe(toolCall, update._meta)
             const terminal = isTerminalActivityStatus(activityStatus(toolCall.status))
             const previousTerminal = toolContentBoundaries.get(toolId)
             if (previousTerminal === undefined || (previousTerminal && !terminal)) {
@@ -3184,6 +3197,7 @@ export class AcpProfileAdapter extends LlmAdapter {
         let successfulToolResultEligible = true
         let successfulToolResultConfirmed = false
         handoff.cancel = () => {
+          nativeToolRows.settleOpen('cancelled')
           inputAbort.abort(new Error('ACP stream consumer ended'))
         }
         const settlementAbandonReason = new DOMException('ACP stream consumer ended', 'AbortError')
@@ -3194,6 +3208,9 @@ export class AcpProfileAdapter extends LlmAdapter {
           session?.watchSteering?.(() => {
             if (remoteSettled || promptSignal.aborted) return
             if (runtime.canSteer === true && runtime.steer !== undefined) {
+              // The suspended segment ends the open step; a still-running call
+              // must be resolved in the step that advertised it.
+              nativeToolRows.settleOpen('cancelled')
               handoff.request()
               return
             }
@@ -3393,6 +3410,7 @@ export class AcpProfileAdapter extends LlmAdapter {
             await contentDeliveryTail
             finishExternalDelegations()
             settleRunningActivities(unresolvedActivityStatus)
+            nativeToolRows.settleOpen('cancelled')
             await activityWriteTail
             // Keep the native turn open until the known terminal response has
             // been durably settled. A local write failure waits on its retained
@@ -3619,6 +3637,15 @@ export class AcpProfileAdapter extends LlmAdapter {
                 await cancelledRuntimeRetirement
               })
             }
+            // Before the step can end: resolve every native tool row this prompt
+            // still holds open (a call without a result makes the stored log
+            // refuse `step/end`), then record the ACP-reported token usage the
+            // Trajectory reads from this segment's stream.
+            nativeToolRows.settleOpen('cancelled')
+            const promptUsage = dshUsageFromAcp(
+              typeof response === 'object' && response !== null && 'usage' in response ? response.usage : undefined,
+            )
+            if (promptUsage !== undefined) pushChunk({ type: 'usage', usage: promptUsage } as StreamChunk)
             pushChunk({
               type: 'finish',
               reason: finalReason,

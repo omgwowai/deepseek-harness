@@ -15,7 +15,7 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-chat",
         "@deepseek-ai/dsh-client-ui-conversation",
-        "@zaimokuza/dsh-acp-adapter"
+        "@local/dsh-acp-adapter"
       ],
       "platform": "web"
     }

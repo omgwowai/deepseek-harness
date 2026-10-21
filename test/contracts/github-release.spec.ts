@@ -19,7 +19,7 @@ import {
 } from '../../scripts/github-release.ts'
 import type { Github, Manifest, Packument, ReleaseAssetIO } from '../../scripts/github-release.ts'
 
-const name = '@zaimokuza/dsh-acp-adapter'
+const name = '@local/dsh-acp-adapter'
 const version = '1.2.3-alpha.2'
 const tag = `v${version}`
 const sha = '1234567890abcdef'
@@ -89,7 +89,7 @@ describe('GitHub release publication', () => {
   })
 
   it('requires the standard npm package/version filename for a Release asset', () => {
-    const expected = 'zaimokuza-dsh-acp-adapter-1.2.3-alpha.2.tgz'
+    const expected = 'local-dsh-acp-adapter-1.2.3-alpha.2.tgz'
     expect(npmTarballFilename(name, version)).toBe(expected)
     expect(assertNpmTarballFilename(`/tmp/${expected}`, manifest)).toBe(expected)
     expect(() => assertNpmTarballFilename('/tmp/rebuilt.tgz', manifest)).toThrow(`filename must be ${expected}`)

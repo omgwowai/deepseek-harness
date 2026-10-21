@@ -1,6 +1,7 @@
 /** ACP presentation facts become native Chat nodes; execution events remain untouched. */
 import type { ChatConversationViewNode, ChatNode, AssistantBlock } from '@deepseek-ai/dsh-client-ui-chat/client'
 import {
+  activityToolCallId,
   nativeActivityToolBlock,
   usesNativeActivityToolProjection,
   type AcpActivityNodeData,
@@ -155,6 +156,26 @@ function projectActivityRow(
   } as ChatConversationViewNode
 }
 
+/** ACP call ids that already have a native tool row in the stored session log. */
+function nativeToolCallIds(nodes: Iterable<ChatConversationViewNode>): ReadonlySet<string> {
+  const ids = new Set<string>()
+  for (const node of nodes) {
+    if (node.kind === 'assistant-step') {
+      // ChatNodeDataMap narrows `data` per kind; the base union keeps it unknown.
+      const assistant = node as ChatNode<'assistant-step'>
+      for (const block of assistant.data.blocks) if (block.kind === 'tool-call') ids.add(block.callId)
+      continue
+    }
+    if (node.kind !== 'tool-call') continue
+    const root = (node as ChatNode<'tool-call'>).data.root
+    if (root !== undefined) ids.add(root.callId)
+  }
+  return ids
+}
+
+/** One filtered window per (journal window, native call id set); identity stays stable while both do. */
+const nativeFilteredWindows = new WeakMap<ActivityWindow, { signature: string; window: ActivityWindow }>()
+
 export function normalizeAcpChatNodes(
   nodes: readonly ChatConversationViewNode[],
   windows: ReadonlyMap<string, ActivityWindow>,
@@ -165,6 +186,25 @@ export function normalizeAcpChatNodes(
   const replaced = new Map<string, readonly ChatConversationViewNode[]>()
   const owned = new Set<string>()
   const owners = new Map<string, number>()
+  // A sidecar Tool row whose call the adapter already recorded natively in the
+  // session log is a duplicate: the Chat renders the stored tool row itself.
+  // Drop those rows here (the journal keeps them for diagnostics), leaving one
+  // visible row per ACP call. Falls through unchanged for older logs.
+  const nativeIds = nativeToolCallIds(nodes)
+  const nativeSignature = nativeIds.size === 0 ? '' : [...nativeIds].sort().join('\u0000')
+  const windowOf = (key: string): ActivityWindow | undefined => {
+    const source = windows.get(key)
+    if (source === undefined || nativeIds.size === 0) return source
+    const cached = nativeFilteredWindows.get(source)
+    if (cached !== undefined && cached.signature === nativeSignature) return cached.window
+    const rows = source.rows.filter((row) => {
+      const callId = activityToolCallId(row)
+      return callId === undefined || !nativeIds.has(callId)
+    })
+    const window = rows.length === source.rows.length ? source : { ...source, rows }
+    nativeFilteredWindows.set(source, { signature: nativeSignature, window })
+    return window
+  }
   const markersByWindow = new Map<string, ChatConversationViewNode[]>()
   for (const node of nodes) {
     if (node.kind === 'acp-activity') {
@@ -206,7 +246,7 @@ export function normalizeAcpChatNodes(
       if (!marker.id.startsWith('input:') || duplicateMarkers.has(marker.key) || marker.visibility === 'hidden')
         continue
       const data = marker.data as AcpActivityNodeData
-      if ((windows.get(activityWindowKey(data, fallbackSessionId))?.rows.length ?? 0) === 0) continue
+      if ((windowOf(activityWindowKey(data, fallbackSessionId))?.rows.length ?? 0) === 0) continue
       const key = stepKey(marker)
       if (key === undefined) continue
       const group = liveMarkersByStep.get(key) ?? []
@@ -226,7 +266,7 @@ export function normalizeAcpChatNodes(
   const earlySteps = new Map<string, number>()
   for (const [windowKey, markers] of markersByWindow) {
     if (owners.has(windowKey)) continue
-    const window = windows.get(windowKey)
+    const window = windowOf(windowKey)
     // Without an assistant, only a known prefix can be placed without moving
     // a tool ahead of content that has not reached the native stream yet.
     if (
@@ -285,7 +325,7 @@ export function normalizeAcpChatNodes(
       cache?.delete(node.key)
       continue
     }
-    const window = windows.get(windowKey)
+    const window = windowOf(windowKey)
     // Keep the additive fallback until the sidecar is available, including failures.
     if (window === undefined || window.unavailable) {
       cache?.delete(node.key)

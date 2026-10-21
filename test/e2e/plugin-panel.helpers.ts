@@ -1,6 +1,6 @@
 import type { Page, Locator } from 'playwright'
 
-export const ACP_PACKAGE = '@zaimokuza/dsh-acp-adapter'
+export const ACP_PACKAGE = '@local/dsh-acp-adapter'
 
 /** Open native Settings through the RC.2 account menu launcher. */
 export async function openNativeSettings(page: Page, locale: 'en' | 'zh' = 'en'): Promise<Locator> {

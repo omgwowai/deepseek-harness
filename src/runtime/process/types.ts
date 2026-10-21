@@ -3,7 +3,7 @@
  * 纯类型模块：协议连接层（src/protocol/v1/connection.ts）与原生访问
  * （src/domain/policy/sandbox.ts）共享此处的结构定义；本模块不 import 任何
  * 包内模块（./subprocess.ts 的 seam 类型除外，同层叶子），从根本上杜绝环。
- * @module @zaimokuza/dsh-acp-adapter/runtime/process/types
+ * @module @local/dsh-acp-adapter/runtime/process/types
  */
 
 import type { SubprocessSeam } from './subprocess.ts'

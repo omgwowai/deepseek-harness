@@ -129,7 +129,7 @@ export interface LiveDiagnosticTraceSink {
   ) => { readonly hmac: string; readonly bytes: number | null; readonly complete: boolean }
 }
 
-const stateKey = Symbol.for('@zaimokuza/dsh-acp-adapter/live-diagnostic-trace/v1')
+const stateKey = Symbol.for('@local/dsh-acp-adapter/live-diagnostic-trace/v1')
 interface TraceState {
   readonly sink: LiveDiagnosticTraceSink
   failures: number

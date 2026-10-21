@@ -43,7 +43,7 @@
  *
  * 本包 tsconfig 用 `types: []`（不含 node 全局类型）；本文件是 host 侧协议/子进程
  * 接缝模块，经下方 triple-slash reference 显式引入 @types/node，不改动共享 tsconfig。
- * @module @zaimokuza/dsh-acp-adapter/protocol/v1/connection
+ * @module @local/dsh-acp-adapter/protocol/v1/connection
  */
 
 /// <reference types="node" />
@@ -605,7 +605,7 @@ export class AcpClientConnection {
     }
     this.spec = spec
     this.command = command
-    this.clientInfo = options.clientInfo ?? { name: '@zaimokuza/dsh-acp-adapter', version: '0.0.0' }
+    this.clientInfo = options.clientInfo ?? { name: '@local/dsh-acp-adapter', version: '0.0.0' }
     this.initializeTimeoutMs = options.initializeTimeoutMs ?? DEFAULT_INITIALIZE_TIMEOUT_MS
     this.onPermissionRequest = options.onPermissionRequest
     this.onElicitationRequest = options.onElicitationRequest

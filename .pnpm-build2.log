@@ -1,0 +1,54 @@
+
+> @zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3 build /Users/lbc/Desktop/work/dsh-acp-adapter-fork
+> node scripts/check-toolchain.mjs && node scripts/verify-dev-dependencies.ts && node scripts/clean.mjs && node scripts/gen-typert.ts && tsc -p tsconfig.json && tsdown && node scripts/verify-bundle.ts
+
+[toolchain] node=22.23.3 pnpm=10.7.0 pinned-node=24.19.0
+[toolchain] WARN: node 22.23.3 !== 开发固定版本 24.19.0（.nvmrc）；测试通过不代表发布工具链一致
+Verified 98 exact published development packages (DSH 0.2.1-rc.2)
+[clean] removed: lib
+[clean] removed: .typert
+gen-typert: wrote 5 artifacts to lib/
+ℹ tsdown v0.22.14 powered by rolldown v1.2.4
+ℹ config file: /Users/lbc/Desktop/work/dsh-acp-adapter-fork/tsdown.config.ts 
+ℹ entry: src/runtime/session/team-mcp-stdio.ts
+ℹ target: node22.19.0
+ℹ tsconfig: tsconfig.json
+ℹ entry: src/client/index.ts
+ℹ target: node22.19.0
+ℹ tsconfig: tsconfig.json
+ℹ Build start
+
+ WARN  We recommend using the ESM format instead of CommonJS.
+The ESM format is compatible with modern platforms and runtimes, and most new libraries are now distributed only in ESM format.
+Learn more at https://nodejs.org/en/learn/modules/publishing-a-package#how-did-we-get-here
+
+[warn] `inlineDynamicImports` option is deprecated, please use `codeSplitting: false` instead.
+ℹ Hint: consider adding deps.onlyBundle option to avoid unintended bundling of dependencies, or set deps.onlyBundle: false to disable this hint.
+See more at https://tsdown.dev/options/dependencies#deps-onlybundle
+Detected dependencies in bundle:
+- @deepseek-ai/dsh-util-values
+- @deepseek-ai/dsh-util-workspace-path
+- @deepseek-ai/dsh-typert-protocol
+ℹ [CJS] lib/client.js      684.54 kB │ gzip: 138.43 kB
+ℹ [CJS] lib/client.js.map    1.05 MB
+ℹ [CJS] 2 files, total: 1.73 MB
+✔ Build complete in 116ms
+ℹ Hint: consider adding deps.onlyBundle option to avoid unintended bundling of dependencies, or set deps.onlyBundle: false to disable this hint.
+See more at https://tsdown.dev/options/dependencies#deps-onlybundle
+Detected dependencies in bundle:
+- @modelcontextprotocol/client
+- zod
+- @modelcontextprotocol/core
+- pkce-challenge
+- eventsource-parser
+- @modelcontextprotocol/server
+ℹ [ESM] lib/runtime/session/dsh-mcp-launcher.mjs  1.51 MB
+ℹ [ESM] 1 files, total: 1.51 MB
+✔ Build complete in 128ms
+[verify-bundle] module requests: @deepseek-ai/dsh-api-gateway/client, @deepseek-ai/dsh-client-store, @deepseek-ai/dsh-client-ui-primitives, react, react-dom, zod
+[verify-bundle] cordis inject: [uiConversation, slots, locale, remote, remoteAccess, sessions, workspaces, uiWorkspace, sidebarRight, configForms, remote.settings, remote.session]; optional reads: [conversation]
+[verify-bundle] tarball files: 246
+[verify-bundle] runtime relative-import closure: 97 JavaScript artifacts checked
+[verify-bundle] public remote declarations: strict consumer passed
+[verify-bundle] OK: manifest / artifacts / closure / module requests / source audit / style pipeline / tarball 全部通过
+EXIT=0

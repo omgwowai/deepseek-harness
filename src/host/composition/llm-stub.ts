@@ -17,7 +17,7 @@
  * 本包 tsconfig 用 `types: []`；本文件需要 `os.tmpdir()` 作为 probe 子进程
  * 的 cwd，经 triple-slash reference 引入 @types/node
  * （src/protocol/v1/connection.ts 同款先例）。
- * @module @zaimokuza/dsh-acp-adapter/host/composition/llm-stub
+ * @module @local/dsh-acp-adapter/host/composition/llm-stub
  */
 
 /// <reference types="node" />

@@ -18,7 +18,7 @@
  * - capability/config hash：保持 advisory（capabilityHash/configHash 字段
  *   只记录不阻断），保住热切换与 devin 既有行为。
  *
- * @module @zaimokuza/dsh-acp-adapter/domain/session/launch-fingerprint
+ * @module @local/dsh-acp-adapter/domain/session/launch-fingerprint
  */
 /// <reference types="node" />
 

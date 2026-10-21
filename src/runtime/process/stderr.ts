@@ -1,7 +1,7 @@
 /**
  * stderr 环形缓冲与脱敏（自 acp-client.ts 切出）：行数与总字节双上限；
  * 写入缓冲前脱敏，不在缓冲中保留敏感原文。
- * @module @zaimokuza/dsh-acp-adapter/runtime/process/stderr
+ * @module @local/dsh-acp-adapter/runtime/process/stderr
  */
 
 export const DEFAULT_STDERR_MAX_LINES = 200

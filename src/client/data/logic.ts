@@ -4,7 +4,7 @@
  * No DOM, fetch, React, or Host implementation imports. Profile identities and
  * wire shapes follow the shared browser-safe contracts; decoders reject
  * malformed payloads before they reach the view.
- * @module @zaimokuza/dsh-acp-adapter/client/logic
+ * @module @local/dsh-acp-adapter/client/logic
  */
 
 import { catalogEntryOf } from './catalog.ts'

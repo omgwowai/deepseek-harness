@@ -30,31 +30,31 @@ describe('DSH clean-install gate contracts', () => {
   })
 
   it('accepts source specs and an optional explicit update spec without changing the tarball default', () => {
-    expect(parseArgs(['--spec', '@zaimokuza/dsh-acp-adapter@0.2.0-rc.2.3'])).toMatchObject({
+    expect(parseArgs(['--spec', '@local/dsh-acp-adapter@0.2.0-rc.2.3'])).toMatchObject({
       tgz: undefined,
-      spec: '@zaimokuza/dsh-acp-adapter@0.2.0-rc.2.3',
+      spec: '@local/dsh-acp-adapter@0.2.0-rc.2.3',
       updateSpec: undefined,
     })
     expect(
       parseArgs([
         '--spec',
-        '@zaimokuza/dsh-acp-adapter@0.2.0-rc.2.2',
+        '@local/dsh-acp-adapter@0.2.0-rc.2.2',
         '--update-spec',
-        '@zaimokuza/dsh-acp-adapter@next',
+        '@local/dsh-acp-adapter@next',
       ]),
     ).toMatchObject({
-      spec: '@zaimokuza/dsh-acp-adapter@0.2.0-rc.2.2',
-      updateSpec: '@zaimokuza/dsh-acp-adapter@next',
+      spec: '@local/dsh-acp-adapter@0.2.0-rc.2.2',
+      updateSpec: '@local/dsh-acp-adapter@next',
     })
     expect(() => parseArgs(['--tgz', './adapter.tgz', '--spec', 'plugin'])).toThrow(/mutually exclusive/)
-    expect(() => parseArgs(['--update-spec', '@zaimokuza/dsh-acp-adapter@next'])).toThrow(/requires --spec/)
+    expect(() => parseArgs(['--update-spec', '@local/dsh-acp-adapter@next'])).toThrow(/requires --spec/)
   })
 
   it('requires the stock loop/picker rows and one additive adapter row', () => {
     const dump = [
       '- id: agent-loop\n  name: @deepseek-ai/dsh-agent-loop',
       '- id: ui-model-selection\n  name: @deepseek-ai/dsh-client-ui-model-selection',
-      '- id: dsh-acp-adapter\n  name: @zaimokuza/dsh-acp-adapter',
+      '- id: dsh-acp-adapter\n  name: @local/dsh-acp-adapter',
     ].join('\n')
     expect(() => assertComposedDump(dump)).not.toThrow()
     expect(() => assertComposedDump(dump.replace('id: agent-loop', 'id: agent-loop\n  disabled: true'))).toThrow(
@@ -69,7 +69,7 @@ describe('DSH clean-install gate contracts', () => {
     const dump = [
       '- id: agent-loop\n  name: @deepseek-ai/dsh-agent-loop',
       '- id: ui-model-selection\n  name: @deepseek-ai/dsh-client-ui-model-selection',
-      "- id: dsh-acp-adapter\n  name: '@zaimokuza/dsh-acp-adapter'\n  config:\n    toolApprovalDefault: ask",
+      "- id: dsh-acp-adapter\n  name: '@local/dsh-acp-adapter'\n  config:\n    toolApprovalDefault: ask",
     ].join('\n')
     expect(() => assertAcpConfigSentinel(dump)).not.toThrow()
     expect(() =>

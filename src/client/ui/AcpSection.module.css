@@ -1,7 +1,7 @@
 /* ACP settings panel stylesheet。
  *
  * Compiled by the bundle's dsh-css-modules-inline plugin (lightningcss,
- * hashed locals) and injected as one `<style data-plugin="@zaimokuza/dsh-acp-adapter">`
+ * hashed locals) and injected as one `<style data-plugin="@local/dsh-acp-adapter">`
  * tag at factory execution — the reference preset's virtual-module mechanism;
  * the loader removes plugin-owned tags on unload. Every color resolves
  * through a `--dsw-alias-*` token (ModelsSection.module.css vocabulary);

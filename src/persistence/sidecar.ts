@@ -103,7 +103,7 @@
  * 强制前提：缺席时 ACP 会话一律拒绝启动（fail loud，见
  * provider runtime），不再「退化为纯窥测」。
  *
- * @module @zaimokuza/dsh-acp-adapter/persistence/sidecar
+ * @module @local/dsh-acp-adapter/persistence/sidecar
  */
 
 /// <reference types="node" />

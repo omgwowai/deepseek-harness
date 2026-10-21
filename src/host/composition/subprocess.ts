@@ -10,7 +10,7 @@
  *
  * 结构化窄化先例：src/domain/policy/sandbox.ts 的权限策略类型、
  * 本模块同目录 installed-profile-registry.ts 对 dsh-settings 的 `ctx.get('settings')` 窄化。
- * @module @zaimokuza/dsh-acp-adapter/host/composition/subprocess
+ * @module @local/dsh-acp-adapter/host/composition/subprocess
  */
 
 import type { Context } from '@deepseek-ai/cordis'

@@ -10,9 +10,9 @@
 
 **推荐：** 在 DSH Creator 模式中发送：
 
-> 请安装并启用 ACP 插件：`@zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3`。
+> 请安装并启用 ACP 插件：`@local/dsh-acp-adapter@0.2.1-rc.2.3`。
 
-按提示确认安装，新插件默认启用。也可打开 **插件 → 添加插件**，粘贴 `@zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3`，安装后点 **立即启用**。
+按提示确认安装，新插件默认启用。也可打开 **插件 → 添加插件**，粘贴 `@local/dsh-acp-adapter@0.2.1-rc.2.3`，安装后点 **立即启用**。
 
 <details>
 <summary>其他安装方式：命令行、Git 与压缩包</summary>
@@ -23,10 +23,10 @@
 
 ```bash
 # Desktop
-dsh plugin --profile desktop add @zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3
+dsh plugin --profile desktop add @local/dsh-acp-adapter@0.2.1-rc.2.3
 
 # Web
-npx @deepseek-ai/dsh@0.2.1-rc.2 plugin --profile web add @zaimokuza/dsh-acp-adapter@0.2.1-rc.2.3
+npx @deepseek-ai/dsh@0.2.1-rc.2 plugin --profile web add @local/dsh-acp-adapter@0.2.1-rc.2.3
 ```
 
 Git 与压缩包安装示例：

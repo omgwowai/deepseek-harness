@@ -22,7 +22,7 @@
  * 配置归属纪律：调用方只传 key 与当前配置一致的最后一次明确 probe；配置不
  * 匹配或没有记录时传 undefined。本状态机不消费模型目录的运行时缓存 TTL。
  *
- * @module @zaimokuza/dsh-acp-adapter/domain/session/agent-state
+ * @module @local/dsh-acp-adapter/domain/session/agent-state
  */
 
 import type { AcpAgentConfigState } from '../../contract/remote.ts'

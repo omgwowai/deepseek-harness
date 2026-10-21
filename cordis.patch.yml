@@ -1,4 +1,4 @@
-# @zaimokuza/dsh-acp-adapter bundle patch layer for the supported DSH host.
+# @local/dsh-acp-adapter bundle patch layer for the supported DSH host.
 # The adapter is additive; the native AgentLoop and ModelPicker remain the default.
 #
 # This file becomes one patch layer when the package is listed in a profile's
@@ -10,5 +10,5 @@
 #
 - insert:
     - id: dsh-acp-adapter
-      name: '@zaimokuza/dsh-acp-adapter'
+      name: '@local/dsh-acp-adapter'
       config: {}

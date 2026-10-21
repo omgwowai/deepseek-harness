@@ -15,6 +15,7 @@ it('reads both sides of the native import rename without rewriting the old confi
     const expected = {
       agents: { codex: { name: 'Codex', command: 'codex-acp', args: [], env: {} } },
       toolApprovalDefault: 'auto',
+      teamBridge: false,
     }
     expect(await readLegacyAcpSettings(home)).toEqual(expected)
     await rename(join(home, 'settings.yaml'), join(home, 'settings.yaml.imported'))
@@ -32,11 +33,13 @@ it('publishes a rehydratable form while keeping host-only Agent validation', asy
   const schema = new z(JSON.parse(JSON.stringify(Config.toJSON())))
   delete schema.dict!.agents!.meta.volatile
   delete schema.dict!.toolApprovalDefault!.meta.volatile
+  delete schema.dict!.teamBridge!.meta.volatile
   const value = { agents: { codex: { name: 'Codex', command: 'codex-acp', args: [], env: {} } } }
   expect(schema({ ...value, searchableModelPicker: true })).toEqual({
     ...value,
     searchableModelPicker: true,
     toolApprovalDefault: 'auto',
+    teamBridge: false,
   })
   expect(Config(value).agents.get()).toEqual(value.agents)
   expect(Config({ ...value, searchableModelPicker: true }).agents.get()).toEqual(value.agents)

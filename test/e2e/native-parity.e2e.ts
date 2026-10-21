@@ -1084,7 +1084,7 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
     async () => {
       const manager = host.ctx.pluginManager
       const adapterEntry = required(
-        (await manager.listPlugins()).find((entry) => entry.moduleName === '@zaimokuza/dsh-acp-adapter'),
+        (await manager.listPlugins()).find((entry) => entry.moduleName === '@local/dsh-acp-adapter'),
       )
       await host.ctx.agentDefaultModel.saveSelection({ provider: 'native-control', model: 'native-model' })
       await page.getByRole('button', { name: 'New session', exact: true }).last().click()

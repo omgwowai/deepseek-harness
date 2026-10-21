@@ -24,6 +24,7 @@ class SettingsDocument {
   readonly config = {
     agents: { get: () => acpSettingsSchema(this.value).agents },
     toolApprovalDefault: { get: () => acpSettingsSchema(this.value).toolApprovalDefault },
+    teamBridge: { get: () => acpSettingsSchema(this.value).teamBridge },
   }
   configure() {
     return () => {}

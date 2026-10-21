@@ -13,7 +13,7 @@
  * actions and hands them here. Attach replays the full projection (`resync`)
  * so a re-created entry store catches up in one publish; while unattached the
  * controller still tracks state and simply has no mirror.
- * @module @zaimokuza/dsh-acp-adapter/client/controller
+ * @module @local/dsh-acp-adapter/client/controller
  */
 
 import {

@@ -7,7 +7,7 @@
  * 不 import client 模块（client bundle 目标 browser），这里独立内嵌同一份
  * 纯数据——两层消费同一快照文件，一致性由 CI 的
  * scripts/verify-registry-snapshot.ts 钉死。
- * @module @zaimokuza/dsh-acp-adapter/domain/session/registry-versions
+ * @module @local/dsh-acp-adapter/domain/session/registry-versions
  */
 
 import executablesJson from '../../../assets/registry/executables.json' with { type: 'json' }

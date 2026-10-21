@@ -82,7 +82,7 @@ export function acpSessionView(ctx: Context, session: Session | undefined): Sess
       if (state === undefined) throw new Error('DSH permission projection is unavailable')
       return state
     },
-    append: (type, data) => session.append(type as keyof SessionEventMap, data as never),
+    append: (type, data, options) => session.append(type as keyof SessionEventMap, data as never, options as never),
     watchTurnEnd: (listener) =>
       ctx.on('session/event', (owner, event) => {
         if (owner.id === session.id && event.type === 'turn/end') listener()

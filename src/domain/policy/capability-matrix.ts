@@ -14,7 +14,7 @@
  *
  * 广告数据缺席（caps 为 null = 未 probe/未握手）时矩阵不空缺：每行
  * advertised=null，status 仍按 adapter/host 事实如实给出。
- * @module @zaimokuza/dsh-acp-adapter/domain/policy/capability-matrix
+ * @module @local/dsh-acp-adapter/domain/policy/capability-matrix
  */
 
 /** 能力矩阵一行的端到端状态词表（恒定三值）。 */

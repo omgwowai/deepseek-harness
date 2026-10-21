@@ -15,7 +15,7 @@
  * 绝不把一次选择升格为 always 类 optionId。`asked` 里的 optionId 保持精确，
  * 其余外部字段按持久化边界有界化。
  *
- * @module @zaimokuza/dsh-acp-adapter/domain/policy/events
+ * @module @local/dsh-acp-adapter/domain/policy/events
  */
 
 import { createHash } from 'node:crypto'

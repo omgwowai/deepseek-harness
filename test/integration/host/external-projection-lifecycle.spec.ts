@@ -207,6 +207,7 @@ async function fixture(repair = false, catalogBarrier = false) {
       installInstalledProfileRegistry(scope, {
         agents: { get: () => ({ claude: { name: 'Claude fixture', command: 'unused', args: [], env: {} } }) },
         toolApprovalDefault: { get: () => 'auto' },
+        teamBridge: { get: () => false },
       })
     },
   })

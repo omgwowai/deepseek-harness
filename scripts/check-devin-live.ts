@@ -337,11 +337,11 @@ try {
   const bundles = [
     '@deepseek-ai/dsh-base',
     '@deepseek-ai/dsh-experimental-agent-team-profile',
-    '@zaimokuza/dsh-acp-adapter',
+    '@local/dsh-acp-adapter',
   ]
   initProfile(profileDir, bundles)
   for (const name of bundles) {
-    const directory = name.startsWith('@zaimokuza/')
+    const directory = name.startsWith('@local/')
       ? packageRoot
       : dirname(requireHost.resolve(`${name}/package.json`))
     const link = join(profileDir, 'node_modules', name)

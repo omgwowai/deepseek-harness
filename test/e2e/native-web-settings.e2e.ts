@@ -95,7 +95,7 @@ it('keeps native Search/Fetch settings and Flash labels independent of the loade
 
     const inventory = await openPlugins(page)
     expect(await inventory.locator('[data-plugin-item="web-search"]').count()).toBe(1)
-    expect(await inventory.locator('[data-plugin-package="@zaimokuza/dsh-acp-adapter"]').count()).toBe(1)
+    expect(await inventory.locator('[data-plugin-package="@local/dsh-acp-adapter"]').count()).toBe(1)
     let detail = await openWebSearch(page)
     const toggle = () => required(page).getByRole('switch', { name: 'Use the new Web Search API', exact: true })
     const endpoint = () => required(page).locator('#plugin-config-web-search-endpoint')

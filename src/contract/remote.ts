@@ -10,7 +10,7 @@
  * 形状纪律：全部字段只含 string/number/boolean/字面量联合/null/readonly 数组与
  * `Record<string, string>` 标签——strict 生成已验证保真（readonly/union/literal/
  * null 联合/z.record）。改这里的形状必须重跑 `pnpm gen:typert` 并全绿门禁。
- * @module @zaimokuza/dsh-acp-adapter/contract/remote
+ * @module @local/dsh-acp-adapter/contract/remote
  */
 
 /** Stable ACP diagnostics preserved by the supported DSH typed Remote failure carrier. */
