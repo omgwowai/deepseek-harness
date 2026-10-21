@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-acp-adapter",
-  "version": "0.2.1-rc.2.3-fork.2",
+  "version": "0.2.1-rc.2.3-fork.3",
   "description": "Use AI agents from the DSH session UI.",
   "icon": "./icon.svg",
   "keywords": [

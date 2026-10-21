@@ -156,4 +156,36 @@ describe('native ACP tool rows', () => {
       arguments: JSON.stringify({ command: "printf 'out\\n'", cwd: '/work' }, null, 2),
     })
   })
+
+  it('derives the read row for a Codex exec_command that only carries a location', () => {
+    const { rows, appends, result } = harness()
+    const call: AcpToolCallSnapshot = {
+      callId: 'exec-read',
+      status: 'running',
+      name: 'exec_command',
+      kind: 'read',
+      title: "Read file '/work/README.md'",
+      locations: [{ path: '/work/README.md' }],
+    }
+    rows.observe(call)
+    rows.observe({ ...call, status: 'completed' }, { terminal_output_delta: { data: '# Title\n' } })
+    const kinds = appends.map((appended) => appended.type)
+    expect(kinds).toEqual(['assistant/message', 'tool/call', 'tool/result'])
+    expect(record(appends[1]!.data)).toMatchObject({
+      name: 'read',
+      arguments: JSON.stringify({ file_path: '/work/README.md' }, null, 2),
+    })
+    expect(result().content).toEqual([{ type: 'text', text: '# Title\n' }])
+  })
+
+  it('reports a recorded successful result and stays silent for anything less', () => {
+    const success = harness()
+    expect(success.rows.observe(codexCall({ status: 'completed' }))).toBe(true)
+    const failure = harness()
+    expect(failure.rows.observe(codexCall({ status: 'failed' }))).toBe(false)
+    const cancelled = harness()
+    cancelled.rows.observe(codexCall({}))
+    cancelled.rows.settleOpen()
+    expect(cancelled.rows.observe(codexCall({ status: 'completed' }))).toBe(false)
+  })
 })

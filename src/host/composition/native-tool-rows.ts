@@ -21,6 +21,14 @@
  * connection still holds for a `terminal` content item, then the result's own
  * text content. A body is bounded to its tail and marked `[output truncated]`;
  * a known non-zero exit is marked `[exit code: N]` like DSH's own bash.
+ *
+ * `observe` also reports whether it recorded a successful result — the
+ * fork-side evidence that a textless `end_turn` had real work behind it, the
+ * native counterpart of the host-tool-result evidence upstream. And because
+ * Codex reports a read-shaped command (its parser classified the call as a
+ * file read) as an `exec_command` call with only a location and never attaches
+ * `rawInput`, such a call is presented as the DSH `read` tool with its real
+ * path instead of an empty argument set.
  */
 import { randomUUID } from 'node:crypto'
 
@@ -134,20 +142,50 @@ const KIND_PRESENTATIONS: Readonly<Record<string, ToolPresentation>> = {
 const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
 
-/** The row name/arguments one ACP call presents as: a DSH wire tool when the pair is known. */
-export function nativeToolPresentation(
+/**
+ * One location without `rawInput` is a file read. Codex parses a command such
+ * as `sed -n '1,240p' README.md` as a read and reports it as an `exec_command`
+ * tool call whose only argument material is the single `locations` entry; it
+ * never attaches `rawInput`, so the location is the call's real argument.
+ */
+function locationReadPresentation(
+  snapshot: AcpToolCallSnapshot,
+): { readonly name: string; readonly arguments: string } | undefined {
+  if (snapshot.name !== 'exec_command') return undefined
+  const locations = Array.isArray(snapshot.locations) ? snapshot.locations : []
+  if (locations.length !== 1) return undefined
+  const path = record(locations[0])?.['path']
+  if (typeof path !== 'string' || path === '') return undefined
+  return { name: 'read', arguments: JSON.stringify({ file_path: path }, null, 2) }
+}
+
+/**
+ * The row a call presents as once its arguments are known: a DSH wire tool when
+ * the profile maps the native pair, else the native pair unchanged. `undefined`
+ * means the call must wait — an agent may announce a call with a title first
+ * and attach its input one update later, and the stored row is immutable. A
+ * terminal snapshot instead admits the fallback row: the terminal update never
+ * comes later and must still advertise the call.
+ */
+function knownPresentation(
   profile: string,
   snapshot: AcpToolCallSnapshot,
-): { readonly name: string; readonly arguments: string } {
+  terminal: boolean,
+): { readonly name: string; readonly arguments: string } | undefined {
   const args = record(snapshot.rawInput)
   const origin =
     (typeof snapshot.name === 'string' && snapshot.name !== '' ? snapshot.name : undefined) ??
     (typeof snapshot.title === 'string' && snapshot.title !== '' ? snapshot.title : undefined) ??
     (typeof snapshot.kind === 'string' && snapshot.kind !== '' ? snapshot.kind : 'tool')
+  if (args === undefined) {
+    const read = locationReadPresentation(snapshot)
+    if (read !== undefined) return read
+    return terminal ? { name: origin, arguments: JSON.stringify({}, null, 2) } : undefined
+  }
   const entry =
     PRESENTATIONS[profile]?.[origin] ??
     (typeof snapshot.kind === 'string' ? KIND_PRESENTATIONS[snapshot.kind] : undefined)
-  if (entry === undefined || args === undefined) return { name: origin, arguments: JSON.stringify(args ?? {}, null, 2) }
+  if (entry === undefined) return { name: origin, arguments: JSON.stringify(args, null, 2) }
   const shaped = entry.shape === undefined ? args : entry.shape(args)
   if (shaped === null) return { name: origin, arguments: JSON.stringify(args, null, 2) }
   const out: Record<string, unknown> = { ...shaped }
@@ -294,65 +332,71 @@ export class AcpNativeToolRows {
     private readonly terminalOutput?: (terminalId: string) => AcpTerminalOutputPeek | undefined,
   ) {}
 
-  /** Observe one merged ACP call snapshot: advertise on first sight, settle on terminal. */
-  observe(snapshot: AcpToolCallSnapshot, meta?: unknown): void {
+  /**
+   * Observe one merged ACP call snapshot: advertise on first sight, settle on
+   * terminal. Returns true when this observation itself settled a call whose
+   * recorded result proves the agent ran it successfully — the evidence the
+   * profile adapter uses to accept a textless `end_turn` instead of failing it
+   * (a call whose row was refused proves nothing).
+   */
+  observe(snapshot: AcpToolCallSnapshot, meta?: unknown): boolean {
     const session = this.session
-    if (session === undefined) return
     const id = snapshot.callId
-    if (typeof id !== 'string' || id.length === 0 || this.settled.has(id)) return
+    if (session === undefined || typeof id !== 'string' || id.length === 0 || this.settled.has(id)) return false
+    const terminal = snapshot.status === 'completed' || snapshot.status === 'failed' || snapshot.status === 'cancelled'
     if (meta !== undefined && meta !== null) this.absorbMeta(id, meta)
+    const presented = knownPresentation(this.profile(), snapshot, terminal)
     let row = this.open.get(id)
     if (row === undefined) {
-      // ACP agents announce a call before they attach its input (Claude's first
-      // update carries only a title, no `rawInput`). The stored row is
-      // immutable, so wait for usable arguments — or for the terminal update,
-      // which never comes later and must still produce a row.
-      const terminal = snapshot.status === 'completed' || snapshot.status === 'failed' || snapshot.status === 'cancelled'
-      if (record(snapshot.rawInput) === undefined && !terminal) return
+      // A call with no arguments yet (and no derivable ones) is not advertised
+      // until its terminal update, which never comes later and must still
+      // produce a row — with whatever the snapshot shows.
+      if (presented === undefined) return false
       const step = session.facts.openSteps.at(-1)
-      if (step === undefined) return
-      const presented = nativeToolPresentation(this.profile(), snapshot)
       const append = session.append
-      if (append === undefined) return
-      try {
-        append('assistant/message', {
-          turn: step.turn,
-          step: step.step,
-          message: {
-            role: 'assistant',
-            content: [{ type: 'tool-call', id, name: presented.name, arguments: presented.arguments }],
-            source: { kind: 'model', provider: this.provider, model: this.model },
-            id: randomUUID(),
-          },
-          stream: [
-            {
-              type: 'tool-call-chunks',
-              time0: 0,
-              index: 0,
-              dt: [],
-              id,
-              name: presented.name,
-              args: [presented.arguments],
+      if (step !== undefined && append !== undefined) {
+        try {
+          append('assistant/message', {
+            turn: step.turn,
+            step: step.step,
+            message: {
+              role: 'assistant',
+              content: [{ type: 'tool-call', id, name: presented.name, arguments: presented.arguments }],
+              source: { kind: 'model', provider: this.provider, model: this.model },
+              id: randomUUID(),
             },
-            { type: 'chunk', time: 0, chunk: { type: 'finish', reason: { kind: 'stop' } } },
-          ],
-        }, { surfaceOp: 'append' })
-        append('tool/call', {
-          turn: step.turn,
-          step: step.step,
-          callId: id,
-          name: presented.name,
-          arguments: presented.arguments,
-        })
-      } catch (error) {
-        this.settled.add(id)
-        this.log?.(`ACP native tool row skipped for ${id}: ${String(error)}`)
-        return
+            stream: [
+              {
+                type: 'tool-call-chunks',
+                time0: 0,
+                index: 0,
+                dt: [],
+                id,
+                name: presented.name,
+                args: [presented.arguments],
+              },
+              { type: 'chunk', time: 0, chunk: { type: 'finish', reason: { kind: 'stop' } } },
+            ],
+          }, { surfaceOp: 'append' })
+          append('tool/call', {
+            turn: step.turn,
+            step: step.step,
+            callId: id,
+            name: presented.name,
+            arguments: presented.arguments,
+          })
+        } catch (error) {
+          this.settled.add(id)
+          this.log?.(`ACP native tool row skipped for ${id}: ${String(error)}`)
+          return false
+        }
+        row = { name: presented.name, arguments: presented.arguments, turn: step.turn, step: step.step, snapshot }
+        this.open.set(id, row)
+      } else if (!terminal) {
+        return false
       }
-      row = { name: presented.name, arguments: presented.arguments, turn: step.turn, step: step.step, snapshot }
-      this.open.set(id, row)
     } else row.snapshot = snapshot
-    if (snapshot.status === 'completed' || snapshot.status === 'failed' || snapshot.status === 'cancelled') this.settle(id)
+    return terminal ? this.settle(id) : false
   }
 
   /** Settle every open row with its last observed status (unfinished calls keep their content). */
@@ -385,19 +429,25 @@ export class AcpNativeToolRows {
     if (typeof signal === 'string' && signal !== '') output.signal = signal
   }
 
-  private settle(id: string, force?: AcpToolCallStatus): void {
+  /**
+   * Append the `tool/result` row for one open call. Returns true when the
+   * recorded result is a successful run — the durable evidence for accepting a
+   * textless `end_turn`; a call settled as cancelled/failed, or a result the
+   * session refused, is not evidence.
+   */
+  private settle(id: string, force?: AcpToolCallStatus): boolean {
     const row = this.open.get(id)
-    if (row === undefined) return
+    if (row === undefined) return false
     this.open.delete(id)
     this.settled.add(id)
     const captured = this.outputs.get(id)
     this.outputs.delete(id)
     const session = this.session
-    if (session === undefined) return
+    if (session === undefined) return false
     const snapshot = force === undefined ? row.snapshot : { ...row.snapshot, status: force }
     const { content, isError } = resultContent(snapshot, { captured, peek: this.terminalOutput })
     const append = session.append
-    if (append === undefined) return
+    if (append === undefined) return false
     try {
       append('tool/result', {
         turn: row.turn,
@@ -414,7 +464,9 @@ export class AcpNativeToolRows {
       }, { surfaceOp: 'append' })
     } catch (error) {
       this.log?.(`ACP native tool result skipped for ${id}: ${String(error)}`)
+      return false
     }
+    return !isError
   }
 
   private profile(): string {

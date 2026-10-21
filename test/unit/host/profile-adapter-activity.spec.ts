@@ -2033,6 +2033,128 @@ describe('provider activity bridge', () => {
     expect(finish?.reason).toEqual({ kind: 'stop' })
   })
 
+  it('accepts an empty end_turn after a native ACP tool result the adapter recorded', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-acp-native-tool-result-'))
+    roots.push(root)
+    const sidecar = testSidecar(root)
+    const message = user('Run the requested command.')
+    const sessionId = 'session-native-tool-result'
+    const appends: string[] = []
+    const sessions = new Map<string, SessionLike>([
+      [
+        sessionId,
+        Object.assign(session(message), {
+          append: (type: string) => {
+            appends.push(type)
+          },
+        }),
+      ],
+    ])
+    const runtimeFactory = (): AcpProfileRuntime => ({
+      acpSessionId: 'agent-native-tool-result',
+      agentInfo: { name: 'native-tool-result-agent', version: '1' },
+      agentCapabilities: {},
+      protocolVersion: 1,
+      start: async () => undefined,
+      prompt: async (_content, onUpdate) => {
+        onUpdate({
+          sessionId: 'agent-native-tool-result',
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'call-native-1',
+            name: 'Bash',
+            kind: 'execute',
+            title: 'echo hi',
+            status: 'in_progress',
+            rawInput: { command: 'echo hi' },
+          },
+        } as never)
+        onUpdate({
+          sessionId: 'agent-native-tool-result',
+          update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-native-1', status: 'completed' },
+        } as never)
+        return { stopReason: 'end_turn' } as never
+      },
+      close: async () => undefined,
+    })
+    const adapter = new AcpProfileAdapter(
+      'native-tool-result',
+      profile,
+      seam(),
+      (id) => sessions.get(id),
+      ledgerFor(sidecar),
+      undefined,
+      runtimeFactory,
+      sidecar,
+    )
+    const chunks: unknown[] = []
+    for await (const chunk of adapter.stream(request(sessionId, message))) chunks.push(chunk)
+    const finish = chunks.find(
+      (chunk) => typeof chunk === 'object' && chunk !== null && 'type' in chunk && chunk.type === 'finish',
+    ) as { reason?: { kind?: string; failure?: { code?: string } } } | undefined
+    expect(finish?.reason).toEqual({ kind: 'stop' })
+    expect(appends.slice(-3)).toEqual(['assistant/message', 'tool/call', 'tool/result'])
+  })
+
+  it('fails an empty end_turn whose only native call did not succeed', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-acp-native-tool-failed-'))
+    roots.push(root)
+    const sidecar = testSidecar(root)
+    const message = user('Run the requested command.')
+    const sessionId = 'session-native-tool-failed'
+    const sessions = new Map<string, SessionLike>([
+      [
+        sessionId,
+        Object.assign(session(message), {
+          append: (type: string) => type,
+        }),
+      ],
+    ])
+    const runtimeFactory = (): AcpProfileRuntime => ({
+      acpSessionId: 'agent-native-tool-failed',
+      agentInfo: { name: 'native-tool-failed-agent', version: '1' },
+      agentCapabilities: {},
+      protocolVersion: 1,
+      start: async () => undefined,
+      prompt: async (_content, onUpdate) => {
+        onUpdate({
+          sessionId: 'agent-native-tool-failed',
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'call-native-2',
+            name: 'Bash',
+            kind: 'execute',
+            title: 'exit 7',
+            status: 'in_progress',
+            rawInput: { command: 'exit 7' },
+          },
+        } as never)
+        onUpdate({
+          sessionId: 'agent-native-tool-failed',
+          update: { sessionUpdate: 'tool_call_update', toolCallId: 'call-native-2', status: 'failed' },
+        } as never)
+        return { stopReason: 'end_turn' } as never
+      },
+      close: async () => undefined,
+    })
+    const adapter = new AcpProfileAdapter(
+      'native-tool-failed',
+      profile,
+      seam(),
+      (id) => sessions.get(id),
+      ledgerFor(sidecar),
+      undefined,
+      runtimeFactory,
+      sidecar,
+    )
+    const chunks: unknown[] = []
+    for await (const chunk of adapter.stream(request(sessionId, message))) chunks.push(chunk)
+    const finish = chunks.find(
+      (chunk) => typeof chunk === 'object' && chunk !== null && 'type' in chunk && chunk.type === 'finish',
+    ) as { reason?: { kind?: string; failure?: { code?: string } } } | undefined
+    expect(finish?.reason).toMatchObject({ kind: 'error', failure: { code: 'ACP_NO_VISIBLE_RESPONSE' } })
+  })
+
   it.each([
     ['refusal', 'error', 'ACP_REFUSAL'],
     ['max_tokens', 'max-tokens', undefined],

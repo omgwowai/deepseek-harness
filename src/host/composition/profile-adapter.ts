@@ -3057,7 +3057,7 @@ export class AcpProfileAdapter extends LlmAdapter {
               ...(update.content === undefined ? {} : { content: update.content }),
             }
             toolCall = toolCallReducer.apply(patch, { externalSignalAborted: options.signal?.aborted === true })
-            nativeToolRows.observe(toolCall, update._meta)
+            if (nativeToolResultEligible && nativeToolRows.observe(toolCall, update._meta)) nativeToolResultConfirmed = true
             const terminal = isTerminalActivityStatus(activityStatus(toolCall.status))
             const previousTerminal = toolContentBoundaries.get(toolId)
             if (previousTerminal === undefined || (previousTerminal && !terminal)) {
@@ -3196,6 +3196,11 @@ export class AcpProfileAdapter extends LlmAdapter {
         let turnConclusionConfirmed = false
         let successfulToolResultEligible = true
         let successfulToolResultConfirmed = false
+        // Native counterpart of the successful host tool result: a call the
+        // agent executed itself whose recorded result proves it ran. Same
+        // evidence-eligibility boundary as the host callbacks below.
+        let nativeToolResultEligible = true
+        let nativeToolResultConfirmed = false
         handoff.cancel = () => {
           nativeToolRows.settleOpen('cancelled')
           inputAbort.abort(new Error('ACP stream consumer ended'))
@@ -3264,6 +3269,8 @@ export class AcpProfileAdapter extends LlmAdapter {
           const previousTurnConclusionConfirmed = turnConclusionConfirmed
           const previousSuccessfulToolResultEligible = successfulToolResultEligible
           const previousSuccessfulToolResultConfirmed = successfulToolResultConfirmed
+          const previousNativeToolResultEligible = nativeToolResultEligible
+          const previousNativeToolResultConfirmed = nativeToolResultConfirmed
           const previousRemoteCancellationHook = remoteCancellationHook
           let projectedAtDispatch = false
           let segmentBoundaryVersion = contentBreakVersion
@@ -3292,6 +3299,8 @@ export class AcpProfileAdapter extends LlmAdapter {
             turnConclusionConfirmed = false
             successfulToolResultEligible = false
             successfulToolResultConfirmed = false
+            nativeToolResultEligible = false
+            nativeToolResultConfirmed = false
           }
           const restoreProjection = (): void => {
             remoteCancellationHook = previousRemoteCancellationHook
@@ -3303,6 +3312,8 @@ export class AcpProfileAdapter extends LlmAdapter {
             turnConclusionConfirmed = previousTurnConclusionConfirmed
             successfulToolResultEligible = previousSuccessfulToolResultEligible
             successfulToolResultConfirmed = previousSuccessfulToolResultConfirmed
+            nativeToolResultEligible = previousNativeToolResultEligible
+            nativeToolResultConfirmed = previousNativeToolResultConfirmed
             // Restore the prior text segment only when nothing arrived after
             // the request boundary; never revisit an index already emitted.
             if (
@@ -3595,19 +3606,29 @@ export class AcpProfileAdapter extends LlmAdapter {
               turnConclusionConfirmed &&
               !promptSignal.aborted &&
               options.signal?.aborted !== true
-            const hasSuccessfulToolResult =
+const hasSuccessfulToolResult =
               response.stopReason === 'end_turn' &&
               successfulToolResultConfirmed &&
               !promptSignal.aborted &&
               options.signal?.aborted !== true
-            // This records a delivered Host tool result, not completion of the user's broader task.
+            // The native-tool counterpart of that evidence: the agent ran its own
+            // tool to a successful result this prompt recorded. Without it a
+            // teamBridge-off profile would fail every silent tool-only turn the
+            // way an answered one is never failed.
+            const hasSuccessfulNativeToolResult =
+              response.stopReason === 'end_turn' &&
+              nativeToolResultConfirmed &&
+              !promptSignal.aborted &&
+              options.signal?.aborted !== true
+            // This records delivered tool work, not completion of the user's broader task.
             const finalReason =
               responseFinish.kind === 'stop' &&
               !visibleContentEmitted &&
               !interruptedForInput &&
               !hasCompletedReport &&
               !hasConcludedTurnTool &&
-              !hasSuccessfulToolResult
+              !hasSuccessfulToolResult &&
+              !hasSuccessfulNativeToolResult
                 ? {
                     kind: 'error' as const,
                     failure: {
