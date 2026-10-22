@@ -1,0 +1,368 @@
+/* ACP settings panel stylesheet。
+ *
+ * Compiled by the bundle's dsh-css-modules-inline plugin (lightningcss,
+ * hashed locals) and injected as one `<style data-plugin="@local/dsh-acp-adapter">`
+ * tag at factory execution — the reference preset's virtual-module mechanism;
+ * the loader removes plugin-owned tags on unload. Every color resolves
+ * through a `--dsw-alias-*` token (ModelsSection.module.css vocabulary);
+ * `--ds-font-family-code` is the theme-owned code-font scale (ui-theme
+ * base.css, same token upstream markdown code uses). No literal colors.
+ */
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+}
+.sectionTitle {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+}
+.preferences {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 16px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+.preferencesTitle {
+  margin: 0;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+}
+.notice {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-state-warn-label);
+}
+.error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-state-error-primary);
+}
+.hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.addActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.addMenu {
+  flex: 1 1 0;
+  min-width: 180px;
+}
+/* Reads the resolved frame clearance without taking space or participating in hit testing. */
+.catalogGeometryProbe {
+  position: fixed;
+  top: 0;
+  left: -10000px;
+  width: 0;
+  height: max(12px, var(--dsh-frame-overlay-top, 12px));
+  visibility: hidden;
+  pointer-events: none;
+  contain: strict;
+}
+/* The native Menu owns material, keyboard interaction, and its pinned footer.
+   Its public listClassName hook scopes sizing to this catalog card in portal mode. */
+.catalogMenu {
+  width: min(var(--acp-catalog-menu-width, 180px), calc(100vw - 24px));
+  min-width: 0;
+  max-width: calc(100vw - 24px);
+  max-height: var(--acp-catalog-menu-max-height, calc(100vh - 12px - max(12px, var(--dsh-frame-overlay-top, 12px))));
+}
+.catalogEntry {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.catalogName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.catalogVersion {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+}
+.addButton {
+  box-sizing: border-box;
+  display: inline-flex;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: min(180px, 100%);
+  height: 40px;
+  padding: 0 12px;
+  border: 1px dashed var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  cursor: pointer;
+}
+.addMenu .addButton {
+  width: 100%;
+  min-width: 0;
+}
+.addButton:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.addButton:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.addButton:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+.approvalButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  box-sizing: border-box;
+  width: min(100%, 360px);
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  text-align: left;
+  cursor: pointer;
+}
+.approvalButton:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.approvalButton:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+.approvalButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chevron {
+  display: inline-flex;
+  transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+.chevronFlip {
+  transform: rotate(180deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .chevron {
+    transition: none;
+  }
+}
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rowCard {
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.rowHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.rowIdentity {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.rowName {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  line-height: 22px;
+  font-weight: 500;
+}
+.rowActions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+}
+.healthMuted {
+  color: var(--dsw-alias-label-tertiary);
+}
+/* 编辑器里疑似 secret 的存量 env 键行（键名 + 已配置 + 移除，值不回显）。 */
+.maskedEnvRows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.maskedEnvRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 18px;
+}
+.maskedEnvKey {
+  font-family: var(--ds-font-family-code, monospace);
+  color: var(--dsw-alias-label-primary);
+  overflow-wrap: anywhere;
+}
+.editor {
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-module-platform);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.editorHeader {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.editorTitle {
+  font-size: 14px;
+  line-height: 22px;
+  font-weight: 500;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.advancedToggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.advancedToggle:hover {
+  color: var(--dsw-alias-label-primary);
+}
+.advancedToggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+.advancedFields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding-top: 2px;
+}
+.fieldLabel {
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-secondary);
+}
+.input {
+  min-width: 0;
+}
+.input:has(input:disabled) {
+  opacity: 0.6;
+}
+.input.inputInvalid {
+  border-color: var(--dsw-alias-state-error-primary);
+}
+.textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 64px;
+  padding: 6px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-sm);
+  font-family: var(--ds-font-family-code, monospace);
+  font-size: 12px;
+  line-height: 18px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  resize: vertical;
+}
+.textarea:focus {
+  border-color: var(--dsw-alias-brand-primary);
+}
+.textarea:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.textareaInvalid {
+  border-color: var(--dsw-alias-state-error-primary);
+}
+.editorActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.dangerButton {
+  color: var(--dsw-alias-state-error-primary);
+}
+.dangerButton:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+}
+.deleteBlock {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-sm);
+}
+.deleteText {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-state-error-primary);
+}

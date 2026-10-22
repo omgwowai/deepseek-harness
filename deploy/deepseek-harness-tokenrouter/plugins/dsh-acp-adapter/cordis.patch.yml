@@ -1,0 +1,14 @@
+# @local/dsh-acp-adapter bundle patch layer for the supported DSH host.
+# The adapter is additive; the native AgentLoop and ModelPicker remain the default.
+#
+# This file becomes one patch layer when the package is listed in a profile's
+# dsh.profile.bundles (`dsh plugin --profile <name> add <path>` reconciles it
+# there). The Loader composes every bundle layer over the empty profile root in
+# ONE applyEntryPatches call (vendor/include/src/index.ts:58), so the rows
+# below address the stock rows inserted by @deepseek-ai/dsh-base and
+# @deepseek-ai/dsh-web-app.
+#
+- insert:
+    - id: dsh-acp-adapter
+      name: '@local/dsh-acp-adapter'
+      config: {}

@@ -1,0 +1,25 @@
+{
+  "name": "@tokenrouter/dsh-telemetry",
+  "version": "0.3.2",
+  "description": "DeepSeek Harness plugin: content-free session telemetry (agent tree, model calls, tools, MCP, compaction, errors) to TokenRouter's OTLP receiver",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

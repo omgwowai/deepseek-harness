@@ -1,0 +1,15 @@
+- insert:
+    - id: dsh-agent-dag
+      name: '@local/dsh-agent-dag'
+      config: {}
+    # DSH's own agent also reads the skills the other code agents keep in their own homes. Shared skills
+    # belong in ~/.agents/skills (read by DSH natively); this row adds the per-agent roots after it.
+    - id: skill-filesystem-agent-homes
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: agent-homes
+        includeDefaultRoots: false
+        customSkillDirs:
+          - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.claude', 'skills')
+          - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.codex', 'skills')
+          - !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:os').homedir(), '.omp', 'agent', 'skills')

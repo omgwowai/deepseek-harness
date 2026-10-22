@@ -1,0 +1,9 @@
+# DeepSeek Harness bundle layer of @tokenrouter/dsh-telemetry: one plugin row.
+# The plugin reads TOKENROUTER_API_KEY from the environment at start (kept out
+# of the row so `dsh --dump-config` never prints it) and stays idle without it.
+# TOKENROUTER_OTEL_URL overrides the receiver base URL.
+- insert:
+    - id: tokenrouter-telemetry
+      name: '@tokenrouter/dsh-telemetry'
+      config:
+        url: !!js process.env.TOKENROUTER_OTEL_URL || 'https://tokenrouterv2.omgwow.tech/v1/otel'

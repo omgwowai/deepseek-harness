@@ -1,0 +1,146 @@
+/**
+ * launch fingerprint 的组装真源（resume 预检②的 blocking 指纹）。
+ * 由 profile adapter 在每次会话建立/续接时计算一次，写入 binding
+ * 并与既有 binding 做 canonical 哈希预检；只忽略已移除的目录版本参考字段，
+ * 其他启动身份变化仍以 'profile-changed' 阻断。
+ *
+ * 分量清单（全部 secret-free）：
+ * - `command`/`args`/`envKeys`： 既有分量（profile config 原文 + 排序键名）。
+ * - `profileId`/`descriptorId`：profile 身份与 runtime 绑定（保留旧字段名）。
+ * - `adapterVersion`/`wrappedCliVersion`：恒 null。
+ * - `envRefs`：保留为 null，不接管 Agent 凭证。
+ * - `executableOverride`：高级 CLI override env 的 `{name,present}` 或 null。
+ * - `nativeStateEnv`：Agent 原生状态目录相关环境键的存在性与路径 hash；
+ *   HOME/CODEX_HOME/XDG 等变化会阻止把旧 Agent 上下文交给新运行环境。
+ *
+ * 显式**不进** blocking 指纹的分量（保持既有语义）：
+ * - canonical cwd：由 binding.canonicalCwd 与预检①（'cwd-changed'）覆盖。
+ * - capability/config hash：保持 advisory（capabilityHash/configHash 字段
+ *   只记录不阻断），保住热切换与 devin 既有行为。
+ *
+ * @module @local/dsh-acp-adapter/domain/session/launch-fingerprint
+ */
+/// <reference types="node" />
+
+import { createHash } from 'node:crypto'
+import { effectiveRuntimeOf, type AcpStubAgentConfig } from './agent-config.ts'
+import { executableOverrideEnvFor } from './agent-compatibility.ts'
+import { ACP_NATIVE_DATA_HOME_ENV_KEYS, ACP_NATIVE_XDG_ENV_KEYS } from '../policy/sandbox.ts'
+import { acpCanonicalHash16, type AcpLaunchFingerprint } from '../../persistence/sidecar.ts'
+
+/** {@link acpLaunchFingerprint} 的输入。 */
+export interface AcpLaunchFingerprintInput {
+  /** 注册表 profile id（路由 `acp-<id>` 的 `<id>` 部分）。 */
+  readonly profileId: string
+  /** 该 profile 的当前配置。 */
+  readonly config: AcpStubAgentConfig
+  /** Stable parent environment; profile overrides are applied before hashing. Defaults to process.env. */
+  readonly env?: Record<string, string | undefined>
+}
+
+export interface AcpLaunchEnvironmentInput {
+  readonly config: AcpStubAgentConfig
+  /** Compatibility-only fields accepted from older embedders; ignored. */
+  readonly [key: string]: unknown
+}
+
+/**
+ * One secret-free identity for a configured profile.  Both route registration
+ * and the per-call runtime use this value, so runtime/launch edits
+ * cannot drift into two different cache policies.  Environment values are
+ * hashed individually; neither this identity nor its callers retain tokens in
+ * an index, log, or sidecar record.
+ */
+export function profileLaunchIdentityHash(
+  profileId: string,
+  config: AcpStubAgentConfig,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const fingerprint = acpLaunchFingerprint({ profileId, config, env })
+  return createHash('sha256').update(JSON.stringify(fingerprint)).digest('hex').slice(0, 16)
+}
+
+/**
+ * Reconstruct the pre-spawn environment.
+ *
+ * The subprocess host supplies the scrubbed parent environment as the spawn
+ * base.  This function therefore returns only profile-configured overrides;
+ * copying `process.env` here would turn scrubbed credentials back into an
+ * explicit opt-in. Profile values are the explicit final override and may
+ * include credential-shaped variables because that is a user configuration
+ * choice.
+ */
+export async function acpLaunchEnvironment(input: AcpLaunchEnvironmentInput): Promise<Record<string, string>> {
+  return { ...input.config.env }
+}
+
+const NATIVE_STATE_ENV_KEYS = ['HOME', ...ACP_NATIVE_DATA_HOME_ENV_KEYS, ...ACP_NATIVE_XDG_ENV_KEYS]
+
+function nativeStateEnvFingerprint(
+  env: Readonly<Record<string, string | undefined>>,
+): readonly { key: string; present: boolean; hash16?: string }[] {
+  return NATIVE_STATE_ENV_KEYS.map((key) => {
+    const value = env[key]
+    return value === undefined
+      ? { key, present: false }
+      : { key, present: true, hash16: createHash('sha256').update(value).digest('hex').slice(0, 16) }
+  })
+}
+
+/**
+ * 组装完整 launch fingerprint（分量语义见模块头注释）。纯函数：相同输入恒等
+ * 输出（所有列表排序固定），canonical 哈希因此稳定。
+ */
+export function acpLaunchFingerprint(input: AcpLaunchFingerprintInput): AcpLaunchFingerprint {
+  // This is identity input only, never subprocess env overrides. The selected
+  // state/override keys survive DSH parent scrubbing; explicit profile values
+  // win just as they do at spawn. Ephemeral Teams launch overlays stay excluded.
+  const env = { ...(input.env ?? process.env), ...input.config.env }
+  const runtime = effectiveRuntimeOf(input.profileId, input.config)
+  const overrideEnv = executableOverrideEnvFor(runtime)
+  // Credential/environment references are intentionally not modeled by the
+  // adapter. Native Agent Access inherits the process snapshot; old bindings
+  // may still carry the nullable field for migration compatibility.
+  const envRefs = null
+  const executableOverride =
+    overrideEnv === undefined
+      ? null
+      : {
+          name: overrideEnv,
+          present: env[overrideEnv] !== undefined && env[overrideEnv] !== '',
+        }
+  return {
+    command: input.config.command,
+    args: [...input.config.args],
+    envKeys: Object.keys(input.config.env).sort(),
+    explicitEnv: Object.entries(input.config.env)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => ({ key, hash16: createHash('sha256').update(value).digest('hex').slice(0, 16) })),
+    profileId: input.profileId,
+    // Preserve the persisted field name and values for existing bindings.
+    descriptorId: runtime ?? null,
+    // descriptor 钉版已随 versionPolicy 移除：上游版本参考移交 registry 快照
+    // （client/data/catalog.ts）；旧值只在兼容比较时归一化，原 binding 不改写。
+    adapterVersion: null,
+    wrappedCliVersion: null,
+    envRefs,
+    executableOverride,
+    nativeStateEnv: nativeStateEnvFingerprint(env),
+    // Native tool discovery is session-scoped; the live MCP key owns reconnection.
+    mcpFingerprint: null,
+  }
+}
+
+/** Ignore retired catalog versions and manual tool lists, retaining execution identity.
+ * Saved bindings are never rewritten: fork evidence and mode intents still refer
+ * to the exact persisted record. This does not relax runtime Agent identity checks.
+ */
+export function acpLaunchFingerprintsCompatible(saved: AcpLaunchFingerprint, current: AcpLaunchFingerprint): boolean {
+  const normalize = (value: AcpLaunchFingerprint) => ({
+    ...value,
+    adapterVersion: null,
+    wrappedCliVersion: null,
+    mcpFingerprint: null,
+  })
+  return acpCanonicalHash16(normalize(saved)) === acpCanonicalHash16(normalize(current))
+}
