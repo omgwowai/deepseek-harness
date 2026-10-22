@@ -12,9 +12,11 @@ Files the agent produced were the sharpest case. A produced-file chip or a `read
 
 ## Decision
 
-The right column is a per-session docking surface — split panes, tabs, floating panels, and an undoable operation sequence — owned by `ui-sidebar-right` over the `ui-dockkit` engine, replacing the Detail panel. This note owns the surface: the engine, the frame's right column, the panel's presentations and controls, and the per-session state. What lives in the surface is decided elsewhere: how plugins declare tab types, open content, and receive their props is [tab types and navigation](../architecture/2026-09-05-sidebar-tab-types-and-navigation.md); live data behind an address is the [client resource model](../architecture/2026-09-05-client-resource-model.md); reading workspace files is the [workspace file service](../architecture/2026-09-05-workspace-files-service.md); and the guide, the text preview, and the file tree are the [shipped types](2026-09-05-sidebar-text-preview-and-file-tree.md).
+The right column is a per-session docking surface — split panes, tabs, floating panels, and an undoable operation sequence — owned by `ui-sidebar-right` over the `ui-dockkit` engine, replacing the Detail panel. This note owns the surface: the engine, the frame's right column, the panel's presentations and controls, and the per-session state. What lives in the surface is decided elsewhere: how plugins declare tab types, open content, and receive their props is [tab types and navigation](../../../../packages/client/ui-sidebar-right/README.md); live data behind an address is the [client resource model](../architecture/2026-09-05-client-resource-model.md); reading workspace files is the [workspace file service](../architecture/2026-09-05-workspace-files-service.md); and the guide, the text preview, and the file tree are the [shipped types](../../../../packages/client/ui-sidebar-documentpreview/README.md).
 
 ### Package topology
+
+The [stable Sidebar mounting decision](../architecture/2026-09-20-sidebar-retained-tab-layout.md) owns one retained tab-content tree for docking, floating and Session switches. The engine, layout state and gesture ownership in this note remain applicable.
 
 | Package | Kind | Owns |
 |---|---|---|
@@ -31,21 +33,23 @@ Components render a snapshot and report settled intents, one per gesture: a drag
 
 ### The frame's right column
 
-[Responsive Sidebar and tab information](../architecture/2026-09-07-sidebar-responsive-tab-info.md) supersedes this note's no-concession layout, overlay presentation and product pane limit. `ui-layout` still owns three-column geometry and pixel width preferences; the Sidebar occupant reports presentation through `ctx.layout.openRightbar(track, fullscreen)` and `closeRightbar()`, without the frame injecting the Sidebar package. Exact width rules belong to [ui-layout](../../../../packages/client/ui-layout/README.md).
+[Responsive Sidebar and tab information](../../../../packages/client/ui-sidebar-right/README.md) supersedes this note's no-concession layout, overlay presentation and product pane limit. `ui-layout` still owns three-column geometry and pixel width preferences; the Sidebar occupant reports presentation through `ctx.layout.openRightbar(track, fullscreen)` and `closeRightbar()`, without the frame injecting the Sidebar package. Exact width rules belong to [ui-layout](../../../../packages/client/ui-layout/README.md).
 
-The right Sidebar uses one mounted content tree in normal and fullscreen modes; hiding preserves tab state, and fullscreen covers the viewport while retaining underlying column reservation. Floats still use viewport coordinates through a portal and remain open when the Sidebar closes. The product limits docking to two horizontal panes and a 20–80% divider; the generic engine keeps its own defaults.
+The right Sidebar uses one mounted content tree in normal and fullscreen modes; hiding preserves retained tab state, and fullscreen covers the viewport while retaining underlying column reservation. `DockLayout` renders stable Grid cells with fixed-position floating frames in the same tree; foreground floats remain open when the Sidebar closes. The product limits docking to two horizontal panes and a 20–80% divider; the generic engine keeps its own defaults.
 
 ### State
 
-`ui-sidebar-right` keeps one `SurfaceState` per session id — the layout, its history, and the mint counter — in a store declared at the seat registration. Every action mints the ids its intent needs, asks a kit planner for the operations, runs the settle planner over the result, and records the whole intent as one history entry before assigning the session's surface back; no action edits a layout in place. The settle step is the product's rule: a docked pane whose last tab is closed, moved out, or floated is merged away, and when only the root pane remains and it is empty, the guide tab is reseeded — there is always at least one tab and never an empty pane, so no pane-closing gesture exists. State is memory-only: a reload returns every session to the collapsed default, and switching sessions keeps each surface where it was. Layout is presentation state and never enters the session log.
+[Sidebar guide rules](../../../../packages/client/ui-sidebar-right/README.md#the-guide) define default-page selection and explicit closing, while moving tabs still settles emptied panes.
+
+`ui-sidebar-right` keeps one `SurfaceState` per session id — the layout, its history, and the mint counter — in a store declared at the seat registration. Every action mints the ids its intent needs, asks a kit planner for the operations, runs the settle planner over the result, and records the whole intent as one history entry before assigning the session's surface back; no action edits a layout in place. The settle step is the product's rule: a docked pane whose last tab is closed, moved out, or floated is merged away, and an expanded empty root pane receives the current default page. A collapsed surface may remain empty until its next expansion; no separate pane-closing gesture exists. [Layout persistence and provider recovery](../../../../packages/client/ui-sidebar-right/README.md) owns Session-scoped browser storage and reload. Layout is presentation state and never enters the session log.
 
 ### Beyond the surface
 
-The surface renders tabs whose bodies it does not know: each tab carries a `kind`, and the panel asks the type registry for the implementation in force and dispatches to its keyed body seat. Everything a body may rely on — its record, its pane, whether it is visible, how it was navigated to, an abort signal, and the actions it may take — is read through the framework-injected `useTabInfo()`. The registry, the navigation face `ctx.sidebarRight`, the seats, and the tab information are specified in [tab types and navigation](../architecture/2026-09-05-sidebar-tab-types-and-navigation.md); a body that shows data reads it through the [client resource model](../architecture/2026-09-05-client-resource-model.md).
+The surface renders tabs whose bodies it does not know: each tab carries a `kind`, and the panel asks the type registry for the implementation in force and dispatches to its keyed body seat. Everything a body may rely on — its record, its pane, whether it is visible, how it was navigated to, an abort signal, and the actions it may take — is read through the framework-injected `useTabInfo()`. The registry, the navigation face `ctx.sidebarRight`, the seats, and the tab information are specified in [tab types and navigation](../../../../packages/client/ui-sidebar-right/README.md); a body that shows data reads it through the [client resource model](../architecture/2026-09-05-client-resource-model.md).
 
 ### Entry points and removals
 
-`ui-chat`'s `openFile(path, { line? })` — reached by tool-row path links, produced-file chips, and closing-message mentions — now opens the file into the Sidebar through the navigation face (see [tab types and navigation](../architecture/2026-09-05-sidebar-tab-types-and-navigation.md)). The `Show in folder` action and its `canOpenWorkspacePath` probe are removed from `ui-deliverables`: the Sidebar has no directory form, and the product keeps no secondary entry. `DetailsPanel`, `ToolDetails`, the tool-node reader, the chat store's selection, `ToolDetailsProps`, and `CENTER_MIN` are removed. `session/openWorkspacePath` remains on the Host with no web caller.
+`ui-chat`'s `openFile(path, { line? })` — reached by tool-row path links, produced-file chips, and closing-message mentions — now opens the file into the Sidebar through the navigation face (see [tab types and navigation](../../../../packages/client/ui-sidebar-right/README.md)). The `Show in folder` action and its `canOpenWorkspacePath` probe are removed from `ui-deliverables`: the Sidebar has no directory form, and the product keeps no secondary entry. `DetailsPanel`, `ToolDetails`, the tool-node reader, the chat store's selection, `ToolDetailsProps`, and `CENTER_MIN` are removed. `session/openWorkspacePath` remains on the Host with no web caller.
 
 ## Alternatives considered
 
@@ -67,15 +71,15 @@ The surface renders tabs whose bodies it does not know: each tab carries a `kind
 
 **Undo and redo buttons on the panel header.** Shipped first, then removed: the sequence is an architectural fact, and stepping it is not a product action yet. The API stays reachable as `@internal` methods for tests and the future navigation controller.
 
-**Empty panes as a persistent state.** The first design allowed a pane to stay after its last tab left, with a placeholder. Rejected because nothing offered a way to close such a pane; every intent now settles the surface so an emptied pane is merged away and an emptied root pane reseeds the guide.
+**Empty panes as a persistent state.** The first design allowed a pane to stay after its last tab left, with a placeholder. Rejected because nothing offered a way to close such a pane; every intent settles the surface so an emptied side pane is merged away. An empty root receives the current default page only while the column is expanded.
 
 **Inline the kit through `packages/util` and the `INLINE_SAFE` list.** A build probe showed it works, but the util build chain has no CSS pipeline and the kit ships a stylesheet; the static-linked client package (the `ui-primitives` precedent) was chosen knowing that changing the kit means rebuilding the shell and reloading.
 
 ## Consequences
 
 - The docking surface itself no longer overflows its panel: `.surface` and `.pane` clamp to the column (`min-width: 0`, `overflow: hidden`), so a long unwrapped line scrolls inside the body and the strip's controls stay in view in every split.
-- Layout is undoable and per session, and it is memory-only; a reload starts every session collapsed. Undo is reachable only through `@internal` service methods; the product shows no history controls.
-- A pane cannot be left empty and the surface cannot be left tabless: closing, moving out, or floating a pane's last tab drops the pane, and emptying the last pane brings the guide back.
+- Layout is undoable, persisted and per Session. Undo is reachable only through `@internal` service methods; the product shows no history controls.
+- An expanded surface has no empty panes. Empty side panes merge away; an empty root receives the current default page only while expanded. New sessions and a collapsed surface whose last tab closed remain empty until expansion.
 - A pane holds at most one guide tab: a second one cannot be added, opened, duplicated, or moved in; the guide's uniqueness is per pane, so a split still seeds its new pane with a guide.
 - A pane may split only when each equal half can still hold what cannot shrink: the strip's fixed controls (its width minus the chip box and the fill, so the top-right pane's chrome counts on the half that hosts it) plus one chip at its minimum, measured in the component layer after every commit and on resize. Otherwise the split control stays, disabled with its own copy, the matching edge drop zones are withheld, and panes the user narrows keep their size; the product permits at most two horizontal panes, regardless of widening or divider movement.
 - The Sidebar panel never moves when the presentation switches, and its slide is the same in both presentations; the conversation is the only thing that animates on a switch. A hidden panel keeps its tabs mounted, so a preview survives a collapse.
@@ -84,7 +88,7 @@ The surface renders tabs whose bodies it does not know: each tab carries a `kind
 - The Detail panel and its duplicate card presentation are gone (a net removal of roughly 1,400 lines); cards are read in place, and `inspect` opens the trajectory view.
 - The frame has no centre floor: a viewport narrower than the two edge columns squeezes the conversation toward zero instead of closing a column.
 - The kit is compiled by its consumers, so a kit change requires a shell rebuild and a page reload; there is no HMR for it.
-- The panel, the float host, and the portalled tab menu use hard-coded z-index values; the client still has no z-index token layer.
+- Docked cells, floating cells and the portalled tab menu use fixed stacking levels; floating cells use CSS paint order within their level. The client still has no global z-index token layer.
 
 ## Testing
 

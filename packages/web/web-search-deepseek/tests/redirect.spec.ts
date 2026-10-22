@@ -59,7 +59,6 @@ describe('DeepSeekSearchProvider redirect policy', () => {
       apiVersion: '2023-06-01',
       maxTokens: 32,
       maxUses: 1,
-      stream: false,
     })
 
     await expect(provider.search({ query: TEST_QUERY }))

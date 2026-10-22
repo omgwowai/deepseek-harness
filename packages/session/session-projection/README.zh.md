@@ -55,7 +55,7 @@ const definition = {
 
 ### 注册与读取
 
-`register(definition)` 安装单元；具有相同 key 和 `stateVersion` 的注册方共享其 cell，版本不兼容或 `stateVersion` 非法时会 throw。注册是挂在调用方 fiber 上的 effect，因此最后一个注册方卸载后会移除 key 及其缓存 cell。载体用 `snapshot(session)` 对每个客户端可见单元读取一致的同步切面——`{ asOfSeq, values }`，其中 `asOfSeq` 是所有值共同反映到的最后一个事件的 seq——并用 `onChanged(listener)` 订阅逐变更通知。`stateOf(session, key)` 读取一个单元的实时只读 host 状态，不计算无关视图。
+`register(definition)` 安装单元；具有相同 key 和 `stateVersion` 的注册方共享其 cell，版本不兼容或 `stateVersion` 非法时会 throw。注册是挂在调用方 fiber 上的 effect，因此最后一个注册方卸载后会移除 key 及其缓存 cell。返回的 disposer 可以 yield 到同一 fiber 上的复合 `ctx.effect()` 中，使单元在依赖它的清理完成前保持可用。载体用 `snapshot(session)` 对每个客户端可见单元读取一致的同步切面——`{ asOfSeq, values }`，其中 `asOfSeq` 是所有值共同反映到的最后一个事件的 seq——并用 `onChanged(listener)` 订阅逐变更通知。`stateOf(session, key)` 读取一个单元的实时只读 host 状态，不计算无关视图。
 
 ```text
 const dispose = ctx.sessionProjections.register(definition)
@@ -66,7 +66,7 @@ const { asOfSeq, values } = ctx.sessionProjections.snapshot(session)
 
 ### 持久检查点
 
-每个单元的状态都会被检查点化——client-visible 与 host-only 一视同仁——通过 `checkpoint(session)`，同级包 [session-projection-cache](../session-projection-cache/README.zh.md) 持久化这些检查点，使冷读跳过全量日志加载。检查点水位使用 `SessionSeqCursor`（空日志为 `-1`），回放起点使用 `SessionLogOffset`；`restoreFloor` 与 `restore` 在无活动会话的情况下实现读取配方，且不会混淆已有事件与日志间隙。
+系统通过 `checkpoint(session)` 为每个单元的状态创建检查点，client-visible 与 host-only 一视同仁；同级包 [session-projection-cache](../session-projection-cache/README.zh.md) 持久化这些检查点，使冷读跳过全量日志加载。检查点水位使用 `SessionSeqCursor`（空日志为 `-1`），回放起点使用 `SessionLogOffset`；`restoreFloor` 与 `restore` 实现读取流程，且不会混淆已有事件与日志间隙。
 
 -----
 
@@ -88,7 +88,6 @@ const { asOfSeq, values } = ctx.sessionProjections.snapshot(session)
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口：`SessionProjectionRegistry` 服务、`ProjectionDefinition`、快照与检查点机制 |
 | [`src/types.ts`](src/types.ts) | 可合并扩展的 `SessionProjectionMap` 与 `SessionProjectionStateMap` 类型表 |
-| — | 不发布运行时不变式伴生入口；同步纪律由 schema parse 强制。 |
 
 ### 驱动与检查点流程
 
