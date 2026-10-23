@@ -1,0 +1,1651 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  activityJournalSessionId,
+  activityRowElement,
+  ActivityRow,
+  completedProjectedChild,
+  usesNativeActivityToolProjection,
+  visibleActivityRows,
+} from '../../../src/client/ui/AcpActivityNode.ts'
+import { createAcpActivityDefinition } from '../../../src/client/ui/activity-definitions.ts'
+import { AcpActivityJournalStore } from '../../../src/client/data/activity-journal.ts'
+import { AcpActivityJournalHub } from '../../../src/client/data/activity-journal.ts'
+import { acpReplayPayloadOf } from '../../../src/client/data/acp-replay-payload.ts'
+import type { ConversationLocation } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type { ReactElement } from 'react'
+
+const payload = {
+  kind: 'dsh-acp' as const,
+  version: 1 as const,
+  ownerDshSessionId: 'dsh-1',
+  profileId: 'codex',
+  profileGeneration: 1,
+  agentSessionId: 'acp-1',
+  bindingEpoch: 1,
+  launchFingerprint: 'fp',
+  committedPromptOrdinal: 3,
+  committedActivitySeq: 4,
+  activityAnchorMessageId: 'user-3',
+}
+
+function stepLocation(turn: number, step: number): ConversationLocation {
+  const locationData = {
+    get: () => undefined,
+    source: () => ({ getSnapshot: () => undefined, subscribe: () => () => undefined }),
+  } as never
+  return {
+    kind: 'step',
+    turn: { turn, start: undefined, end: undefined, status: 'open', steps: [], data: locationData },
+    step: { turn, step, start: undefined, end: undefined, status: 'open', data: locationData },
+  } as ConversationLocation
+}
+
+function assistantEvent() {
+  return {
+    type: 'assistant/message',
+    seq: 10,
+    time: 10,
+    data: { message: { source: { replayState: { response: payload } } } },
+  } as never
+}
+
+function activityStreamFactory(hooks: { accept?: () => void; dispose?: () => void } = {}) {
+  return {
+    $stream<Item>(options: { readonly open: (signal: AbortSignal) => AsyncIterable<Item> }) {
+      const controller = new AbortController()
+      const stream = (async function* () {
+        for await (const value of options.open(controller.signal)) {
+          yield {
+            generation: 1,
+            value,
+            signal: controller.signal,
+            accept: () => {
+              hooks.accept?.()
+            },
+          }
+        }
+      })()
+      return {
+        signal: controller.signal,
+        restart: () => controller.abort(),
+        [Symbol.asyncIterator]: () => stream[Symbol.asyncIterator](),
+        dispose: async () => {
+          hooks.dispose?.()
+          controller.abort()
+        },
+      }
+    },
+  }
+}
+
+describe('ACP activity conversation node', () => {
+  it.each([
+    { kind: 'plan' as const, rawDetail: JSON.stringify([{ content: 'Review changes', status: 'pending' }]) },
+    { kind: 'other' as const, rawDetail: JSON.stringify({ detail: 'Agent activity detail' }) },
+    { kind: 'other' as const, detailDeferred: true as const },
+  ])('follows native disclosure resets for $kind cards with deferred=$detailDeferred', (detail) => {
+    let expanded = false
+    const toggle = vi.fn(() => {
+      expanded = !expanded
+    })
+    const setExpanded = vi.fn((value: boolean) => {
+      expanded = value
+    })
+    const useDisclosure = vi.fn(() => ({ expanded, toggle, setExpanded }))
+    const props: Parameters<typeof ActivityRow>[0] = {
+      row: {
+        dshSessionId: 's',
+        ownerDshSessionId: 's',
+        promptAnchorMessageId: 'u',
+        activityId: 'activity-1',
+        activitySeq: 1,
+        revisionSeq: 1,
+        time: 1,
+        status: 'completed',
+        presentation: 'Agent activity',
+        ...detail,
+      },
+      t: (key) => key,
+      openFile: () => {},
+      useDisclosure,
+    }
+    const render = () => ActivityRow(props) as ReactElement<{ open: boolean; onToggle: () => void }>
+    expect(render().props.open).toBe(false)
+    render().props.onToggle()
+    expect(toggle).toHaveBeenCalledExactlyOnceWith()
+    expect(render().props.open).toBe(true)
+    // A native presentation change leaves the disclosure snapshot intact.
+    expect(render().props.open).toBe(true)
+    // The enclosing native Turn publishes a closed snapshot only after it hides.
+    expanded = false
+    expect(render().props.open).toBe(false)
+    expect(setExpanded).not.toHaveBeenCalled()
+  })
+
+  it('keeps unfinished tools in the generic activity surface without a native tool result', () => {
+    expect(usesNativeActivityToolProjection({ kind: 'tool', status: 'unfinished' })).toBe(false)
+    expect(usesNativeActivityToolProjection({ kind: 'tool', status: 'completed' })).toBe(true)
+    expect(usesNativeActivityToolProjection({ kind: 'other', status: 'unfinished' })).toBe(false)
+  })
+
+  it('does not compare file sides from truncated legacy audit records', () => {
+    const rendered = JSON.stringify(
+      activityRowElement({
+        row: {
+          dshSessionId: 's',
+          ownerDshSessionId: 's',
+          promptAnchorMessageId: 'u',
+          activityId: 'diff',
+          activitySeq: 1,
+          revisionSeq: 1,
+          time: 1,
+          kind: 'diff',
+          status: 'completed',
+          presentation: 'File change',
+          rawDetail: JSON.stringify({
+            type: 'diff',
+            path: 'a',
+            oldText: 'prefix… [truncated]',
+            newText: 'prefix… [truncated]',
+          }),
+        },
+        t: (key) => key,
+        open: true,
+      }),
+    )
+    expect(rendered).not.toContain('"diffs"')
+  })
+  it('only matches durable ACP replay evidence, never native assistant messages', () => {
+    const definition = createAcpActivityDefinition(() => false)
+    expect(definition.match(assistantEvent())).toEqual({ id: 'answer:["dsh-1","codex",1,1,"acp-1",3]', role: 'start' })
+    expect(definition.match({ type: 'assistant/message', seq: 11, time: 11, data: {} } as never)).toBeNull()
+  })
+
+  it('reads compact outer-data replay payloads without changing the rendered identity', () => {
+    const compact = {
+      type: 'assistant/message',
+      seq: 12,
+      data: { replayState: payload },
+    }
+    expect(acpReplayPayloadOf(compact)).toEqual(payload)
+    expect(createAcpActivityDefinition(() => false).match(compact as never)).toEqual({
+      id: 'answer:["dsh-1","codex",1,1,"acp-1",3]',
+      role: 'start',
+    })
+  })
+
+  it('reads message-level replay envelopes without changing the rendered identity', () => {
+    const compact = { type: 'assistant/message', data: { message: { replayState: { response: payload } } } }
+    expect(acpReplayPayloadOf(compact)).toEqual(payload)
+    expect(createAcpActivityDefinition(() => false).match(compact as never)).toEqual({
+      id: 'answer:["dsh-1","codex",1,1,"acp-1",3]',
+      role: 'start',
+    })
+  })
+
+  it('reaches the outer-data fallback with an explicit message object', () => {
+    const compact = { type: 'assistant/message', data: { message: {}, replayState: { response: payload } } }
+    expect(acpReplayPayloadOf(compact)).toEqual(payload)
+    expect(createAcpActivityDefinition(() => false).match(compact as never)).toEqual({
+      id: 'answer:["dsh-1","codex",1,1,"acp-1",3]',
+      role: 'start',
+    })
+  })
+
+  it('keeps replay shape precedence and accepts direct replay-state payloads', () => {
+    const lowerPriority = { ...payload, profileId: 'fallback' }
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { replayState: lowerPriority, message: { replayState: payload } },
+      }),
+    ).toEqual(payload)
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { message: { source: { replayState: payload }, replayState: lowerPriority }, replayState: lowerPriority },
+      }),
+    ).toEqual(payload)
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: {
+          message: { source: { replayState: { response: { ...payload, kind: 'invalid' } } }, replayState: payload },
+        },
+      }),
+    ).toBeUndefined()
+  })
+
+  it('rejects invalid event type, marker version, kind, and required field types', () => {
+    expect(
+      acpReplayPayloadOf({
+        type: 'user/message',
+        data: { message: { source: { replayState: { response: payload } } } },
+      }),
+    ).toBeUndefined()
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { message: { source: { replayState: { response: { ...payload, version: 2 } } } } },
+      }),
+    ).toBeUndefined()
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { message: { source: { replayState: { response: { ...payload, kind: 'other' } } } } },
+      }),
+    ).toBeUndefined()
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { message: { source: { replayState: { response: { ...payload, bindingEpoch: '1' } } } } },
+      }),
+    ).toBeUndefined()
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { message: { source: { replayState: { response: { ...payload, profileId: 3 } } } } },
+      }),
+    ).toBeUndefined()
+    const { ownerDshSessionId: _owner, ...missing } = payload
+    expect(
+      acpReplayPayloadOf({
+        type: 'assistant/message',
+        data: { message: { source: { replayState: { response: missing } } } },
+      }),
+    ).toBeUndefined()
+  })
+
+  it('settles by stable identity even when migration shifts the old request sequence', () => {
+    const definition = createAcpActivityDefinition(() => true)
+    const old = assistantEvent() as unknown as {
+      data: {
+        message: { source: { replayState: { response: typeof payload & { activityRequestHeaderSeq?: number } } } }
+      }
+    }
+    old.data.message.source.replayState.response = { ...payload, activityRequestHeaderSeq: 42 }
+    expect(definition.match(old as never)).toEqual(definition.match(assistantEvent()))
+    const location = {
+      kind: 'step',
+      turn: { turn: 1 },
+      step: { step: 1, data: { get: (key: string) => key === 'acp-activity' } },
+    }
+    const state = definition.start({} as never, { event: old, location } as never, { previous: () => undefined })
+    const { seq: _seq, location: _location, ...data } = state
+    expect(definition.buildLocationData!({ state } as never, 'step', null)).toEqual({
+      kind: 'step',
+      turn: 1,
+      step: 1,
+      key: definition.kind,
+      value: data,
+    })
+    expect(definition.buildViewNode!({ state } as never)).toMatchObject({ data: { settled: true } })
+    const live = definition.start(
+      {} as never,
+      {
+        event: { type: 'request/header', seq: 44, data: { header: { config: { provider: 'acp-codex' } } } },
+        location,
+      } as never,
+      { previous: () => undefined },
+    )
+    // The native Step store notifies the live renderer; the assembler does not
+    // rebuild unrelated nodes when another context publishes Location data.
+    expect(definition.buildViewNode!({ state: live } as never)).toMatchObject({ visibility: 'visible' })
+    expect(definition.buildViewNode!({ state: live } as never)?.data).not.toHaveProperty('settled')
+  })
+
+  it('starts immediately for an exact managed request route and ignores another plugin route', () => {
+    const definition = createAcpActivityDefinition((provider) => provider === 'acp-codex')
+    expect(
+      definition.match({
+        type: 'request/header',
+        seq: 42,
+        time: 42,
+        data: { header: { config: { provider: 'acp-codex', model: 'GPT-5' } } },
+      } as never),
+    ).toEqual({ id: 'request:42', role: 'start' })
+    expect(
+      definition.match({
+        type: 'request/header',
+        seq: 43,
+        time: 43,
+        data: { header: { config: { provider: 'acp-third-party', model: 'x' } } },
+      } as never),
+    ).toBeNull()
+  })
+
+  it('anchors finalized ACP activity at the answer boundary so stock process folding cannot hide it', () => {
+    const definition = createAcpActivityDefinition((provider) => provider === 'acp-codex')
+    const location = { kind: 'session' }
+    const started = definition.start(
+      {} as never,
+      {
+        event: {
+          type: 'request/header',
+          seq: 42,
+          time: 42,
+          data: { header: { config: { provider: 'acp-codex', model: 'GPT-5' } } },
+        },
+        location,
+      } as never,
+      { previous: () => undefined } as never,
+    )
+    const finalized = definition.start(
+      {} as never,
+      {
+        event: {
+          type: 'assistant/message',
+          seq: 93,
+          time: 93,
+          data: { message: { source: { replayState: { response: { ...payload, activityRequestHeaderSeq: 42 } } } } },
+        },
+        location,
+      } as never,
+      { previous: () => ({ state: started }) } as never,
+    )
+    const node = definition.buildViewNode!({ key: 'activity', id: 'request:42', state: finalized } as never)
+    expect((node as { readonly anchorSeq: number } | null)?.anchorSeq).toBe(93)
+  })
+
+  it('keeps cancelled tool activity visible at the interrupted assistant boundary', () => {
+    const definition = createAcpActivityDefinition((provider) => provider === 'acp-devin')
+    const location = stepLocation(1, 1)
+    const request = {
+      event: {
+        type: 'request/header',
+        seq: 42,
+        time: 42,
+        data: { header: { config: { provider: 'acp-devin', model: 'deepseek-v4-flash-low' } } },
+      },
+      location,
+    } as never
+    const started = definition.start({} as never, request, { previous: () => undefined } as never)
+    const interruptedEvent = {
+      type: 'assistant/message',
+      seq: 93,
+      time: 93,
+      data: {
+        interrupted: true,
+        message: { source: { kind: 'model', provider: 'acp-devin', model: 'deepseek-v4-flash-low' } },
+      },
+    }
+    const interrupted = {
+      event: interruptedEvent,
+      location,
+    } as never
+    expect(definition.match(interruptedEvent as never)).toEqual({ id: 'interrupted:93', role: 'start' })
+    const finalized = definition.start({} as never, interrupted, {
+      previous: (kind: string) => (kind === 'acp-activity' ? { state: started } : undefined),
+    } as never)
+    const node = definition.buildViewNode!({
+      key: 'cancelled-activity',
+      id: 'interrupted:93',
+      state: finalized,
+    } as never)
+    expect((node as { readonly anchorSeq: number } | null)?.anchorSeq).toBe(93)
+    expect(
+      (node as { readonly data: { readonly promptAnchorMessageId: string } } | null)?.data.promptAnchorMessageId,
+    ).toBe(started.promptAnchorMessageId)
+  })
+
+  it('does not finalize interrupted activity for a native or foreign provider', () => {
+    const definition = createAcpActivityDefinition((provider) => provider === 'acp-devin')
+    const event = (provider: string) =>
+      ({
+        type: 'assistant/message',
+        seq: 93,
+        time: 93,
+        data: { interrupted: true, message: { source: { kind: 'model', provider } } },
+      }) as never
+    expect(definition.match(event('deepseek'))).toBeNull()
+    expect(definition.match(event('acp-third-party'))).toBeNull()
+  })
+
+  it.each([
+    undefined,
+    { settled: true, profileId: 'devin', promptAnchorMessageId: 'old-prompt', location: stepLocation(1, 1) },
+    { profileId: 'acp-devin', promptAnchorMessageId: 'old-prompt', location: stepLocation(1, 1) },
+  ])('replays an interrupted answer without borrowing an earlier prompt: %j', (previous) => {
+    const definition = createAcpActivityDefinition((provider) => provider === 'acp-devin')
+    const location = stepLocation(2, 1)
+    const match = {
+      event: {
+        type: 'assistant/message',
+        seq: 93,
+        data: { interrupted: true, message: { source: { kind: 'model', provider: 'acp-devin' } } },
+      },
+      location,
+    }
+    const state = definition.start(
+      {} as never,
+      match as never,
+      {
+        previous: (kind: string) =>
+          kind === 'acp-prompt-anchor'
+            ? { state: { anchorMessageId: 'cancelled-prompt', location } }
+            : previous === undefined
+              ? undefined
+              : { state: previous },
+      } as never,
+    )
+    expect(state).toMatchObject({
+      settled: true,
+      profileId: 'acp-devin',
+      promptAnchorMessageId: 'cancelled-prompt',
+      committedActivitySeq: 0,
+      seq: 93,
+    })
+  })
+
+  it('does not borrow an ACP input anchor from a prior step for interrupted activity', () => {
+    const definition = createAcpActivityDefinition((provider) => provider === 'acp-devin')
+    const previousLocation = stepLocation(1, 1)
+    const location = stepLocation(1, 2)
+    const state = definition.start(
+      {} as never,
+      {
+        event: {
+          type: 'assistant/message',
+          seq: 93,
+          data: { interrupted: true, message: { source: { kind: 'model', provider: 'acp-devin' } } },
+        },
+        location,
+      } as never,
+      {
+        previous: (kind: string) =>
+          kind === 'acp-prompt-anchor'
+            ? { state: { anchorMessageId: 'old-step-prompt', location: previousLocation } }
+            : undefined,
+      } as never,
+    )
+    expect(state).toMatchObject({
+      settled: true,
+      profileId: 'acp-devin',
+      promptAnchorMessageId: 'request:93',
+      seq: 93,
+    })
+  })
+
+  it('leaves projected child pages to the native message renderers', () => {
+    const definition = createAcpActivityDefinition(() => false)
+    expect(
+      definition.match({
+        type: 'subagent/descriptor',
+        seq: 0,
+        time: 1,
+        data: { version: 3, mode: 'one-shot', provider: 'dsh-acp-adapter', label: 'Research' },
+      } as never),
+    ).toBeNull()
+    expect(
+      definition.match({
+        type: 'subagent/descriptor',
+        seq: 0,
+        time: 1,
+        data: { version: 3, mode: 'one-shot', provider: 'another-plugin', label: 'Research' },
+      } as never),
+    ).toBeNull()
+  })
+
+  it('keeps activity order stable while replacing a running row in place', () => {
+    const store = new AcpActivityJournalStore()
+    store.replace(2, [
+      {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'b',
+        activitySeq: 2,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'running',
+        presentation: 'B',
+      },
+      {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'a',
+        activitySeq: 1,
+        revisionSeq: 1,
+        time: 1,
+        kind: 'tool',
+        status: 'running',
+        presentation: 'A',
+      },
+    ])
+    store.append({
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'user-3',
+      activityId: 'a',
+      activitySeq: 1,
+      revisionSeq: 3,
+      time: 3,
+      kind: 'tool',
+      status: 'completed',
+      presentation: 'A done',
+    })
+    expect(store.values('dsh-1', 'user-3').map((row) => `${row.activityId}:${row.status}`)).toEqual([
+      'a:completed',
+      'b:running',
+    ])
+  })
+
+  it('refreshes the native subagent catalog only after the projected child is durable', () => {
+    const row = {
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'user-3',
+      activityId: 'external-subagent-record',
+      activitySeq: 1,
+      revisionSeq: 1,
+      time: 1,
+      kind: 'delegated' as const,
+      status: 'running' as const,
+      presentation: 'Helper',
+      rawDetail: JSON.stringify({ childSessionId: 'child-1', parentDshSessionId: 'dsh-1' }),
+    }
+    expect(completedProjectedChild(row)).toBeUndefined()
+    expect(completedProjectedChild({ ...row, status: 'completed', revisionSeq: 2 })).toEqual({
+      parentSessionId: 'dsh-1',
+      childSessionId: 'child-1',
+    })
+  })
+
+  it('updates one anchor without scanning or mutating another anchor index', () => {
+    const store = new AcpActivityJournalStore()
+    const row = (anchor: string, id: string, revisionSeq: number) => ({
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: anchor,
+      activityId: id,
+      activitySeq: 1,
+      revisionSeq,
+      time: revisionSeq,
+      kind: 'tool' as const,
+      status: 'running' as const,
+      presentation: id,
+    })
+    store.replace(2, [row('anchor-a', 'a', 1), row('anchor-b', 'b', 2)])
+    const indexes = store as unknown as { readonly rowsByAnchor: Map<string, Map<string, unknown>> }
+    const bIndex = indexes.rowsByAnchor.get('dsh-1\u0000anchor-b')
+    store.append({ ...row('anchor-a', 'a', 3), status: 'completed' })
+    expect(indexes.rowsByAnchor.get('dsh-1\u0000anchor-b')).toBe(bIndex)
+    expect(store.values('dsh-1', 'anchor-b').map((item) => item.activityId)).toEqual(['b'])
+  })
+
+  it('renders a native disclosure summary, status, and read-only detail', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-1',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'delegated',
+        status: 'completed',
+        presentation: 'Spawned helper',
+        rawDetail: JSON.stringify({ secret: 'must stay in audit' }),
+      },
+      t: (key) => (key === 'activity.kind.delegated' ? 'Subagent details' : key),
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('Spawned helper')
+    expect(rendered).toContain('activity.status.completed')
+    expect(rendered).toContain('Subagent details')
+    expect(rendered).toContain('must stay in audit')
+    expect(rendered).toContain('"expandable":true')
+  })
+
+  it('does not offer an empty disclosure for absent tool details', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-empty',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Editing files',
+        rawDetail: JSON.stringify({ rawInput: {}, rawOutput: {}, content: [] }),
+      },
+      t: (key) => key,
+    })
+    expect(JSON.stringify(element)).toContain('"expandable":false')
+  })
+
+  it('projects formatted command output through the native TerminalBlock', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-terminal',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'sed -n 1,2p example.ts',
+        rawDetail: JSON.stringify({
+          toolKind: 'execute',
+          rawInput: { command: 'sed -n 1,2p example.ts', cwd: '/workspace' },
+          rawOutput: { formatted_output: 'line one\nline two', exit_code: 0, signal: 'SIGTERM' },
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('"command":"sed -n 1,2p example.ts"')
+    expect(rendered).toContain('"cwd":"/workspace"')
+    expect(rendered).toContain('"output":"line one\\nline two"')
+    expect(rendered).toContain('"exitCode":0')
+    expect(rendered).toContain('"signal":"SIGTERM"')
+    expect(rendered).toContain('"running":false')
+    expect(rendered).not.toContain('formatted_output')
+  })
+
+  it('projects the captured Devin nested exit text as terminal status, not JSON output', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-devin-terminal',
+        activitySeq: 1,
+        revisionSeq: 4,
+        time: 4,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Ran printf',
+        rawDetail: JSON.stringify({
+          content: [{ content: { text: 'Exited with code 0', type: 'text' }, type: 'content' }],
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('"command":"Ran printf"')
+    expect(rendered).toContain('"exitCode":0')
+    expect(rendered).toContain('"running":false')
+    expect(rendered).not.toContain('Exited with code 0')
+    expect(rendered).not.toContain('"type":"text"')
+  })
+
+  it('keeps other Devin nested content readable as settled terminal output', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-devin-output',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Ran printf',
+        rawDetail: JSON.stringify({
+          toolKind: 'execute',
+          rawInput: { command: 'printf DEVIN_TOOL_OK', cwd: '/workspace' },
+          content: [{ content: { text: 'DEVIN_TOOL_OK', type: 'text' }, type: 'content' }],
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('"output":"DEVIN_TOOL_OK"')
+    expect(rendered).toContain('"running":false')
+    expect(rendered).not.toContain('"type":"text"')
+  })
+
+  it('marks an in-progress execute shape as a running native terminal', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-devin-running',
+        activitySeq: 1,
+        revisionSeq: 1,
+        time: 1,
+        kind: 'tool',
+        status: 'running',
+        presentation: 'Ran printf',
+        rawDetail: JSON.stringify({ toolKind: 'execute', rawInput: { command: 'printf DEVIN_TOOL_OK' } }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    expect(JSON.stringify(element)).toContain('"running":true')
+  })
+
+  it('leaves unknown non-terminal detail on the JsonTree path', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'tool-custom',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Custom tool',
+        rawDetail: JSON.stringify({ content: [{ type: 'custom', payload: 'kept in JSON' }] }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('kept in JSON')
+    expect(rendered).toContain('activity.kind.tool')
+  })
+
+  it('projects protocol diff content through the native DiffBlock primitive', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'diff-1',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'diff',
+        status: 'completed',
+        presentation: 'File change · example.ts',
+        rawDetail: JSON.stringify({ type: 'diff', path: '/workspace/example.ts', oldText: 'old', newText: 'new' }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('/workspace/example.ts')
+    expect(rendered).toContain('old')
+    expect(rendered).toContain('new')
+    expect(rendered).toContain('activity.copy')
+  })
+
+  it('projects Kimi complete-file writes through the native DiffBlock primitive', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'kimi-write',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Write fixture',
+        rawDetail: JSON.stringify({
+          toolKind: 'edit',
+          rawInput: { path: '/workspace/kimi.txt', content: 'KIMI_UI_FILE_OK\n' },
+          rawOutput: 'Wrote 16 bytes to /workspace/kimi.txt',
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('/workspace/kimi.txt')
+    expect(rendered).toContain('KIMI_UI_FILE_OK')
+    expect(rendered).not.toContain('Wrote 16 bytes')
+    expect(rendered).not.toContain('toolKind')
+  })
+
+  it('preserves Kimi numbered read output when the total file length is unknown', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'kimi-read',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Read fixture',
+        rawDetail: JSON.stringify({
+          toolKind: 'read',
+          rawInput: { path: '/workspace/fixture.ts' },
+          rawOutput: '41\tconst marker = true\n42\texport { marker }',
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('/workspace/fixture.ts')
+    expect(rendered).toContain('41\\tconst marker = true')
+    expect(rendered).toContain('const marker = true')
+    expect(rendered).toContain('rawOutput')
+    expect(rendered).not.toContain('totalLines')
+  })
+
+  it('preserves the original numbered read window and provider status without claiming a total', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'kimi-read-status',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Read fixture',
+        rawDetail: JSON.stringify({
+          toolKind: 'read',
+          rawInput: { path: '/workspace/fixture.txt' },
+          rawOutput: '7\tvisible\n8\tcontent\n<system>status metadata</system>\n',
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('7\\tvisible')
+    expect(rendered).toContain('visible')
+    expect(rendered).toContain('status metadata')
+    expect(rendered).not.toContain('totalLines')
+  })
+
+  it('does not misclassify Kimi Grep or malformed line windows as file reads', () => {
+    const row = (rawInput: Record<string, unknown>, rawOutput: string) =>
+      activityRowElement({
+        row: {
+          dshSessionId: 'dsh-1',
+          ownerDshSessionId: 'dsh-1',
+          promptAnchorMessageId: 'user-3',
+          activityId: 'kimi-read-shape',
+          activitySeq: 1,
+          revisionSeq: 2,
+          time: 2,
+          kind: 'tool',
+          status: 'completed',
+          presentation: 'Read-shaped tool',
+          rawDetail: JSON.stringify({ toolKind: 'read', rawInput, rawOutput }),
+        },
+        t: (key) => key,
+        open: true,
+      })
+    expect(JSON.stringify(row({ path: '/workspace', pattern: 'needle' }, '1\tmatch'))).toContain('pattern')
+    expect(JSON.stringify(row({ path: '/workspace/file' }, '1\tone\n3\tthree'))).toContain('rawOutput')
+  })
+
+  it('maps an empty Kimi write but not a local replacement edit as a whole-file diff', () => {
+    const render = (rawInput: Record<string, unknown>) =>
+      JSON.stringify(
+        activityRowElement({
+          row: {
+            dshSessionId: 'dsh-1',
+            ownerDshSessionId: 'dsh-1',
+            promptAnchorMessageId: 'user-3',
+            activityId: 'kimi-edit-shape',
+            activitySeq: 1,
+            revisionSeq: 2,
+            time: 2,
+            kind: 'tool',
+            status: 'completed',
+            presentation: 'Edit fixture',
+            rawDetail: JSON.stringify({ toolKind: 'edit', rawInput }),
+          },
+          t: (key) => key,
+          open: true,
+        }),
+      )
+    expect(render({ path: '/workspace/empty.txt', content: '' })).toContain('/workspace/empty.txt')
+    expect(render({ path: '/workspace/file.txt', old_string: 'old', new_string: 'new' })).toContain('old_string')
+  })
+
+  it('keeps an unrecognized read payload on the lossless JsonTree path', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'dsh-1',
+        ownerDshSessionId: 'dsh-1',
+        promptAnchorMessageId: 'user-3',
+        activityId: 'custom-read',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'tool',
+        status: 'completed',
+        presentation: 'Read custom resource',
+        rawDetail: JSON.stringify({
+          toolKind: 'read',
+          rawInput: { uri: 'custom://item' },
+          rawOutput: { value: 'kept' },
+        }),
+      },
+      t: (key) => key,
+      open: true,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('custom://item')
+    expect(rendered).toContain('kept')
+  })
+
+  it('renders external task and summary as read-only Agent-provided text', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'child',
+        ownerDshSessionId: 'child',
+        promptAnchorMessageId: 'external-subagent-record',
+        activityId: 'external-subagent-record',
+        activitySeq: 1,
+        revisionSeq: 2,
+        time: 2,
+        kind: 'delegated',
+        status: 'completed',
+        presentation: 'Research',
+        rawDetail: JSON.stringify({
+          kind: 'dsh-acp-external-subagent',
+          task: { text: 'Find evidence' },
+          result: { text: 'Found it', completeness: 'summary' },
+        }),
+      },
+      t: (key) => key,
+    })
+    const rendered = JSON.stringify(element)
+    expect(rendered).toContain('Find evidence')
+    expect(rendered).toContain('Found it')
+    expect(rendered).toContain('subagent.summary')
+  })
+
+  it('offers a direct read-only record entry only when the parent activity proves a projected child', () => {
+    const element = activityRowElement({
+      row: {
+        dshSessionId: 'parent',
+        ownerDshSessionId: 'parent',
+        promptAnchorMessageId: 'user-1',
+        activityId: 'delegated-record:child-1',
+        activitySeq: 1,
+        revisionSeq: 1,
+        time: 1,
+        kind: 'delegated',
+        status: 'completed',
+        presentation: 'Research',
+        rawDetail: JSON.stringify({ projectedChildSessionId: 'child-1' }),
+      },
+      t: (key) => key,
+      onOpenProjectedChild: () => undefined,
+    })
+    expect(JSON.stringify(element)).toContain('subagent.openRecord')
+  })
+
+  it('keeps the source delegation tool and hides its duplicate projection metadata', () => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      revisionSeq: 1,
+      time: 1,
+      status: 'completed' as const,
+    }
+    const rows = visibleActivityRows([
+      { ...base, activityId: 'tool:call-1', activitySeq: 1, kind: 'tool', presentation: 'Compute 2+2' },
+      { ...base, activityId: 'tool:call-1:0:content', activitySeq: 2, kind: 'other', presentation: 'Tool output' },
+      {
+        ...base,
+        activityId: 'delegated-record:child-1',
+        activitySeq: 3,
+        kind: 'delegated',
+        presentation: 'Compute 2+2',
+        rawDetail: JSON.stringify({ projectedChildSessionId: 'child-1', sourceToolCallId: 'call-1' }),
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['tool:call-1'])
+    expect(rows[0]?.projectedChild).toEqual({ parentSessionId: 'parent', childSessionId: 'child-1' })
+  })
+
+  it('collapses the prompt-anchored tool ids written by the production sidecar', () => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      revisionSeq: 1,
+      time: 1,
+      status: 'completed' as const,
+    }
+    const rows = visibleActivityRows([
+      { ...base, activityId: 'user-1:tool:call-1', activitySeq: 1, kind: 'tool', presentation: 'Compute 2+2' },
+      {
+        ...base,
+        activityId: 'user-1:tool:call-1:0:content',
+        activitySeq: 2,
+        kind: 'other',
+        presentation: 'Tool output',
+      },
+      {
+        ...base,
+        activityId: 'user-1:delegated-record:child-1',
+        activitySeq: 3,
+        kind: 'delegated',
+        presentation: 'Compute 2+2',
+        rawDetail: JSON.stringify({ projectedChildSessionId: 'child-1', sourceToolCallId: 'call-1' }),
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['user-1:tool:call-1'])
+    expect(rows[0]?.projectedChild).toEqual({ parentSessionId: 'parent', childSessionId: 'child-1' })
+  })
+
+  it.each(['running', 'failed'] as const)('does not link a %s child projection before durable completion', (status) => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      revisionSeq: 1,
+      time: 1,
+      status: 'completed' as const,
+    }
+    const rows = visibleActivityRows([
+      { ...base, activityId: 'user-1:tool:call-1', activitySeq: 1, kind: 'tool', presentation: 'Research' },
+      {
+        ...base,
+        activityId: 'user-1:delegated-record:child-1',
+        activitySeq: 2,
+        kind: 'delegated',
+        presentation: 'Research',
+        status,
+        rawDetail: JSON.stringify({ projectedChildSessionId: 'child-1', sourceToolCallId: 'call-1' }),
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['user-1:tool:call-1'])
+    expect(rows[0]?.projectedChild).toBeUndefined()
+  })
+
+  it('keeps one delegation row while suppressing real normalized content and failed projection metadata', () => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      revisionSeq: 1,
+      time: 1,
+      status: 'completed' as const,
+    }
+    const rows = visibleActivityRows([
+      {
+        ...base,
+        activityId: 'user-1:tool:delegate-1',
+        activitySeq: 5,
+        kind: 'tool',
+        presentation: 'Ran explore subagent',
+      },
+      { ...base, activityId: 'user-1:tool:edit-1', activitySeq: 6, kind: 'tool', presentation: 'Edited fixture' },
+      {
+        ...base,
+        activityId: 'user-1:tool:child-root',
+        activitySeq: 8,
+        kind: 'tool',
+        presentation: 'Agent tool activity',
+      },
+      {
+        ...base,
+        activityId: 'user-1:tool:child-root:0:content',
+        activitySeq: 9,
+        kind: 'other',
+        presentation: 'Tool output',
+      },
+      {
+        ...base,
+        activityId: 'user-1:delegated-record:child-1',
+        activitySeq: 10,
+        kind: 'delegated',
+        presentation: 'Research',
+        status: 'failed' as const,
+        rawDetail: JSON.stringify({ projection: 'unavailable', sourceToolCallId: 'child-root' }),
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['user-1:tool:delegate-1', 'user-1:tool:edit-1'])
+  })
+
+  it('keeps one top-level row for an ordinary tool and absorbs all content children', () => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      revisionSeq: 1,
+      time: 1,
+      status: 'completed' as const,
+    }
+    const rows = visibleActivityRows([
+      { ...base, activityId: 'tool:call-1', activitySeq: 1, kind: 'tool', presentation: 'Ran printf' },
+      { ...base, activityId: 'tool:call-1:0:content', activitySeq: 2, kind: 'other', presentation: 'Tool output' },
+      {
+        ...base,
+        activityId: 'tool:call-1:1:terminal',
+        activitySeq: 3,
+        kind: 'terminal',
+        presentation: 'Terminal activity',
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['tool:call-1'])
+  })
+
+  it('hides an id-only Agent placeholder before delegation metadata arrives', () => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      activitySeq: 1,
+      revisionSeq: 1,
+      time: 1,
+      status: 'running' as const,
+    }
+    const rows = visibleActivityRows([
+      {
+        ...base,
+        activityId: 'user-1:tool:opaque-child',
+        kind: 'tool',
+        presentation: 'Agent tool activity',
+        rawDetail: '{}',
+      },
+      {
+        ...base,
+        activityId: 'user-1:tool:real-call',
+        activitySeq: 2,
+        kind: 'tool',
+        presentation: 'Read file',
+        rawDetail: '{"toolKind":"read","rawInput":{"file_path":"/w/a.ts"}}',
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['user-1:tool:real-call'])
+  })
+
+  it('also hides legacy projection rows without replacing their source tool', () => {
+    const base = {
+      dshSessionId: 'parent',
+      ownerDshSessionId: 'parent',
+      promptAnchorMessageId: 'user-1',
+      revisionSeq: 1,
+      time: 1,
+      status: 'completed' as const,
+    }
+    const rows = visibleActivityRows([
+      { ...base, activityId: 'tool:call-1', activitySeq: 1, kind: 'tool', presentation: 'Research' },
+      { ...base, activityId: 'tool:call-1:0:content', activitySeq: 2, kind: 'other', presentation: 'Tool output' },
+      {
+        ...base,
+        activityId: 'delegated-record:child-1',
+        activitySeq: 3,
+        kind: 'delegated',
+        presentation: 'Research',
+        rawDetail: JSON.stringify({ projectedChildSessionId: 'child-1' }),
+      },
+    ])
+    expect(rows.map((row) => row.activityId)).toEqual(['tool:call-1'])
+  })
+
+  it('uses the Gateway reconnecting stream and disposes it when the last node releases', async () => {
+    let starts = 0
+    let accepted = 0
+    let disposed = 0
+    let requestLimit: number | undefined
+    let releaseStream: (() => void) | undefined
+    const remote = {
+      activityFollow: async function* (_sessionId: string, request: { readonly limit?: number }, signal: AbortSignal) {
+        requestLimit = request.limit
+        starts += 1
+        yield { type: 'opened' as const, cursor: 0, head: 0, activities: [] }
+        await new Promise<void>((resolve) => {
+          releaseStream = resolve
+          signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    }
+    const factory = activityStreamFactory({
+      accept: () => {
+        accepted += 1
+      },
+      dispose: () => {
+        disposed += 1
+        releaseStream?.()
+      },
+    })
+    const hub = new AcpActivityJournalHub(remote as never, factory as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'user-1', () => undefined)
+    expect(handle.ready()).toBe(false)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(handle.ready()).toBe(true)
+    expect(starts).toBe(1)
+    expect(requestLimit).toBe(200)
+    expect(accepted).toBe(1)
+    handle.release()
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(disposed).toBe(1)
+  })
+
+  it('exposes a stable authorization failure instead of reporting an empty successful window', async () => {
+    const failure = Object.assign(new Error('not authorized'), { code: 'dsh-acp/user-rejected' })
+    let notifications = 0
+    const remote = {
+      activityFollow: async function* () {
+        throw failure
+      },
+    }
+    const hub = new AcpActivityJournalHub(remote as never, activityStreamFactory() as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'user-1', () => {
+      notifications += 1
+    })
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(handle.error()).toBe(failure)
+      expect(handle.ready()).toBe(false)
+      expect(handle.loading()).toBe(false)
+      expect(handle.canRetry()).toBe(true)
+      expect(notifications).toBeGreaterThan(0)
+    } finally {
+      handle.release()
+    }
+  })
+
+  it('retries an initial binding race and clears the error when the journal opens', async () => {
+    let starts = 0
+    let releaseStream: (() => void) | undefined
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        starts += 1
+        if (starts === 1)
+          throw Object.assign(new Error('binding is not committed yet'), { code: 'dsh-acp/activity-binding-pending' })
+        yield { type: 'opened' as const, cursor: 0, head: 0, activities: [] }
+        await new Promise<void>((resolve) => {
+          releaseStream = resolve
+          signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    }
+    const hub = new AcpActivityJournalHub(remote as never, activityStreamFactory() as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'user-1', () => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(handle.loading()).toBe(true)
+    expect((handle.error() as { code?: string } | undefined)?.code).toBe('dsh-acp/activity-binding-pending')
+    for (let attempt = 0; attempt < 50 && starts < 2; attempt += 1)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(starts).toBe(2)
+    expect(handle.error()).toBeUndefined()
+    expect(handle.ready()).toBe(true)
+    handle.release()
+    releaseStream?.()
+  })
+
+  it('keeps waiting for a slow Agent binding beyond thirty seconds while subscribed', async () => {
+    vi.useFakeTimers()
+    let starts = 0
+    let releaseStream: (() => void) | undefined
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        starts += 1
+        if (starts < 12)
+          throw Object.assign(new Error('binding is not committed yet'), { code: 'dsh-acp/activity-binding-pending' })
+        yield { type: 'opened' as const, cursor: 0, head: 0, activities: [] }
+        await new Promise<void>((resolve) => {
+          releaseStream = resolve
+          signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    }
+    const hub = new AcpActivityJournalHub(remote as never, activityStreamFactory() as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'user-1', () => undefined)
+    try {
+      await vi.advanceTimersByTimeAsync(45_000)
+      expect(starts).toBe(12)
+      expect(handle.ready()).toBe(true)
+      expect(handle.canRetry()).toBe(false)
+    } finally {
+      handle.release()
+      releaseStream?.()
+      vi.useRealTimers()
+    }
+  })
+
+  it('reopens a terminal temporary read failure and replaces rows without duplicates', async () => {
+    let starts = 0
+    let disposed = 0
+    const temporaryFailure = Object.assign(new Error('temporary activity page read failure'), {
+      code: 'gateway/internal',
+    })
+    const row = (revisionSeq: number) => ({
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'anchor',
+      activityId: `a-${String(revisionSeq)}`,
+      activitySeq: revisionSeq,
+      revisionSeq,
+      time: revisionSeq,
+      kind: 'tool' as const,
+      status: 'completed' as const,
+      presentation: `A${String(revisionSeq)}`,
+    })
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        starts += 1
+        if (starts === 1) {
+          yield { type: 'opened' as const, cursor: 1, head: 1, activities: [row(1)] }
+          yield { type: 'entry' as const, activity: row(3) }
+        } else yield { type: 'opened' as const, cursor: 3, head: 3, activities: [row(1), row(2), row(3)] }
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      },
+      activityPage: async () => ({ ok: false as const, error: temporaryFailure }),
+    }
+    const factory = activityStreamFactory({ dispose: () => (disposed += 1) })
+    const hub = new AcpActivityJournalHub(remote as never, factory as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'anchor', () => undefined)
+    try {
+      for (let attempt = 0; attempt < 100 && starts < 2; attempt += 1)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(starts).toBe(2)
+      expect(disposed).toBe(1)
+      expect(handle.ready()).toBe(true)
+      expect(handle.error()).toBeUndefined()
+      expect(handle.snapshot().map((activity) => activity.activityId)).toEqual(['a-1', 'a-2', 'a-3'])
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      expect(starts).toBe(2)
+    } finally {
+      handle.release()
+    }
+  })
+
+  it('increases backoff across opened journals that fail their first repair read', async () => {
+    vi.useFakeTimers()
+    let starts = 0
+    const row = (revisionSeq: number) => ({
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'anchor',
+      activityId: `a-${String(revisionSeq)}`,
+      activitySeq: revisionSeq,
+      revisionSeq,
+      time: revisionSeq,
+      kind: 'tool' as const,
+      status: 'completed' as const,
+      presentation: `A${String(revisionSeq)}`,
+    })
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        starts += 1
+        yield { type: 'opened' as const, cursor: 1, head: 1, activities: [row(1)] }
+        yield { type: 'entry' as const, activity: row(3) }
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      },
+      activityPage: async () => ({
+        ok: false as const,
+        error: Object.assign(new Error('temporary Host page failure'), { code: 'gateway/internal' }),
+      }),
+    }
+    const hub = new AcpActivityJournalHub(remote as never, activityStreamFactory() as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'anchor', () => undefined)
+    const flush = async (): Promise<void> => {
+      for (let turn = 0; turn < 12; turn += 1) await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    try {
+      await flush()
+      expect(starts).toBe(1)
+      await vi.advanceTimersByTimeAsync(99)
+      expect(starts).toBe(1)
+      await vi.advanceTimersByTimeAsync(1)
+      await flush()
+      expect(starts).toBe(2)
+      await vi.advanceTimersByTimeAsync(199)
+      expect(starts).toBe(2)
+      await vi.advanceTimersByTimeAsync(1)
+      await flush()
+      expect(starts).toBe(3)
+    } finally {
+      handle.release()
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(starts).toBe(3)
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels the initial retry wait when the last subscriber releases', async () => {
+    let starts = 0
+    const remote = {
+      activityFollow: async function* () {
+        starts += 1
+        throw Object.assign(new Error('binding is not committed yet'), { code: 'dsh-acp/activity-binding-pending' })
+      },
+    }
+    const hub = new AcpActivityJournalHub(remote as never, activityStreamFactory() as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'user-1', () => undefined)
+    try {
+      for (let attempt = 0; attempt < 20 && handle.error() === undefined; attempt += 1)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      expect(starts).toBe(1)
+    } finally {
+      handle.release()
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(starts).toBe(1)
+  })
+
+  it('does not automatically retry an authorization failure', async () => {
+    let starts = 0
+    const failure = Object.assign(new Error('not authorized'), { code: 'dsh-acp/user-rejected' })
+    const remote = {
+      activityFollow: async function* () {
+        starts += 1
+        throw failure
+      },
+    }
+    const hub = new AcpActivityJournalHub(remote as never, activityStreamFactory() as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'user-1', () => undefined)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(starts).toBe(1)
+      expect(handle.error()).toBe(failure)
+      expect(handle.loading()).toBe(false)
+      expect(handle.canRetry()).toBe(true)
+    } finally {
+      handle.release()
+    }
+  })
+
+  it('repairs a 2→4 gap through every page before delivering revision 4', async () => {
+    const row = (revisionSeq: number) => ({
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'anchor',
+      activityId: `a-${String(revisionSeq)}`,
+      activitySeq: revisionSeq,
+      revisionSeq,
+      time: revisionSeq,
+      kind: 'tool' as const,
+      status: 'completed' as const,
+      presentation: `A${String(revisionSeq)}`,
+    })
+    const pages: number[] = []
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        yield { type: 'opened' as const, cursor: 2, head: 4, activities: [row(1), row(2)] }
+        yield { type: 'entry' as const, activity: row(4) }
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      },
+      activityPage: async (_sessionId: string, request: { readonly afterRevision?: number }) => {
+        pages.push(request.afterRevision ?? 0)
+        return request.afterRevision === 0
+          ? {
+              ok: true as const,
+              value: {
+                sessionId: 'dsh-1',
+                cursor: 0,
+                head: 4,
+                activities: [row(1), row(2)],
+                nextCursor: 2,
+                hasMore: true,
+              },
+            }
+          : request.afterRevision === 2
+            ? {
+                ok: true as const,
+                value: { sessionId: 'dsh-1', cursor: 2, head: 4, activities: [row(3)], nextCursor: 3, hasMore: true },
+              }
+            : {
+                ok: true as const,
+                value: {
+                  sessionId: 'dsh-1',
+                  cursor: 3,
+                  head: 4,
+                  activities: [row(4)],
+                  nextCursor: null,
+                  hasMore: false,
+                },
+              }
+      },
+    }
+    const factory = activityStreamFactory()
+    const hub = new AcpActivityJournalHub(remote as never, factory as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'anchor', () => undefined)
+    for (let attempt = 0; attempt < 50 && handle.snapshot().length < 4; attempt += 1)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(pages).toEqual([0, 2, 3])
+    expect(handle.snapshot().map((activity) => activity.revisionSeq)).toEqual([1, 2, 3, 4])
+    handle.release()
+  })
+
+  it('keeps the mounted snapshot when a repair page violates the durable revision contract', async () => {
+    const row = (revisionSeq: number) => ({
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'anchor',
+      activityId: `a-${String(revisionSeq)}`,
+      activitySeq: revisionSeq,
+      revisionSeq,
+      time: revisionSeq,
+      kind: 'tool' as const,
+      status: 'completed' as const,
+      presentation: `A${String(revisionSeq)}`,
+    })
+    let starts = 0
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        starts += 1
+        yield { type: 'opened' as const, cursor: 2, head: 4, activities: [row(1), row(2)] }
+        yield { type: 'entry' as const, activity: row(4) }
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      },
+      activityPage: async () => ({
+        ok: true as const,
+        value: { sessionId: 'dsh-1', cursor: 2, head: 4, activities: [row(4)], nextCursor: null, hasMore: false },
+      }),
+    }
+    const factory = activityStreamFactory()
+    const hub = new AcpActivityJournalHub(remote as never, factory as never)
+    const handle = hub.acquire('dsh-1', 'dsh-1', 'anchor', () => undefined)
+    for (let attempt = 0; attempt < 100 && !handle.canRetry(); attempt += 1)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(starts).toBe(1)
+    expect(handle.error()).toBeInstanceOf(Error)
+    expect(handle.canRetry()).toBe(true)
+    expect(handle.ready()).toBe(true)
+    expect(handle.loading()).toBe(false)
+    expect(handle.snapshot().map((activity) => activity.revisionSeq)).toEqual([1, 2])
+    handle.release()
+  })
+
+  it('notifies only the listener for the entry anchor', async () => {
+    const entry = {
+      dshSessionId: 'dsh-1',
+      ownerDshSessionId: 'dsh-1',
+      promptAnchorMessageId: 'anchor-a',
+      activityId: 'a',
+      activitySeq: 1,
+      revisionSeq: 1,
+      time: 1,
+      kind: 'tool' as const,
+      status: 'completed' as const,
+      presentation: 'A',
+    }
+    let releaseEntry: (() => void) | undefined
+    const remote = {
+      activityFollow: async function* (_sessionId: string, _request: unknown, signal: AbortSignal) {
+        yield { type: 'opened' as const, cursor: 0, head: 0, activities: [] }
+        await new Promise<void>((resolve) => {
+          releaseEntry = resolve
+          signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        if (signal.aborted) return
+        yield { type: 'entry' as const, activity: entry }
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      },
+    }
+    const factory = activityStreamFactory()
+    const hub = new AcpActivityJournalHub(remote as never, factory as never)
+    let a = 0
+    let b = 0
+    const first = hub.acquire('dsh-1', 'dsh-1', 'anchor-a', () => {
+      a += 1
+    })
+    const second = hub.acquire('dsh-1', 'dsh-1', 'anchor-b', () => {
+      b += 1
+    })
+    for (let attempt = 0; attempt < 20 && releaseEntry === undefined; attempt += 1)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    const beforeA = a
+    const beforeB = b
+    releaseEntry?.()
+    for (let attempt = 0; attempt < 20 && a < beforeA + 1; attempt += 1)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(a).toBe(beforeA + 1)
+    expect(b).toBe(beforeB)
+    first.release()
+    second.release()
+  })
+
+  it('reads forked activity from the replay owner while keeping child activity separate', async () => {
+    const parent = 'dsh-parent'
+    const child = 'dsh-child'
+    const data = { ownerDshSessionId: parent }
+    const requests: string[] = []
+    const parentActivity = {
+      dshSessionId: parent,
+      ownerDshSessionId: parent,
+      promptAnchorMessageId: 'user-parent-1',
+      activityId: 'parent-tool',
+      activitySeq: 1,
+      revisionSeq: 1,
+      time: 1,
+      kind: 'tool' as const,
+      status: 'completed' as const,
+      presentation: 'Ran pwd',
+    }
+    const childActivity = {
+      ...parentActivity,
+      dshSessionId: child,
+      ownerDshSessionId: child,
+      activityId: 'child-tool',
+    }
+    const remote = {
+      activityFollow: async function* (sessionId: string, _request: unknown, signal: AbortSignal) {
+        requests.push(sessionId)
+        yield { type: 'opened' as const, cursor: 2, head: 2, activities: [parentActivity, childActivity] }
+        await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      },
+    }
+    const factory = activityStreamFactory()
+    const hub = new AcpActivityJournalHub(remote as never, factory as never)
+    const handle = hub.acquire(activityJournalSessionId(data), parent, 'user-parent-1', () => undefined)
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    expect(requests).toEqual([parent])
+    expect(handle.snapshot().map((row) => row.activityId)).toEqual(['parent-tool'])
+    handle.release()
+    // The child route will use child as owner on its own replay payload.
+    expect(activityJournalSessionId({ ownerDshSessionId: child })).toBe(child)
+  })
+})

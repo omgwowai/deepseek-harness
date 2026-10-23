@@ -1,0 +1,147 @@
+.flow {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.row {
+  min-width: 0;
+}
+.nativeToolOwner {
+  display: contents;
+}
+.nativeToolOwner.hasSupplement {
+  display: block;
+  min-width: 0;
+}
+.rowSummary {
+  min-width: 0;
+}
+.presentation {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-width: 0;
+  margin-left: 8px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+}
+.separator {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  margin-right: 8px;
+  border-radius: 50%;
+  corner-shape: round;
+  background: var(--dsw-alias-label-caption);
+}
+.body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 4px 0 6px 22px;
+}
+.planList {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 6px 22px;
+  padding: 0;
+  list-style: none;
+}
+.planItem {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 10px;
+  align-items: start;
+  min-width: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+}
+.planGlyph {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+}
+.planContent {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.planStatus {
+  display: inline-block;
+  margin-inline-start: 8px;
+  color: var(--dsw-alias-label-caption);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.json {
+  max-height: 320px;
+  min-width: 0;
+  overflow: auto;
+}
+.raw {
+  max-height: 320px;
+  min-width: 0;
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.toolSupplement {
+  margin: 4px 0 4px 4px;
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-tertiary);
+}
+.nativeBlock {
+  min-width: 0;
+}
+.externalRecord {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 0 2px;
+}
+.externalSection {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.externalLabel {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  font-weight: 500;
+}
+.externalText {
+  margin: 0;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--dsw-alias-label-primary);
+}
+.externalNote {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+}
+.openRecord {
+  justify-self: start;
+}
+.unavailable {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+}

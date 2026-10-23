@@ -1,0 +1,574 @@
+/// <reference types="node" />
+import { createHash } from 'node:crypto'
+import {
+  SESSION_FORMAT_VERSION,
+  Session,
+  SessionId,
+  SessionLogOffset,
+  SessionSeq,
+  type SessionEvent,
+  type SessionHeader,
+} from '@deepseek-ai/dsh-session'
+import { createSessionFormatCatalogWithChildren } from '@deepseek-ai/dsh-session-format-catalog'
+import { releasedV3SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v3-to-v4'
+import { foldSubagentDescriptor, SUBAGENT_DESCRIPTOR_VERSION } from '@deepseek-ai/dsh-subagent'
+import type { OneShotSubagentDescriptorData } from '@deepseek-ai/dsh-subagent'
+import type { AssistantMessage, UserMessage } from '@deepseek-ai/dsh-llm'
+import { AssistantStreamAccumulator } from '@deepseek-ai/dsh-llm'
+import { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { SessionAlreadyExistsError, SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
+import type { SessionHandle, SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import type { AcpActivityRecord, AcpSidecar } from '../../persistence/sidecar.ts'
+import {
+  EXTERNAL_CHILD_RESULT_PREVIEW_LIMIT,
+  type ExternalDelegationObservation,
+} from '../../domain/subagent/external-delegation.ts'
+import { redactSecretText } from '../../domain/observability/redaction.ts'
+
+export const EXTERNAL_SUBAGENT_ACTIVITY_ANCHOR = 'external-subagent-record'
+export const EXTERNAL_SUBAGENT_DESCRIPTOR_PROVIDER = 'dsh-acp-adapter'
+
+export interface ExternalProjectionContext {
+  readonly profileId: string
+  readonly bindingGeneration: number
+  readonly rootAcpSessionId: string
+  readonly parentDshSessionId: string
+  readonly parentCwd: string
+  readonly parentDelegationDepth?: number
+  readonly flushParent: () => Promise<boolean>
+}
+
+export interface ExternalProjectionResult {
+  readonly childSessionId: string
+  readonly created: boolean
+}
+
+interface ProjectedDetail {
+  readonly kind: 'dsh-acp-external-subagent'
+  readonly version: 5
+  readonly childSessionId: string
+  readonly parentDshSessionId: string
+  readonly profileId: string
+  readonly profileKind: string
+  readonly task: ExternalDelegationObservation['task']
+  readonly result: ExternalDelegationObservation['result']
+  readonly model?: ExternalDelegationObservation['model']
+  readonly usage?: ExternalDelegationObservation['usage']
+  readonly timing: ExternalDelegationObservation['timing']
+  readonly evidenceDigest: string
+  /** Shallow canonical fields survive Activity redaction without granting the
+   * renderer an opaque unredacted payload. The event batch is reconstructed by
+   * one versioned schema, never from task/result display text. */
+  readonly projectionHeader: SessionHeader
+  readonly projectionLabel: string
+  readonly projectionStartedAt: number
+  readonly projectionCompletedAt: number
+  readonly projectionDigest: string
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function digest(value: unknown): string {
+  return createHash('sha256').update(canonical(value)).digest('hex')
+}
+
+function bounded(value: string, limit = EXTERNAL_CHILD_RESULT_PREVIEW_LIMIT): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)}… [truncated]`
+}
+
+/** Canonicalize persisted/display text before both projection and digesting.
+ * Sidecar Activity redaction must not mutate an authenticated projection later. */
+function safeObservation(observation: ExternalDelegationObservation): ExternalDelegationObservation {
+  return {
+    ...observation,
+    label: bounded(redactSecretText(observation.label), 256),
+    task: { ...observation.task, text: bounded(redactSecretText(observation.task.text)) },
+    result: { ...observation.result, text: bounded(redactSecretText(observation.result.text)) },
+    ...(observation.model === undefined
+      ? {}
+      : { model: { ...observation.model, id: redactSecretText(observation.model.id) } }),
+  }
+}
+
+function childId(context: ExternalProjectionContext, observation: ExternalDelegationObservation): string {
+  const key = {
+    profileId: context.profileId,
+    bindingGeneration: context.bindingGeneration,
+    rootAcpSessionId: context.rootAcpSessionId,
+    vendorDelegationKey: observation.vendorDelegationKey,
+  }
+  return `session-dsh-acp-${digest(key).slice(0, 32)}`
+}
+
+function recordDetail(
+  childSessionId: string,
+  context: ExternalProjectionContext,
+  observation: ExternalDelegationObservation,
+  projected: ReturnType<typeof projectionLog>,
+): ProjectedDetail {
+  const evidence = {
+    profileId: context.profileId,
+    bindingGeneration: context.bindingGeneration,
+    rootAcpSessionId: context.rootAcpSessionId,
+    vendorDelegationKey: observation.vendorDelegationKey,
+    sourceToolCallId: observation.sourceToolCallId,
+    vendorChildId: observation.vendorChildId,
+    task: observation.task,
+    result: observation.result,
+    status: observation.status,
+    model: observation.model,
+    usage: observation.usage,
+    timing: observation.timing,
+  }
+  return {
+    kind: 'dsh-acp-external-subagent',
+    version: 5,
+    childSessionId,
+    parentDshSessionId: context.parentDshSessionId,
+    profileId: context.profileId,
+    profileKind: observation.profileKind,
+    task: { ...observation.task, text: bounded(observation.task.text) },
+    result: { ...observation.result, text: bounded(observation.result.text) },
+    ...(observation.model === undefined ? {} : { model: observation.model }),
+    ...(observation.usage === undefined ? {} : { usage: observation.usage }),
+    timing: observation.timing,
+    evidenceDigest: digest(evidence),
+    projectionHeader: projected.header,
+    projectionLabel: (projected.events[0]?.data as { label: string }).label,
+    projectionStartedAt: projected.events[0]?.time ?? projected.header.createdAt,
+    projectionCompletedAt: projected.events.at(-1)?.time ?? projected.header.createdAt,
+    projectionDigest: digest(projected),
+  }
+}
+
+function transcriptLog(
+  header: SessionHeader,
+  label: string,
+  startedAt: number,
+  completedAt: number,
+  detail: Pick<ProjectedDetail, 'profileKind' | 'task' | 'result' | 'model' | 'usage'>,
+): { readonly header: SessionHeader; readonly events: readonly SessionEvent[] } {
+  const user: UserMessage = {
+    id: MessageId(`${header.id}:external-task`),
+    role: 'user',
+    content: [{ type: 'text', text: detail.task.text }],
+    source: { kind: 'user' },
+  }
+  const reported =
+    detail.result.completeness === 'summary' ? `Agent-reported summary:\n\n${detail.result.text}` : detail.result.text
+  const assistant: AssistantMessage = {
+    id: MessageId(`${header.id}:external-result`),
+    role: 'assistant',
+    content: [{ type: 'text', text: reported }],
+    source: {
+      kind: 'model',
+      provider: EXTERNAL_SUBAGENT_DESCRIPTOR_PROVIDER,
+      model: detail.model?.id ?? `${detail.profileKind}-external-subagent`,
+    },
+  }
+  const usage =
+    detail.usage?.inputTokens !== undefined && detail.usage.outputTokens !== undefined
+      ? {
+          inputTokens: detail.usage.inputTokens,
+          outputTokens: detail.usage.outputTokens,
+          ...(detail.usage.totalTokens === undefined ? {} : { totalTokens: detail.usage.totalTokens }),
+          ...(detail.usage.cacheReadTokens === undefined ? {} : { cacheReadTokens: detail.usage.cacheReadTokens }),
+          ...(detail.usage.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: detail.usage.cacheWriteTokens }),
+        }
+      : undefined
+  // This is a projection of the reported result, not a reconstructed external
+  // token timeline. All synthetic chunks use the result observation time.
+  const stream = new AssistantStreamAccumulator()
+  stream.push({ time: completedAt, chunk: { type: 'block-start', index: 0, blockType: 'text' } })
+  stream.push({ time: completedAt, chunk: { type: 'text-delta', index: 0, text: reported } })
+  stream.push({ time: completedAt, chunk: { type: 'block-end', index: 0, block: { type: 'text', text: reported } } })
+  if (usage !== undefined) stream.push({ time: completedAt, chunk: { type: 'usage', usage } })
+  stream.push({ time: completedAt, chunk: { type: 'finish', reason: { kind: 'stop' } } })
+  const events: readonly SessionEvent[] = [
+    {
+      type: 'subagent/descriptor',
+      seq: SessionSeq(0),
+      time: startedAt,
+      // This is a read-only local transcript, not a resumable activation or an
+      // external catalog leaf. The released historical descriptor remains readable.
+      data: {
+        version: SUBAGENT_DESCRIPTOR_VERSION,
+        mode: 'one-shot',
+        provider: EXTERNAL_SUBAGENT_DESCRIPTOR_PROVIDER,
+        label,
+      } satisfies OneShotSubagentDescriptorData,
+    },
+    { type: 'turn/start', seq: SessionSeq(1), time: startedAt, data: { turn: 1 } },
+    { type: 'step/start', seq: SessionSeq(2), time: startedAt, data: { turn: 1, step: 1 } },
+    { type: 'user/message', seq: SessionSeq(3), time: startedAt, data: user, surfaceOp: 'append' },
+    {
+      type: 'assistant/message',
+      seq: SessionSeq(4),
+      time: completedAt,
+      data: {
+        turn: 1,
+        step: 1,
+        message: assistant,
+        ...(usage === undefined ? {} : { usage }),
+        stream: [...stream.snapshot()],
+      },
+      surfaceOp: 'append',
+    },
+    { type: 'step/end', seq: SessionSeq(5), time: completedAt, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: SessionSeq(6), time: completedAt, data: { turn: 1, reason: { kind: 'completed' } } },
+  ]
+  if (foldSubagentDescriptor(events)?.mode !== 'one-shot')
+    throw new Error('ACP_SUBAGENT_TRANSCRIPT_INVALID: projected child must remain read-only')
+  if (header.version === SESSION_FORMAT_VERSION) {
+    const validated = Session.fromRestore(header.id, events, header, SessionLogOffset(0), 'detached')
+    if (validated.deriveMessages().length !== 2)
+      throw new Error('ACP_SUBAGENT_TRANSCRIPT_INVALID: projected task/result were not admitted')
+  }
+  return { header, events }
+}
+
+function projectionLog(
+  context: ExternalProjectionContext,
+  observation: ExternalDelegationObservation,
+  id: string,
+): {
+  readonly header: SessionHeader
+  readonly events: readonly SessionEvent[]
+} {
+  const startedAt = Math.trunc(observation.timing.observedStartedAt)
+  const completedAt = Math.max(startedAt, Math.trunc(observation.timing.observedCompletedAt))
+  const label = bounded(redactSecretText(observation.label), 256)
+  const header: SessionHeader = {
+    version: SESSION_FORMAT_VERSION,
+    isSeeded: false,
+    id: SessionId(id),
+    createdAt: startedAt,
+    cwd: context.parentCwd,
+    parentSession: SessionId(context.parentDshSessionId),
+    origin: 'subagent',
+    delegationDepth: (context.parentDelegationDepth ?? 0) + 1,
+  }
+  return transcriptLog(header, label, startedAt, completedAt, {
+    profileKind: observation.profileKind,
+    task: { ...observation.task, text: bounded(observation.task.text) },
+    result: { ...observation.result, text: bounded(observation.result.text) },
+    ...(observation.model === undefined ? {} : { model: observation.model }),
+    ...(observation.usage === undefined ? {} : { usage: observation.usage }),
+  })
+}
+
+function sameProjection(
+  existing: { readonly meta: SessionHeader; readonly events: readonly SessionEvent[] },
+  expected: { readonly header: SessionHeader; readonly events: readonly SessionEvent[] },
+): boolean {
+  if (canonical(existing.meta) !== canonical(expected.header)) return false
+  // The complete current projection must match, including the durable stream.
+  return canonical(existing.events) === canonical(expected.events)
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Recognize only the current authenticated envelope when it cannot be rebuilt. */
+function isCurrentProjectionEnvelope(row: AcpActivityRecord): boolean {
+  if (row.rawDetail === undefined) return false
+  try {
+    const value: unknown = JSON.parse(row.rawDetail)
+    return (
+      object(value) &&
+      value.kind === 'dsh-acp-external-subagent' &&
+      value.version === 5 &&
+      value.childSessionId === row.dshSessionId &&
+      object(value.projectionHeader) &&
+      (value.projectionHeader.version === 3 || value.projectionHeader.version === SESSION_FORMAT_VERSION)
+    )
+  } catch {
+    return false
+  }
+}
+
+function storedProjection(
+  row: AcpActivityRecord,
+): { readonly detail: ProjectedDetail; readonly expected: ReturnType<typeof projectionLog> } | undefined {
+  if (row.rawDetail === undefined) return undefined
+  let value: unknown
+  try {
+    value = JSON.parse(row.rawDetail)
+  } catch {
+    return undefined
+  }
+  if (
+    !object(value) ||
+    value.kind !== 'dsh-acp-external-subagent' ||
+    value.version !== 5 ||
+    value.childSessionId !== row.dshSessionId
+  )
+    return undefined
+  if (
+    !object(value.projectionHeader) ||
+    typeof value.projectionLabel !== 'string' ||
+    typeof value.projectionStartedAt !== 'number' ||
+    typeof value.projectionCompletedAt !== 'number' ||
+    typeof value.projectionDigest !== 'string'
+  )
+    return undefined
+  const header = value.projectionHeader as unknown as SessionHeader
+  if (
+    ![3, SESSION_FORMAT_VERSION].includes(header.version) ||
+    header.id !== row.dshSessionId ||
+    header.parentSession !== value.parentDshSessionId
+  )
+    return undefined
+  let expected: ReturnType<typeof transcriptLog>
+  try {
+    expected = transcriptLog(header, value.projectionLabel, value.projectionStartedAt, value.projectionCompletedAt, {
+      profileKind: String(value.profileKind),
+      task: value.task as ProjectedDetail['task'],
+      result: value.result as ProjectedDetail['result'],
+      ...(object(value.model) ? { model: value.model as unknown as NonNullable<ProjectedDetail['model']> } : {}),
+      ...(object(value.usage) ? { usage: value.usage as unknown as NonNullable<ProjectedDetail['usage']> } : {}),
+    })
+  } catch {
+    return undefined
+  }
+  if (value.projectionDigest !== digest(expected)) return undefined
+  // Authenticate the original transaction before using the host's released
+  // migration catalog. Never "upgrade" durable data by changing only its version.
+  if (Number(header.version) === 3) {
+    try {
+      // The authenticated seven-event read-only transcript cannot own children.
+      const codec = releasedV3SessionFormatCodec
+      const restore = createSessionFormatCatalogWithChildren([]).createRestore(
+        codec.encodeHeader(header as unknown as Parameters<typeof codec.encodeHeader>[0], 0),
+        { recovery: 'strict', validation: 'current' },
+      )
+      for (const event of expected.events)
+        restore.decodeRow(codec.encodeEvent(event as unknown as Parameters<typeof codec.encodeEvent>[0]))
+      const migrated = restore.finish()
+      expected = {
+        header: migrated.header as unknown as SessionHeader,
+        events: migrated.events as unknown as readonly SessionEvent[],
+      }
+    } catch {
+      return undefined
+    }
+  }
+  return { detail: value as unknown as ProjectedDetail, expected }
+}
+
+export interface ExternalProjectionRepairSummary {
+  readonly committed: number
+  readonly repaired: number
+  readonly conflicted: number
+}
+
+/** Idempotent read-only transcript projection for evidence-complete external delegations. */
+export class ExternalSubagentProjector {
+  private accepting = true
+  private readonly pending = new Set<Promise<unknown>>()
+  private closing: Promise<void> | undefined
+
+  /** Stop new transactions and retain their dependencies through the final status write.
+   * @returns resolves after every accepted transaction and borrowed batch settles.
+   */
+  close(): Promise<void> {
+    this.accepting = false
+    return (this.closing ??= (async () => {
+      while (this.pending.size > 0) await Promise.allSettled([...this.pending])
+    })())
+  }
+
+  private run<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(new Error('ACP_SUBAGENT_PERSISTENCE_UNAVAILABLE'))
+    // Reserve ownership before synchronous staging can notify a reentrant disposer.
+    const completion = Promise.withResolvers<T>()
+    this.pending.add(completion.promise)
+    const release = (): void => {
+      this.pending.delete(completion.promise)
+    }
+    void completion.promise.then(release, release)
+    try {
+      void operation().then(completion.resolve, completion.reject)
+    } catch (error) {
+      completion.reject(error)
+    }
+    return completion.promise
+  }
+
+  constructor(
+    private readonly persistence: Pick<SessionPersistence, 'create' | 'open'>,
+    private readonly sidecar: Pick<AcpSidecar, 'upsertActivity'> &
+      Partial<Pick<AcpSidecar, 'listProjectedSubagentActivities'>>,
+    private readonly publishChild?: (header: SessionHeader, label: string) => Promise<void>,
+  ) {}
+
+  /** Borrow one admitted batch; shutdown waits through every transaction and caller writeback.
+   * @param operation - uses the supplied projector only within its awaited batch.
+   * @returns resolves after the batch and its final caller writeback settle.
+   */
+  withProjection(
+    operation: (
+      project: (
+        observation: ExternalDelegationObservation,
+        context: ExternalProjectionContext,
+      ) => Promise<ExternalProjectionResult | undefined>,
+    ) => Promise<void>,
+  ): Promise<void> {
+    return this.run(() => operation((observation, context) => this.projectAccepted(observation, context)))
+  }
+
+  private async inspect(
+    id: string,
+  ): Promise<{ readonly meta: SessionHeader; readonly events: readonly SessionEvent[] } | undefined> {
+    let handle: SessionHandle
+    try {
+      handle = await this.persistence.open(SessionId(id), 'read')
+    } catch (error) {
+      if (error instanceof SessionPersistenceNotFoundError) return undefined
+      throw error
+    }
+    await using reader = handle
+    return { meta: reader.header, events: (await reader.read()).events }
+  }
+
+  private async commit(expected: ReturnType<typeof projectionLog>): Promise<boolean> {
+    let handle: SessionHandle
+    let created = false
+    try {
+      handle = await this.persistence.create(expected.header)
+      created = true
+    } catch (error) {
+      if (!(error instanceof SessionAlreadyExistsError)) throw error
+      handle = await this.persistence.open(expected.header.id, 'write')
+    }
+    await using writer = handle
+    const { events } = await writer.read()
+    const prefix = { header: expected.header, events: expected.events.slice(0, events.length) }
+    if (events.length > expected.events.length || !sameProjection({ meta: writer.header, events }, prefix)) {
+      throw new Error(`ACP_SUBAGENT_PROJECTION_CONFLICT: ${expected.header.id}`)
+    }
+    const remaining = expected.events.slice(events.length)
+    if (remaining.length > 0) await writer.append(remaining)
+    // Read visibility does not imply crash durability. Publish the sidecar
+    // completion only after this barrier and the writer's teardown succeed.
+    await writer.flush()
+    return created || remaining.length > 0
+  }
+
+  private async setProjectionStatus(row: AcpActivityRecord, status: 'completed' | 'failed'): Promise<void> {
+    await this.sidecar.upsertActivity({
+      dshSessionId: row.dshSessionId,
+      ownerDshSessionId: row.ownerDshSessionId,
+      promptAnchorMessageId: row.promptAnchorMessageId,
+      activityId: row.activityId,
+      time: Date.now(),
+      kind: row.kind,
+      status,
+      presentation: row.presentation,
+      ...(row.rawDetail === undefined ? {} : { rawDetail: row.rawDetail }),
+      ...(row.rawDetailRef === undefined ? {} : { rawDetailRef: row.rawDetailRef }),
+    })
+  }
+
+  /** Converge interrupted projection transactions after the persistence seam mounts. */
+  repairInterrupted(): Promise<ExternalProjectionRepairSummary> {
+    return this.run(() => this.repairAccepted())
+  }
+
+  private async repairAccepted(): Promise<ExternalProjectionRepairSummary> {
+    const rows = (await this.sidecar.listProjectedSubagentActivities?.()) ?? []
+    let committed = 0
+    let repaired = 0
+    let conflicted = 0
+    for (const row of rows) {
+      const stored = storedProjection(row)
+      if (stored === undefined) {
+        // Historical projections follow the host migration policy. Never
+        // rewrite unsupported generations or synthesize missing history.
+        // A current v5 running envelope that fails authentication is a conflict,
+        // not an interrupted transaction to retry forever; keep its raw evidence.
+        if (row.status === 'running' && isCurrentProjectionEnvelope(row)) {
+          conflicted += 1
+          await this.setProjectionStatus(row, 'failed').catch(() => undefined)
+        }
+        continue
+      }
+      try {
+        const parent = await this.inspect(stored.detail.parentDshSessionId)
+        if (
+          parent === undefined ||
+          parent.meta.id !== stored.expected.header.parentSession ||
+          parent.meta.cwd !== stored.expected.header.cwd
+        ) {
+          throw new Error(`ACP_SUBAGENT_PARENT_NOT_DURABLE: ${stored.detail.parentDshSessionId}`)
+        }
+        const created = await this.commit(stored.expected)
+        await this.publishChild?.(stored.expected.header, stored.detail.projectionLabel)
+        await this.setProjectionStatus(row, 'completed')
+        committed += 1
+        if (created) repaired += 1
+      } catch {
+        conflicted += 1
+        await this.setProjectionStatus(row, 'failed').catch(() => undefined)
+      }
+    }
+    return { committed, repaired, conflicted }
+  }
+
+  project(
+    observation: ExternalDelegationObservation,
+    context: ExternalProjectionContext,
+  ): Promise<ExternalProjectionResult | undefined> {
+    return this.run(() => this.projectAccepted(observation, context))
+  }
+
+  private async projectAccepted(
+    observation: ExternalDelegationObservation,
+    context: ExternalProjectionContext,
+  ): Promise<ExternalProjectionResult | undefined> {
+    if (!observation.projectionEligible || observation.status !== 'completed') return undefined
+    const id = childId(context, observation)
+    const safe = safeObservation(observation)
+    const expected = projectionLog(context, safe, id)
+    const detail = recordDetail(id, context, safe, expected)
+
+    // Stage the complete canonical transaction first. If the process crashes
+    // at any later boundary, startup repair can converge without reconstructing
+    // identity or display evidence from Agent text.
+    const staged = await this.sidecar.upsertActivity({
+      dshSessionId: id,
+      ownerDshSessionId: id,
+      promptAnchorMessageId: EXTERNAL_SUBAGENT_ACTIVITY_ANCHOR,
+      activityId: 'external-subagent-record',
+      time: Date.now(),
+      kind: 'delegated',
+      status: 'running',
+      presentation: safe.label,
+      rawDetail: JSON.stringify(detail),
+    })
+
+    // Parent durable history must precede child publication. A host without a
+    // persistence listener cannot truthfully publish lineage.
+    try {
+      if (!(await context.flushParent())) throw new Error('ACP_SUBAGENT_PARENT_NOT_DURABLE')
+      const created = await this.commit(expected)
+      await this.publishChild?.(expected.header, detail.projectionLabel)
+      await this.setProjectionStatus(staged, 'completed')
+      return { childSessionId: id, created }
+    } catch (error) {
+      await this.setProjectionStatus(staged, 'failed').catch(() => undefined)
+      throw error
+    }
+  }
+}

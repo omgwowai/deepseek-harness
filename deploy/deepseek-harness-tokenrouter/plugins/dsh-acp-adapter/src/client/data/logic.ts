@@ -1,0 +1,658 @@
+/**
+ * Pure settings-panel validation and defensive Remote payload decoding.
+ *
+ * No DOM, fetch, React, or Host implementation imports. Profile identities and
+ * wire shapes follow the shared browser-safe contracts; decoders reject
+ * malformed payloads before they reach the view.
+ * @module @local/dsh-acp-adapter/client/logic
+ */
+
+import { catalogEntryOf } from './catalog.ts'
+
+// Shared profile shape and runtime binding rules; no imports of host implementations.
+
+import { ACP_AGENT_ID_PATTERN, effectiveRuntimeOf, catalogIdOf } from '../../contract/agent-config.ts'
+import type { AcpAgentConfig, AcpAgentId as AcpAgentRuntimeId } from '../../contract/agent-config.ts'
+import { ACP_AGENT_CONFIG_STATES } from '../../contract/remote.ts'
+import type { AcpAgentConfigState } from '../../contract/remote.ts'
+export {
+  ACP_AGENT_IDS as ACP_AGENT_RUNTIME_IDS,
+  ACP_AGENT_ID_PATTERN,
+  ACP_SETTINGS_NS,
+  effectiveRuntimeOf,
+} from '../../contract/agent-config.ts'
+export type { AcpAgentConfig, AcpAgentId as AcpAgentRuntimeId } from '../../contract/agent-config.ts'
+export type { AcpAgentConfigState } from '../../contract/remote.ts'
+
+/** Resolved `dsh-acp-adapter` settings section. */
+export interface AcpSettings {
+  agents: Record<string, AcpAgentConfig>
+  /** Default policy snapshotted by newly initialized ACP sessions. */
+  toolApprovalDefault?: 'auto' | 'ask'
+}
+
+/** Env var name: POSIX shell identifier. */
+export const ACP_ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/**
+ * Mask likely secret env values in the editor. Existing values travel through
+ * `maskedEnv` and are preserved on save unless explicitly replaced or removed.
+ * This display rule does not control the Host subprocess environment.
+ */
+export const ACP_SECRET_ENV_KEY_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const proto: unknown = Object.getPrototypeOf(value)
+  return proto === Object.prototype || proto === null
+}
+
+// ---------- Editor drafts: staged text parsed only on save ----------
+
+/** The agent editor's staged text: what is on screen is exactly what a save parses. */
+export interface AgentDraft {
+  id: string
+  name: string
+  command: string
+  /** One argument per line. */
+  argsText: string
+  /** One `KEY=VALUE` per line（疑似 secret 的键不进文本框——见 `maskedEnv`）。 */
+  envText: string
+  loginHint: string
+  /**
+   * 疑似 secret（键名命中 {@link ACP_SECRET_ENV_KEY_PATTERN}）的存量 env 值
+   * **不回显**——文本框只放非疑似键，疑似键由 UI 以「键名 + 已配置」
+   * 行展示；原值在此携带过站，保存时与用户显式重填的同名行合并（显式行优先，
+   * 即同名重填 = 轮换值；UI 移除行 = 删除该键）。仅「编辑存量 agent」路径会
+   * 带上本字段。
+   */
+  maskedEnv?: Record<string, string>
+  /**
+   * 存量 agent 的 runtime 绑定（边界）原样过站：编辑器不暴露本
+   * 字段，但保存时必须挂回——否则面板保存会静默解除 runtime 绑定。
+   * 仅「编辑存量 agent 且其配置带 runtime」路径携带本字段。
+   */
+  runtime?: AcpAgentRuntimeId
+  catalogId?: string
+}
+
+/** A blank draft for the manual-add flow. */
+export function emptyDraft(): AgentDraft {
+  return { id: '', name: '', command: '', argsText: '', envText: '', loginHint: '' }
+}
+
+/** Display-only guidance: preserve saved hints and fall back to catalog metadata. */
+export function agentLoginHint(
+  id: string,
+  config: Pick<AcpAgentConfig, 'runtime' | 'catalogId' | 'loginHint'>,
+): string | undefined {
+  return config.loginHint?.trim() || catalogEntryOf(catalogIdOf(id, config))?.loginHint
+}
+
+/**
+ * Seed the editor from a catalog entry（add-menu 按 {@link ACP_CATALOG_ENTRIES}
+ * 逐条渲染；catalog 条目来自 data/catalog.ts，见该模块头注释）。未知 id
+ * 返回 undefined——菜单只从列表渲染，正常不可达；调用方据此不打开编辑器。
+ */
+export function draftFromCatalogEntry(entryId: string): AgentDraft | undefined {
+  const entry = catalogEntryOf(entryId)
+  if (entry === undefined) return undefined
+  return {
+    id: entry.id,
+    name: entry.name,
+    command: entry.command,
+    argsText: formatArgsText(entry.args),
+    envText: formatEnvText(entry.env),
+    loginHint: entry.loginHint ?? '',
+    catalogId: entry.id,
+    ...(entry.runtime === undefined ? {} : { runtime: entry.runtime }),
+  }
+}
+
+/** Seed the editor from a stored agent (the row's 编辑 button)。 */
+export function draftFromAgent(id: string, config: AcpAgentConfig): AgentDraft {
+  // 疑似 secret 的 env 键不进文本框（不回显值），原值进 maskedEnv 过站
+  const visibleEnv: Record<string, string> = {}
+  const maskedEnv: Record<string, string> = {}
+  for (const [key, value] of Object.entries(config.env)) {
+    if (ACP_SECRET_ENV_KEY_PATTERN.test(key)) maskedEnv[key] = value
+    else visibleEnv[key] = value
+  }
+  return {
+    id,
+    name: config.name,
+    ...(config.catalogId === undefined &&
+    (effectiveRuntimeOf(id, config) !== undefined || catalogEntryOf(id) === undefined)
+      ? {}
+      : { catalogId: catalogIdOf(id, config) }),
+    command: config.command,
+    argsText: formatArgsText(config.args),
+    envText: formatEnvText(visibleEnv),
+    loginHint: config.loginHint ?? '',
+    ...(Object.keys(maskedEnv).length === 0 ? {} : { maskedEnv }),
+    // 边界：runtime 绑定不暴露编辑，原样过站（保存时挂回，见 validateAgentDraft）
+    ...(config.runtime === undefined ? {} : { runtime: config.runtime }),
+  }
+}
+
+/**
+ * 移除草稿里一条掩码 env 键（UI 的「移除」按钮）。返回新草稿对象；
+ * 移除最后一个键时 `maskedEnv` 字段整体缺席（保持「无掩码 = 字段不在」的
+ * 单一形态，validate/序列化两侧都不用特判空对象）。
+ */
+export function dropMaskedEnvKey(draft: AgentDraft, key: string): AgentDraft {
+  if (draft.maskedEnv === undefined || !(key in draft.maskedEnv)) return draft
+  const next = { ...draft.maskedEnv }
+  delete next[key]
+  const { maskedEnv: _dropped, ...rest } = draft
+  return Object.keys(next).length === 0 ? rest : { ...rest, maskedEnv: next }
+}
+
+/**
+ * Parse the args textarea: one argument per line, each line trimmed, blank
+ * lines dropped. A line's interior whitespace is the user's to keep.
+ */
+export function parseArgsText(text: string): string[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+}
+
+/** Render stored args as the editor's one-per-line text. */
+export function formatArgsText(args: readonly string[]): string {
+  return args.join('\n')
+}
+
+/** Why one env line failed to parse. */
+export type EnvParseFailure =
+  { readonly line: number; readonly reason: 'key' } | { readonly line: number; readonly reason: 'duplicate' }
+
+/**
+ * Parse the env textarea: one `KEY=VALUE` per line (split on the FIRST `=`),
+ * blank lines ignored, key trimmed and required to be a shell identifier,
+ * value kept verbatim after the line trim.
+ * @param text - the staged env text.
+ * @returns the env map, or the first offending line (1-based).
+ */
+export function parseEnvText(
+  text: string,
+): { ok: true; env: Record<string, string> } | { ok: false; failure: EnvParseFailure } {
+  const env: Record<string, string> = {}
+  const lines = text.split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = (lines[index] as string).trim()
+    if (line === '') continue
+    const eq = line.indexOf('=')
+    const key = (eq < 0 ? line : line.slice(0, eq)).trim()
+    if (!ACP_ENV_KEY_PATTERN.test(key)) return { ok: false, failure: { line: index + 1, reason: 'key' } }
+    if (Object.hasOwn(env, key)) return { ok: false, failure: { line: index + 1, reason: 'duplicate' } }
+    env[key] = eq < 0 ? '' : line.slice(eq + 1)
+  }
+  return { ok: true, env }
+}
+
+/** Render a stored env map as the editor's `KEY=VALUE` text (insertion order). */
+export function formatEnvText(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n')
+}
+
+/** Locale key of one validation failure (the component maps it through `t`). */
+export type DraftErrorKey =
+  | 'errorIdRequired'
+  | 'errorIdInvalid'
+  | 'errorIdTaken'
+  | 'errorNameRequired'
+  | 'errorCommandRequired'
+  | 'errorEnvKey'
+  | 'errorEnvDuplicate'
+  | 'errorRuntimeTaken'
+
+/** One validation failure: locale key plus template params (e.g. the env line number). */
+export interface DraftError {
+  readonly key: DraftErrorKey
+  readonly params?: Record<string, string | number>
+}
+
+/** Per-field validation outcome; `config` is present exactly when nothing failed. */
+export interface DraftValidation {
+  readonly id?: DraftError
+  readonly name?: DraftError
+  readonly command?: DraftError
+  readonly env?: DraftError
+  /**
+   * （内置 runtime 唯一性）内置 runtime singleton 冲突：草稿的生效 runtime 已被另一个
+   * 存量 profile 绑定。params 携带 `{runtime, id, name}` 点名已有 profile——
+   * UI 据此展示「打开已有配置」出口，不自动覆盖/删除。
+   */
+  readonly runtime?: DraftError
+  /** The parsed, storage-ready config; undefined while any error stands. */
+  readonly config?: AcpAgentConfig
+}
+
+/**
+ * Validate a staged draft against the host schema's rules plus id uniqueness
+ * and the built-in runtime singleton（同一内置 runtime 至多一个 profile，
+ * client 侧先检——host schema 的同款跨条目拒绝兜底绕过 UI 的直写）。
+ * The row being edited keeps its own id/runtime (`editingId`) without tripping
+ * the taken checks.
+ * @param draft - the staged text.
+ * @param agents - the stored agents map（id 唯一性与 runtime 冲突的共同事实源）.
+ * @param editingId - the id whose row is being edited, undefined while adding.
+ * @returns per-field errors and, when clean, the parsed config.
+ */
+export function validateAgentDraft(
+  draft: AgentDraft,
+  agents: Record<string, AcpAgentConfig>,
+  editingId: string | undefined,
+): DraftValidation {
+  const id = draft.id.trim()
+  const name = draft.name.trim()
+  const command = draft.command.trim()
+  const loginHint = draft.loginHint.trim()
+  const validation: {
+    id?: DraftError
+    name?: DraftError
+    command?: DraftError
+    env?: DraftError
+    runtime?: DraftError
+  } = {}
+  if (id === '') validation.id = { key: 'errorIdRequired' }
+  else if (!ACP_AGENT_ID_PATTERN.test(id)) validation.id = { key: 'errorIdInvalid' }
+  else if (id !== editingId && Object.hasOwn(agents, id)) validation.id = { key: 'errorIdTaken' }
+  if (name === '') validation.name = { key: 'errorNameRequired' }
+  if (command === '') validation.command = { key: 'errorCommandRequired' }
+  const parsedEnv = parseEnvText(draft.envText)
+  if (!parsedEnv.ok) {
+    const key: DraftErrorKey = parsedEnv.failure.reason === 'key' ? 'errorEnvKey' : 'errorEnvDuplicate'
+    validation.env = { key, params: { line: parsedEnv.failure.line } }
+  }
+  // singleton：草稿的生效 runtime（显式 runtime 优先、内置 id 回退）与任一
+  // 其他存量 profile 的生效 runtime 相撞即拒绝，错误点名已有 profile。
+  const draftRuntime = effectiveRuntimeOf(id, draft)
+  if (draftRuntime !== undefined) {
+    for (const [existingId, existing] of Object.entries(agents)) {
+      if (existingId === editingId) continue
+      if (effectiveRuntimeOf(existingId, existing) !== draftRuntime) continue
+      validation.runtime = {
+        key: 'errorRuntimeTaken',
+        params: { runtime: draftRuntime, id: existingId, name: existing.name },
+      }
+      break
+    }
+  }
+  if (
+    validation.id !== undefined ||
+    validation.name !== undefined ||
+    validation.command !== undefined ||
+    validation.env !== undefined ||
+    validation.runtime !== undefined ||
+    !parsedEnv.ok
+  ) {
+    return validation
+  }
+  return {
+    ...validation,
+    config: {
+      name,
+      command,
+      args: parseArgsText(draft.argsText),
+      // 掩码键原样合回（用户同名重填的显式行优先 = 轮换值）
+      env: { ...draft.maskedEnv, ...parsedEnv.env },
+      ...(loginHint === '' ? {} : { loginHint }),
+      // 边界：存量 agent 的 runtime 绑定原样挂回（编辑器不暴露，保存不得静默解除）
+      ...(draft.runtime === undefined ? {} : { runtime: draft.runtime }),
+      ...(draft.catalogId === undefined ? {} : { catalogId: draft.catalogId }),
+    },
+  }
+}
+
+// ---------- agents map projections ----------
+
+/** Agent ids in the registry's canonical display order. */
+export function sortedAgentIds(agents: Record<string, AcpAgentConfig>): string[] {
+  return Object.keys(agents).sort((left, right) => left.localeCompare(right))
+}
+
+// ---------- settings scope 快照投影（controller 订阅的面片状态） ----------
+
+/** Structural face of the Alpha client settings-scope snapshot. */
+export interface AcpScopeSnapshot {
+  status: 'loading' | 'ready' | 'unavailable'
+  value: AcpSettings | undefined
+  revision: number | undefined
+  writable: boolean
+}
+
+/** The panel's view of its settings scope. */
+export interface PanelSettingsState {
+  /**
+   * `invalid` covers a section the scope served but the decoder refused: the
+   * scope leaves `status` at 'loading' on a decode miss while `revision`
+   * proves a read landed — that pair is the invalid state, not a slow load.
+   */
+  status: 'loading' | 'invalid' | 'unavailable' | 'ready'
+  writable: boolean
+  agents: Record<string, AcpAgentConfig>
+  toolApprovalDefault: 'auto' | 'ask'
+  revision: number | undefined
+}
+
+/** Project one scope snapshot into the panel's settings state. */
+export function panelSettingsOf(snapshot: AcpScopeSnapshot): PanelSettingsState {
+  const status =
+    snapshot.status === 'ready'
+      ? 'ready'
+      : snapshot.status === 'unavailable'
+        ? 'unavailable'
+        : snapshot.revision === undefined
+          ? 'loading'
+          : 'invalid'
+  return {
+    status,
+    writable: snapshot.writable,
+    agents: snapshot.value?.agents ?? {},
+    toolApprovalDefault: snapshot.value?.toolApprovalDefault ?? 'auto',
+    revision: snapshot.revision,
+  }
+}
+
+// ---------- Remote wire 解码（窄化 contract 见 src/contract/remote.ts） ----------
+
+/** ACP schema v1 AuthMethod (the initialize response's advertised methods; every variant carries id + name). */
+export interface AcpAuthMethod {
+  id: string
+  name: string
+  description?: string | null
+}
+
+/** initialize 握手能力的展示事实（镜像 src/contract/remote.ts `AcpCapabilityFacts`）。 */
+export interface AcpCapabilityFacts {
+  loadSession: boolean
+  sessionList: boolean
+  /** `session/close`（清理事实展示用）。 */
+  sessionClose: boolean
+  /** `session/delete`（清理事实展示用）。 */
+  sessionDelete: boolean
+  promptImage: boolean
+  promptAudio: boolean
+  promptEmbeddedContext: boolean
+  mcpHttp: boolean
+  mcpSse: boolean
+}
+
+/** probe 会话清理事实（镜像 src/contract/remote.ts `AcpProbeCleanupView`）。 */
+export interface AcpProbeCleanup {
+  close: 'done' | 'not-advertised' | 'failed'
+  delete: 'done' | 'not-advertised' | 'failed'
+  message: string | null
+}
+
+/** 端到端能力矩阵一行的三值状态（镜像 src/contract/remote.ts `AcpCapabilityMatrixStatus`）。 */
+export type AcpCapabilityMatrixStatus = 'supported' | 'degraded' | 'unsupported'
+
+/**
+ * 端到端能力矩阵的一行（镜像 src/contract/remote.ts
+ * `AcpCapabilityMatrixRow`）：advertised/adapterPath/hostSeam 三列事实 +
+ * 派生 status + 可选 note（host 侧事实陈述原文，次级展示不过 locale）。
+ */
+export interface AcpCapabilityMatrixRow {
+  id: string
+  advertised: boolean | null
+  adapterPath: string
+  hostSeam: string | null
+  status: AcpCapabilityMatrixStatus
+  note?: string
+}
+
+/** Probe failure stage, matching `AcpProbePhase` in src/protocol/v1/types.ts. */
+export type AcpProbePhase = 'initialize' | 'session'
+
+/** One provider row of the dshAcp Remote `health` view (src/contract/remote.ts). */
+export interface AcpProviderHealth {
+  id: string
+  name: string
+  command: string
+  args: string[]
+  loginHint: string | null
+  executable: boolean
+  version: string | null
+  /** Configuration state derived by the Host. */
+  state: AcpAgentConfigState
+  probe:
+    | { status: 'never'; at: null }
+    | {
+        status: 'ok'
+        at: number
+        modelCount: number
+        authMethods: readonly AcpAuthMethod[] | null
+        agentInfo: { name: string; version: string } | null
+        capabilities: AcpCapabilityFacts | null
+        /** probe 会话清理事实（delete 未广告/失败 = 降级，面板须如实展示）。 */
+        cleanup: AcpProbeCleanup | null
+        /** initialize 握手能力的 sha256-16 指纹（旧条目缺席归 null）。 */
+        capabilityHash: string | null
+        /** 协商的 ACP 协议版本（readiness；旧缓存条目/握手未给出归 null）。 */
+        protocolVersion: number | null
+        /** 兼容状态（边界；无版本参考/握手无版本归 null，快照无版本 'unknown'）。 */
+        versionCompatibility: 'current' | 'different' | 'unknown' | null
+        /** 端到端能力矩阵（host 计算的交集结论，UI 只展示它，不直译 capabilities 布尔）。 */
+        matrix: readonly AcpCapabilityMatrixRow[]
+      }
+    | { status: 'error'; at: number; failureKind: string; message: string; phase: AcpProbePhase | null }
+}
+
+/**
+ * Validate a dshAcp Remote `health` view payload. Wire boundary: the whole
+ * payload is refused (undefined) rather than partially shown when any row
+ * violates the contract.
+ */
+export function decodeHealthResponse(body: unknown): readonly AcpProviderHealth[] | undefined {
+  if (!isPlainObject(body)) return undefined
+  const providers = body['providers']
+  if (!Array.isArray(providers)) return undefined
+  const rows: AcpProviderHealth[] = []
+  for (const raw of providers) {
+    const row = decodeHealthRow(raw)
+    if (row === undefined) return undefined
+    rows.push(row)
+  }
+  return rows
+}
+
+function decodeHealthRow(raw: unknown): AcpProviderHealth | undefined {
+  if (!isPlainObject(raw)) return undefined
+  const { id, name, command, args, loginHint, executable, version, state, probe } = raw as Record<string, unknown>
+  if (typeof id !== 'string' || typeof name !== 'string' || typeof command !== 'string') return undefined
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string')) return undefined
+  if (!(typeof loginHint === 'string' || loginHint === null)) return undefined
+  if (typeof executable !== 'boolean') return undefined
+  if (!(typeof version === 'string' || version === null)) return undefined
+  // 五态：词表外一律整行拒绝（health 响应整体失格，与 decodeHealthResponse 口径一致）
+  if (typeof state !== 'string' || !(ACP_AGENT_CONFIG_STATES as readonly string[]).includes(state)) return undefined
+  const probeRow = decodeProbeRow(probe)
+  if (probeRow === undefined) return undefined
+  return {
+    id,
+    name,
+    command,
+    args: args as string[],
+    loginHint,
+    executable,
+    version,
+    state: state as AcpAgentConfigState,
+    probe: probeRow,
+  }
+}
+
+function decodeProbeRow(raw: unknown): AcpProviderHealth['probe'] | undefined {
+  if (!isPlainObject(raw)) return undefined
+  const status = raw['status']
+  if (status === 'never') return raw['at'] === null ? { status: 'never', at: null } : undefined
+  if (typeof raw['at'] !== 'number') return undefined
+  if (status === 'ok') {
+    const modelCount = raw['modelCount']
+    const authMethods = raw['authMethods']
+    if (typeof modelCount !== 'number') return undefined
+    if (!(authMethods === null || (Array.isArray(authMethods) && authMethods.every(isAuthMethod)))) return undefined
+    const agentInfo = decodeAgentInfo(raw['agentInfo'])
+    if (agentInfo === undefined) return undefined
+    const capabilities = decodeCapabilityFacts(raw['capabilities'])
+    if (capabilities === undefined) return undefined
+    const cleanup = decodeProbeCleanup(raw['cleanup'])
+    if (cleanup === undefined) return undefined
+    const capabilityHash = raw['capabilityHash']
+    if (!(capabilityHash === null || typeof capabilityHash === 'string')) return undefined
+    // readiness 三键（probe-ok 必填；null 词表/词表外值整行拒绝）
+    const protocolVersion = raw['protocolVersion']
+    if (!(protocolVersion === null || typeof protocolVersion === 'number')) return undefined
+    const versionCompatibility = raw['versionCompatibility']
+    if (!(
+      versionCompatibility === null ||
+      versionCompatibility === 'current' ||
+      versionCompatibility === 'different' ||
+      versionCompatibility === 'unknown'
+    ))
+      return undefined
+    const matrix = decodeCapabilityMatrix(raw['matrix'])
+    if (matrix === undefined) return undefined
+    return {
+      status: 'ok',
+      at: raw['at'],
+      modelCount,
+      authMethods: authMethods as readonly AcpAuthMethod[] | null,
+      agentInfo,
+      capabilities,
+      cleanup,
+      capabilityHash,
+      protocolVersion,
+      versionCompatibility,
+      matrix,
+    }
+  }
+  if (status === 'error') {
+    const failureKind = raw['failureKind']
+    const message = raw['message']
+    const phase = raw['phase']
+    if (typeof failureKind !== 'string' || typeof message !== 'string') return undefined
+    if (!(phase === null || phase === 'initialize' || phase === 'session')) return undefined
+    return { status: 'error', at: raw['at'], failureKind, message, phase }
+  }
+  return undefined
+}
+
+/** agentInfo 字段：null 或 {name, version}（其余键剥离）。 */
+function decodeAgentInfo(raw: unknown): { name: string; version: string } | null | undefined {
+  if (raw === null) return null
+  if (!isPlainObject(raw)) return undefined
+  const { name, version } = raw as Record<string, unknown>
+  if (typeof name !== 'string' || typeof version !== 'string') return undefined
+  return { name, version }
+}
+
+/** capabilities 字段：null 或九键全 boolean 的事实对象（其余键剥离）。 */
+function decodeCapabilityFacts(raw: unknown): AcpCapabilityFacts | null | undefined {
+  if (raw === null) return null
+  if (!isPlainObject(raw)) return undefined
+  const keys = [
+    'loadSession',
+    'sessionList',
+    'sessionClose',
+    'sessionDelete',
+    'promptImage',
+    'promptAudio',
+    'promptEmbeddedContext',
+    'mcpHttp',
+    'mcpSse',
+  ] as const
+  const facts = {} as Record<(typeof keys)[number], boolean>
+  for (const key of keys) {
+    const value = (raw as Record<string, unknown>)[key]
+    if (typeof value !== 'boolean') return undefined
+    facts[key] = value
+  }
+  return facts
+}
+
+const CLEANUP_STEPS = ['done', 'not-advertised', 'failed'] as const
+
+/** cleanup 字段：null 词表或三态齐全的事实对象；其余形态整行拒绝。 */
+function decodeProbeCleanup(raw: unknown): AcpProbeCleanup | null | undefined {
+  if (raw === null) return null
+  if (!isPlainObject(raw)) return undefined
+  const close = CLEANUP_STEPS.find((step) => step === raw['close'])
+  const del = CLEANUP_STEPS.find((step) => step === raw['delete'])
+  if (close === undefined || del === undefined) return undefined
+  const message = raw['message']
+  if (!(message === null || typeof message === 'string')) return undefined
+  return { close, delete: del, message }
+}
+
+function isAuthMethod(raw: unknown): boolean {
+  return isPlainObject(raw) && typeof raw['id'] === 'string' && typeof raw['name'] === 'string'
+}
+
+const MATRIX_STATUSES: readonly AcpCapabilityMatrixStatus[] = ['supported', 'degraded', 'unsupported']
+
+/**
+ * matrix 字段：probe-ok 的必填键，行数组逐行严检（id/adapterPath
+ * string、advertised boolean|null、hostSeam string|null、status 词表内、
+ * note 缺席或 string）；任一畸形整行拒绝 → health 响应整体失格
+ * （decodeHealthResponse 同款口径）。
+ */
+function decodeCapabilityMatrix(raw: unknown): readonly AcpCapabilityMatrixRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const rows: AcpCapabilityMatrixRow[] = []
+  for (const item of raw) {
+    if (!isPlainObject(item)) return undefined
+    const { id, advertised, adapterPath, hostSeam, status, note } = item
+    if (typeof id !== 'string') return undefined
+    if (!(advertised === null || typeof advertised === 'boolean')) return undefined
+    if (typeof adapterPath !== 'string') return undefined
+    if (!(hostSeam === null || typeof hostSeam === 'string')) return undefined
+    if (typeof status !== 'string' || !MATRIX_STATUSES.includes(status as AcpCapabilityMatrixStatus)) return undefined
+    if (note !== undefined && typeof note !== 'string') return undefined
+    rows.push({
+      id,
+      advertised,
+      adapterPath,
+      hostSeam,
+      status: status as AcpCapabilityMatrixStatus,
+      ...(typeof note === 'string' ? { note } : {}),
+    })
+  }
+  return rows
+}
+
+/** `boundSessions(agentId)` 的应答（删除确认提示；client 侧镜像 src/contract/remote.ts `AcpBoundSessionsView`）。 */
+export interface AcpBoundSessionsView {
+  readonly agentId: string
+  readonly count: number
+}
+
+/**
+ * boundSessions 应答的严格解码（wire 边界纪律与 decodeHealthResponse 同款：
+ * 畸形/错型整体拒绝归 undefined——计数是删除确认的增强提示，缺失时面板退回
+ * 无计数的基础文案，绝不拿解码失败冒充 0）。
+ */
+export function decodeBoundSessions(body: unknown): AcpBoundSessionsView | undefined {
+  if (!isPlainObject(body)) return undefined
+  const { agentId, count } = body as Record<string, unknown>
+  if (typeof agentId !== 'string' || !ACP_AGENT_ID_PATTERN.test(agentId)) return undefined
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) return undefined
+  return { agentId, count }
+}
+
+/** Match one health row to a settings agent id (undefined when the response does not cover it). */
+export function healthRowOf(rows: readonly AcpProviderHealth[], id: string): AcpProviderHealth | undefined {
+  return rows.find((row) => row.id === id)
+}
+
+// ---------- 错误文本整形 ----------
+
+/** Any thrown value → a displayable message. */
+export function errorMessageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}

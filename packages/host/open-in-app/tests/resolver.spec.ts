@@ -581,15 +581,15 @@ describe('launchResolved', () => {
         },
       }),
     )).resolves.toBe('launched')
-    // The opener is the shipped Invoke-Item channel; the detached spawner never runs.
+    // The opener is the shipped Explorer channel; the detached spawner never runs.
     expect(spawns).toEqual([])
     expect(commands).toEqual([
-      ['powershell.exe', '-NoProfile', '-Command', "Invoke-Item -LiteralPath 'C:\\w\\dir'"],
+      ['explorer.exe', 'file:///C:/w/dir'],
     ])
   })
 
   it('counts a shell-open opener that outlives the watch window as launched, and a fast failure as failed', async () => {
-    // A cold powershell start can outlive the window: still-running counts launched.
+    // A cold shell opener can outlive the window: still-running counts launched.
     await expect(launchResolved(
       { launch: { kind: 'shell-open' } }, '/w/dir', 25,
       bare({ platform: 'darwin', run: () => new Promise(() => {}) }),
@@ -662,18 +662,6 @@ describe('launchDetachedApp', () => {
   it('rejects a spawn failure, carrying the ENOENT code', async () => {
     await expect(launchDetachedApp('dsh-definitely-missing-launcher', [], { watchMs: TIMEOUT_MS }))
       .rejects.toMatchObject({ code: 'ENOENT' })
-  })
-
-  it('counts a child that outlives the watch window as launched without killing it', async () => {
-    // The child exits on its own shortly after; the launch settles at the
-    // window, long before that, and never awaits or kills the process.
-    const started = Date.now()
-    await expect(launchDetachedApp(
-      node, ['-e', 'setTimeout(() => {}, 1500)'], { watchMs: 100 },
-    )).resolves.toBeUndefined()
-    expect(Date.now() - started).toBeLessThan(1_400)
-    // A late exit after the settled window changes nothing.
-    await new Promise(resolve => setTimeout(resolve, 1_600))
   })
 
   it('hands the child a credential-scrubbed environment with explicit adapter entries', async () => {

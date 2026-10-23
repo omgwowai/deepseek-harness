@@ -1,0 +1,91 @@
+# DSH-ACP-ADAPTER
+
+[中文](README.md)
+
+Use ACP Agents in DSH with native sessions, tool approvals, and team collaboration.
+
+## Install
+
+Plugin version [`0.2.1-rc.2.3`](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/tag/v0.2.1-rc.2.3) supports DSH `0.2.1-rc.2`. See [Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases) for other versions.
+
+**Recommended:** In DSH Creator mode, send:
+
+> Install and enable the ACP plugin: `@local/dsh-acp-adapter@0.2.1-rc.2.3`.
+
+Confirm the native prompt to install; the new plugin is enabled by default. Alternatively, open **Plugins → Add plugin**, paste `@local/dsh-acp-adapter@0.2.1-rc.2.3`, install it, then select **Enable now**.
+
+<details>
+<summary>Other installation methods: CLI, Git, and archive</summary>
+
+CLI: On Desktop, use its bundled `dsh` command. On Web, use `npx` to run the official DSH CLI npm package without a global install.
+
+Before using the Desktop CLI, fully quit the app; reopen it after the command completes. To update with the CLI, replace the version after the package name with your target version and rerun the corresponding `add` command; no uninstall is needed.
+
+```bash
+# Desktop
+dsh plugin --profile desktop add @local/dsh-acp-adapter@0.2.1-rc.2.3
+
+# Web
+npx @deepseek-ai/dsh@0.2.1-rc.2 plugin --profile web add @local/dsh-acp-adapter@0.2.1-rc.2.3
+```
+
+Git and archive examples:
+
+In the plugin manager, paste the Git address or .tgz URL below in place of the package name.
+
+| Source                         | Example                                                                                                                                                    |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git                            | `git+https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter.git#v0.2.1-rc.2.3`                                                                             |
+| Prebuilt plugin archive (.tgz) | [Download 0.2.1-rc.2.3](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/download/v0.2.1-rc.2.3/zaimokuza-dsh-acp-adapter-0.2.1-rc.2.3.tgz) |
+
+This archive includes compiled output and matches the npm package. GitHub's automatically generated Source code ZIP/TAR.GZ files are source archives, not built plugin packages. Uncached dependencies still require network access.
+
+</details>
+
+**Updates:** The plugin manager does not update plugins automatically. To update through the plugin manager, uninstall the old version, then install the new version using the recommended method above. Uninstalling the plugin does not uninstall an Agent or sign out of its account. To ensure the updated plugin is loaded, fully quit and reopen DSH Desktop after the current task finishes; for Web, restart the DSH service and refresh the page. You do not need to sign in again.
+
+## Connect an Agent
+
+The plugin ships with a snapshot of the [official ACP Agent catalog](https://agentclientprotocol.com/registry), with installation and sign-in guidance and command prefill. You can also add an ACP Agent manually. Install and sign in to the Agent CLI on the computer running DSH. Open **Plugins → ACP adapter**, follow the catalog guidance to add the Agent and check its connection, then choose its model in a new session. The plugin does not install CLIs or sign in to accounts. These Agents have completed real integration checks:
+
+| Agent                     | ACP command                                 | Authentication       |
+| ------------------------- | ------------------------------------------- | -------------------- |
+| Devin                     | `devin acp`                                 | `devin auth login`   |
+| CodeBuddy CLI (WorkBuddy) | `codebuddy --acp`                           | `codebuddy`          |
+| Antigravity               | `agy_acp_server.par` (official raw `1.3.0`) | Separate ACP sign-in |
+| Claude                    | `claude-agent-acp`                          | `claude`             |
+| Codex                     | `codex-acp`                                 | `codex login`        |
+| Kimi                      | `kimi acp`                                  | `kimi login`         |
+| Qwen Code                 | `qwen --acp`                                | `qwen`               |
+
+> CodeBuddy CLI and the WorkBuddy desktop app share account credits, with no separate subscription required. Connect DSH through the CodeBuddy CLI. See [CodeBuddy account and subscription details](https://www.codebuddy.cn/docs/ide/Account/pricing) and the [ACP CLI reference](https://www.codebuddy.cn/docs/cli/cli-reference).
+
+For test coverage and limitations, see the [E2E verification guide](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/blob/v0.2.1-rc.2.3/test/e2e/README.md).
+
+## Preview
+
+![An Agent working in the native DSH session UI](assets/readme/acp-session.en.png)
+
+<details>
+<summary>More screenshots</summary>
+
+![Native DSH approval card](assets/readme/acp-permission.en.png)
+
+![Read-only subagent details](assets/readme/acp-subagent.en.png)
+
+</details>
+
+**Auto** automatically approves DSH native tool requests for the current session. **Ask** shows the native approval card when the Agent requests approval. The Agent controls its own tools. **Stop** stops the current turn; press Enter to queue a message, which supported Agents continue in the same Agent session. With DSH's experimental Agent Teams enabled, you can view member progress and handle approvals from the main conversation.
+
+## Troubleshooting and feedback
+
+| Symptom                              | First check                                                                                              |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| Command will not start               | Check the Agent executable path and try an absolute path.                                                |
+| Sign-in or authentication fails      | Sign in through the Agent CLI and check configured environment variables.                                |
+| Older subagent details will not open | Follow the native recovery notice; incompatible old details remain in local history with an error shown. |
+| Session requests recovery            | Follow the composer notice; do not clear local data.                                                     |
+
+DSH's native session-log ZIP may contain prompts, tool arguments, file paths, and attachments; inspect and redact it before sharing.
+
+For help, open an [issue](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/issues) with the error reference, DSH/plugin versions, and redacted log excerpts. See the [native reuse boundaries](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/blob/v0.2.1-rc.2.3/docs/native-reuse.en.md).

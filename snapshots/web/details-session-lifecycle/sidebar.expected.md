@@ -13,11 +13,11 @@
     644,
     756
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": true,
   "mode": "push",
   "panelContentWidth": 756,
-  "panelOuterWidth": 757,
+  "panelOuterWidth": 756,
   "coversViewport": false,
   "resizeHandleWidth": 8,
   "expandedDirectories": [],
@@ -39,7 +39,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -87,7 +87,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -135,7 +135,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -157,7 +157,7 @@
     1400,
     0
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": false,
   "mode": "push",
   "panelContentWidth": 0,
@@ -220,7 +220,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -229,7 +229,7 @@
 }
 ```
 
-## B restored: normal mode and Files directory state
+## B restored: normal mode and collapsed Files directory
 
 ```json
 {
@@ -242,16 +242,14 @@
     644,
     756
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": true,
   "mode": "push",
   "panelContentWidth": 756,
-  "panelOuterWidth": 757,
+  "panelOuterWidth": 756,
   "coversViewport": false,
   "resizeHandleWidth": 8,
-  "expandedDirectories": [
-    "workspace"
-  ],
+  "expandedDirectories": [],
   "panes": [
     {
       "active": true,
@@ -279,11 +277,11 @@
     644,
     756
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": true,
   "mode": "push",
   "panelContentWidth": 756,
-  "panelOuterWidth": 757,
+  "panelOuterWidth": 756,
   "coversViewport": false,
   "resizeHandleWidth": 8,
   "expandedDirectories": [],
@@ -305,7 +303,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -327,7 +325,7 @@
     604,
     0
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": false,
   "mode": "push",
   "panelContentWidth": 0,
@@ -353,7 +351,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -375,7 +373,7 @@
     1260,
     0
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": false,
   "mode": "push",
   "panelContentWidth": 0,
@@ -401,7 +399,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -449,7 +447,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]
@@ -471,7 +469,7 @@
     1260,
     0
   ],
-  "columnTransition": "grid-template-columns",
+  "columnTransition": "all",
   "expanded": false,
   "mode": "push",
   "panelContentWidth": 0,
@@ -497,7 +495,7 @@
       "active": false,
       "tabs": [
         {
-          "title": "Start",
+          "title": "Files",
           "selected": true
         }
       ]

@@ -21,7 +21,7 @@ afterEach(() => {
 })
 
 function harness() {
-  const instance = createSidebarRightStore(() => 'Start').create()
+  const instance = createSidebarRightStore(() => ({ kind: 'guide', title: 'Start' })).create()
   const domain = new TabDomain({ openResourceIn: vi.fn(), openTabIn: vi.fn(), closeIn: vi.fn() }, vi.fn())
   domains.push(domain)
   const navigationSources = new Map<string, TabOccurrence['navigation']>()
@@ -40,7 +40,8 @@ function harness() {
     const occurrence = domain.occurrence(SESSION, { id: tabId })
     navigationSources.set(tabId, occurrence.navigation)
     return tabInfoFactory(standard, {
-      tabId, title: false, fullscreen: false, signal: occurrence.signal, actions: occurrence.tabActions, useStore, useTabNavigation,
+      tabId, title: false, fullscreen: false, active: true, shortcuts: [],
+      signal: occurrence.signal, actions: occurrence.tabActions, useStore, useTabNavigation,
     })
   }
   const open = (beforeCommit?: (tabId: TabId) => void): TabId => {
