@@ -13,8 +13,12 @@ import type { AcpAgentConfig, AcpResolvedAgent } from '../../domain/session/agen
 import { createTeamManagement } from '../teams/management.ts'
 import { createAcpLogger } from '../../domain/observability/logging.ts'
 import { acpProbeConfigKey } from './llm-stub.ts'
-import { installNativeAgentAccess } from './native-agent-access.ts'
+import { installNativeAgentAccess, installNativeCompact } from './native-agent-access.ts'
 import { AcpProfileAdapter } from './profile-adapter.ts'
+import { AcpSessionRuntime } from '../../runtime/session/session-runtime.ts'
+import { NativeSessionRuntime } from '../../runtime/native/native-session-runtime.ts'
+import { selectNativeTransportKind } from '../../runtime/native/transports/contract.ts'
+import { createNativeTransport } from '../../runtime/native/transports/index.ts'
 import { installWorkingDirectoryGuard } from './working-directory-guard.ts'
 import { profileLaunchIdentityHash } from '../../domain/session/launch-fingerprint.ts'
 import type { SubprocessSeamResolution } from '../../runtime/process/subprocess.ts'
@@ -659,7 +663,11 @@ export function installInstalledProfileRegistry(
         },
       },
       toolApprovalPolicy: {
-        read: readToolApprovalPolicy,
+        // The policy only gates DSH tools reached through the team bridge; without it the control is inert.
+        read: async (sessionId) => {
+          const snapshot = await readToolApprovalPolicy(sessionId)
+          return teamBridge ? snapshot : { ...snapshot, applies: false }
+        },
         write: async (sessionId, policy) => {
           const current = await readToolApprovalPolicy(sessionId)
           if (!current.editable) throw new Error('ACP_TOOL_APPROVAL_POLICY_INHERITED')
@@ -733,7 +741,15 @@ export function installInstalledProfileRegistry(
             (sessionId) => acpSessionView(ctx, sessionStore?.get(sessionId)),
             ledgerStore,
             undefined,
-            undefined,
+            (options: ConstructorParameters<typeof AcpSessionRuntime>[0]) => {
+              const candidate = activeAgents[id]
+              const kind =
+                candidate === undefined
+                  ? undefined
+                  : selectNativeTransportKind({ command: candidate.command, args: [...candidate.args] })
+              if (kind === undefined) return new AcpSessionRuntime(options)
+              return new NativeSessionRuntime({ ...options, kind, createTransport: () => createNativeTransport(kind) })
+            },
             sidecar,
             attachments,
             resolveNativeQuestions,
@@ -828,10 +844,12 @@ export function installInstalledProfileRegistry(
     registeredKey = key
   }
 
-  installNativeAgentAccess(ctx, (provider) => {
+  const ownsAcpRoute = (provider: string | undefined): boolean => {
     const profileId = acpAgentIdFromRoute(provider ?? '')
     return profileId !== undefined && registrations.has(profileId)
-  })
+  }
+  installNativeCompact(ctx, ownsAcpRoute)
+  installNativeAgentAccess(ctx, ownsAcpRoute)
 
   const onSettingsChange = (): void => {
     // llm-pi-ai precedent: a refused swap (route owned by another adapter
