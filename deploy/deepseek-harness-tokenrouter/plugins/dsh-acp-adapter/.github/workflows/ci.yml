@@ -1,0 +1,193 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  published-compatibility:
+    name: DSH npm compatibility (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # pnpm 10's node-gyp supports VS 2022; windows-2025 now ships VS 18.
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        id: node
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        if: runner.os != 'Windows'
+        with:
+          version: 10.7.0
+      - name: Verify ordinary Unix user
+        if: runner.os != 'Windows'
+        run: node scripts/check-ci-user.mjs
+      - name: Cache published dependency store
+        if: runner.os != 'Windows'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/pnpm-store-plugin
+          key: plugin-store-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-pnpm10.7.0-${{ hashFiles('pnpm-lock.yaml') }}
+      - name: Install exact published dependencies
+        if: runner.os != 'Windows'
+        run: pnpm install --frozen-lockfile --store-dir "$RUNNER_TEMP/pnpm-store-plugin"
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: pnpm format:check
+      - name: Verify npm compatibility
+        if: runner.os != 'Windows'
+        run: pnpm typecheck && pnpm test --no-file-parallelism && pnpm build
+      - name: Real Devin MCP config discovery (macOS, no credentials)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same release and probe as Windows. Never install into the runner's profile.
+          devin_version=3000.10.31
+          case "$(uname -m)" in
+            arm64) devin_platform=aarch64-apple-darwin; devin_sha=051dfcf29e0f5cb5f0a07c7579dc97255fee7f02ce4c6feacc7d4065ce76b5bd ;;
+            x86_64) devin_platform=x86_64-apple-darwin; devin_sha=ca450a13a7e2d83a2c6e641c0f80842826f944cad3ca93ba892a7ade3948555a ;;
+            *) exit 1 ;;
+          esac
+          devin_root="$(mktemp -d "$RUNNER_TEMP/devin-mcp.XXXXXX")"
+          trap 'rm -rf "$devin_root"' EXIT
+          curl --fail --location --silent --show-error --retry 3 "https://static.devin.ai/cli/$devin_version/devin-$devin_version-$devin_platform.tar.gz" -o "$devin_root/devin.tar.gz"
+          echo "$devin_sha  $devin_root/devin.tar.gz" | shasum -a 256 --check
+          tar -xzf "$devin_root/devin.tar.gz" -C "$devin_root"
+          devin_exe="$(find "$devin_root" -type f -name devin)"
+          test -x "$devin_exe"
+          "$devin_exe" version
+          node scripts/check-devin-mcp.ts "$devin_exe"
+      - name: Install, verify and pack as an ordinary Windows user
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/run-windows-user-ci.ps1
+      - name: Pack verified artifact
+        if: runner.os != 'Windows'
+        id: artifact
+        shell: bash
+        run: echo "tarball=$(npm pack --ignore-scripts --silent)" >> "$GITHUB_OUTPUT"
+      - name: Published host install and boot
+        if: runner.os != 'Windows'
+        run: node scripts/install-gate.ts --tgz "${{ steps.artifact.outputs.tarball }}"
+
+  native-ui-shards:
+    name: Native UI shard (${{ matrix.shard }}/3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: dsh-acp-adapter
+    env:
+      DSH_UPSTREAM_CHECKOUT: ${{ github.workspace }}/reference/deepseek-harness
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          path: dsh-acp-adapter
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        id: node
+        with:
+          node-version-file: dsh-acp-adapter/.nvmrc
+          package-manager-cache: false
+      - name: Resolve exact DSH source tag
+        id: dsh-target
+        run: node --input-type=module -e 'import { appendFileSync } from "node:fs"; import { DSH_SOURCE_TAG } from "./scripts/dsh-target.ts"; appendFileSync(process.env.GITHUB_OUTPUT, `tag=${DSH_SOURCE_TAG}\n`)'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ steps.dsh-target.outputs.tag }}
+          path: reference/deepseek-harness
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.28.5
+          package_json_file: reference/deepseek-harness/package.json
+      - name: Verify ordinary Unix user
+        run: node scripts/check-ci-user.mjs
+      - name: Cache exact host dependency store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/pnpm-store-host
+          key: host-store-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-pnpm11.28.5-${{ steps.dsh-target.outputs.tag }}-${{ hashFiles('reference/deepseek-harness/pnpm-lock.yaml') }}
+      - name: Build exact host scaffold
+        working-directory: reference/deepseek-harness
+        # The pinned Host's official artifact chain checks package projects and produces the
+        # Host/client/Web outputs; upstream test/script aggregates are separate.
+        run: pnpm install --frozen-lockfile --store-dir "$RUNNER_TEMP/pnpm-store-host" && pnpm run build:artifacts
+      - name: Cache pinned Chromium
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-${{ steps.dsh-target.outputs.tag }}-${{ hashFiles('reference/deepseek-harness/pnpm-lock.yaml') }}
+      - name: Install Chromium
+        working-directory: reference/deepseek-harness
+        run: pnpm --dir apps/web exec playwright install --with-deps chromium
+      - name: Install native terminal sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces. Permit only
+          # the sandbox launcher; keep the global AppArmor restriction enabled.
+          sudo tee /etc/apparmor.d/dsh-ci-bwrap > /dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          profile dsh-ci-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/dsh-ci-bwrap
+          bwrap --ro-bind / / --dev /dev --proc /proc -- true
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 10.7.0
+          package_json_file: dsh-acp-adapter/package.json
+      - name: Cache published dependency store
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/pnpm-store-plugin
+          key: plugin-store-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-pnpm10.7.0-${{ hashFiles('dsh-acp-adapter/pnpm-lock.yaml') }}
+      - name: Build plugin with npm dependencies
+        run: pnpm install --frozen-lockfile --store-dir "$RUNNER_TEMP/pnpm-store-plugin" && pnpm build
+      - name: Native UI parity (keyless ACP protocol fixtures)
+        run: pnpm test:e2e --ci-shard "${{ matrix.shard }}/3"
+      - name: Upload native UI failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-ui-failures-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: dsh-acp-adapter/.local/e2e-failures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Preserve the required check name while making every shard mandatory.
+  native-ui:
+    name: Native UI parity (exact source scaffold)
+    needs: native-ui-shards
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all native UI shards
+        env:
+          SHARD_RESULT: ${{ needs.native-ui-shards.result }}
+        run: test "$SHARD_RESULT" = success

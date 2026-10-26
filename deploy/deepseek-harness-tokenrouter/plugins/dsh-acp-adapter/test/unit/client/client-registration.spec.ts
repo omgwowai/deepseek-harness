@@ -1,0 +1,138 @@
+import { describe, expect, it } from 'vitest'
+import { apply, inject } from '../../../src/client/index.ts'
+
+describe('client contribution', () => {
+  it('declares the plugin detail, audit, and conversation seams', () => {
+    expect(inject).toEqual([
+      'uiConversation',
+      'slots',
+      'locale',
+      'remote',
+      'remoteAccess',
+      'sessions',
+      'workspaces',
+      'uiWorkspace',
+      'sidebarRight',
+      'configForms',
+      'remote.settings',
+      'remote.session',
+    ])
+  })
+
+  it('mounts the generated Remote before registering one keyed renderer', async () => {
+    const definitions: unknown[] = []
+    const injections: unknown[] = []
+    // Model a live slot that another plugin already owns. The public slot
+    // contract is additive: registering our entry must not replace or clear
+    // the existing entry.
+    const slotEntries = new Map<string, unknown[]>([
+      ['shell.overlay', [{ name: 'shell.overlay', id: 'third-party-overlay' }]],
+      ['conversation.input.model', [{ name: 'conversation.input.model', priority: 0, id: 'native-model-selector' }]],
+    ])
+    const lifecycle: string[] = []
+    const ctx = {
+      remote: {
+        $mount: async () => {
+          lifecycle.push('mount')
+          return async () => {
+            lifecycle.push('dispose')
+          }
+        },
+        settings: { mutate: async () => ({ ok: true, value: null }) },
+        dshAcp: {
+          ownedProviderRoutes: async () => ({ ok: true, value: { providers: [] } }),
+        },
+      },
+      uiSession: { sessionStatus: { getSnapshot: () => new Map(), subscribe: () => () => {} } },
+      uiConversation: {
+        events: {
+          register: (definition: unknown) => {
+            definitions.push(definition)
+          },
+        },
+      },
+      locale: { register: () => undefined, bind: () => (key: string) => key },
+      configForms: {
+        get: () => ({
+          getSnapshot: () => ({ status: 'ready', value: { agents: {} }, revision: 1, writable: true }),
+          subscribe: () => () => {},
+        }),
+      },
+      sessions: {},
+      workspaces: {},
+      effect: (fn: () => unknown) => {
+        void fn()
+      },
+      slots: {
+        subscribe: () => () => {},
+        entriesOfSlot: () => [],
+        entries: () => [],
+        inject: (name: string, factory: () => unknown) => {
+          const entry = factory()
+          injections.push(entry)
+          slotEntries.set(name, [...(slotEntries.get(name) ?? []), entry])
+        },
+        register: (value: unknown) => value,
+        registerFactory: () => () => {},
+      },
+      get: () => ({}),
+    }
+    const uiInjects: string[][] = []
+    Object.assign(ctx, {
+      inject: (deps: readonly string[], callback: (scope: typeof ctx) => void | Promise<void>) => {
+        uiInjects.push([...deps])
+        // Model search and selection remain owned by the host's native composer.
+        const started = Promise.resolve(callback(ctx))
+        return Object.assign(started, {
+          dispose: async () => {
+            lifecycle.push('ui-dispose')
+          },
+        })
+      },
+    })
+    const dispose = await apply(ctx as never)
+    expect(lifecycle).toEqual(['mount'])
+    expect(uiInjects).toEqual([
+      [...inject, 'remote.dshAcp'],
+      ['remote.subagents', 'uiSession'],
+    ])
+    expect(definitions).toHaveLength(4)
+    expect(injections).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'plugins.bundle.config', key: '@local/dsh-acp-adapter' }),
+        expect.objectContaining({ key: 'acp-activity' }),
+        expect.objectContaining({ key: 'acp-inline-activity' }),
+        expect.objectContaining({ id: 'dsh-acp-agent-control' }),
+      ]),
+    )
+    expect(injections).not.toContainEqual(expect.objectContaining({ name: 'settings.section' }))
+    expect(slotEntries.get('shell.overlay')).toEqual([
+      { name: 'shell.overlay', id: 'third-party-overlay' },
+      expect.objectContaining({ id: 'dsh-acp-cross-backend-confirmation' }),
+      expect.objectContaining({ id: 'dsh-acp-operation-outcomes' }),
+    ])
+    expect(slotEntries.get('conversation.input.model')).toEqual([
+      { name: 'conversation.input.model', priority: 0, id: 'native-model-selector' },
+    ])
+    await dispose()
+    expect(lifecycle).toEqual(['mount', 'ui-dispose', 'dispose'])
+  })
+
+  it('does not register a partial contribution when Remote mounting fails', async () => {
+    const ctx = {
+      remote: {
+        $mount: async () => {
+          throw new Error('mount failed')
+        },
+      },
+      uiConversation: {
+        events: {
+          register: () => {
+            throw new Error('must not register')
+          },
+        },
+      },
+    } as never
+    await expect(apply(ctx)).rejects.toThrow('mount failed')
+  })
+})
