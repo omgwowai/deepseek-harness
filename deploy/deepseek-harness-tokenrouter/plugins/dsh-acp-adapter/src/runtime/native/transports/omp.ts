@@ -23,21 +23,52 @@
  *   `plan.enabled`; the native mode list is `default` only, so the UI never offers a mode that cannot
  *   be applied, and `setConfigOption('mode', 'plan')` still rejects with `plan-mode-unsupported`. ACP
  *   does not restore plan state on session load either: the current mode is always `default`.
+ *   `fast` (and `slow`, for models that support it) are boolean extras driven by `set_fast_mode` / `set_slow_mode`.
  * - Projection. Frames map onto ACP updates with the logic of `acp-event-mapper.ts`:
  *   `tool_call` / `tool_call_update` (kind, title, rawInput/rawOutput, locations, text + diff
  *   content, the vendor tool `name`), `agent_message_chunk` / `agent_thought_chunk` with a per-message
- *   `messageId`, `plan` from the todo tool, `available_commands_update`, `session_info_update`.
- *   Like ACP, turn content is only forwarded while a `prompt()` owns the turn.
+ *   `messageId`, `plan` from the todo tool, `session_info_update`. Like ACP, turn content is only forwarded
+ *   while a `prompt()` owns the turn. Slash-command output loses its terminal escapes, and retry, fallback,
+ *   compaction, extension and warning notices become one-line thoughts inside the turn.
  * - Usage. Each assistant `message_end.message.usage` is summed over the whole prompt; context
  *   occupancy and cumulative cost come from `get_session_stats`.
  * - Steering. `steer()` never starts a turn (idle → `promptRequired`, like ACP's `_session/steering`);
  *   inside a running turn it returns `injected` only after OMP's three-stage proof: `queue_update`
  *   admits the text, a later `queue_update` drops it, and a `role:"user"` message flagged
  *   `steering`/`liveSteered` lands in the transcript.
- * - Approvals. DSH runs unattended, so the process starts with `--auto-approve` unless the launcher
- *   already carries an approval flag. Any `extension_ui_request {method:"select"}` that still
- *   arrives is forwarded through `onPermission` in ACP shape and answered with the chosen label;
- *   OMP's own `cancel` frame aborts the pending prompt.
+ * - Approvals and questions. DSH runs unattended, so the process starts with `--auto-approve` unless the
+ *   launcher already carries an approval flag. A tool-approval `extension_ui_request {method:"select"}`
+ *   (title `Allow tool: <name>`) that still arrives is forwarded through `onPermission` in ACP shape and
+ *   answered with the chosen label. Every other dialog is a question for the user: when the host passes
+ *   `onElicitation` the transport opts in to OMP's rich `ask` dialog (rpc `set_ask_dialog`) and puts `ask`,
+ *   non-approval `select`, `confirm`, `input` and `editor` to it as the same form omp acp's extension UI
+ *   context sends (`q<i>` / `q<i>__other` for `ask`, a required `value` for the rest), then answers the OMP
+ *   dialog from the response; decline, cancel or a failure dismisses it. Without `onElicitation` the dialogs
+ *   are dismissed, as omp acp does for a client without form elicitation. OMP's own `cancel` frame withdraws
+ *   the pending prompt or form.
+ * - Commands. omp's catalog (`available_commands_update`) reaches the host as a `commands` event instead of an
+ *   ACP update. Every omp command runs through `prompt` ("/name args"); the transport adds the builtins omp keeps
+ *   terminal-only and serves itself: `btw` (side question), `new` and `clear` (a fresh session, idle only, reported
+ *   with `session_changed`), `rewind` (below) and `goal` (below). omp hands the other terminal-only builtins
+ *   (`/settings`, `/tree`, `/plan`, …) to the model as plain text, so `prompt()` answers them locally, unless the
+ *   live catalog gives the name to an extension, custom or file command. A lone `!cmd` is omp's user shell
+ *   (rpc `bash`): one `execute` tool call, no model call.
+ * - Side questions. `sideQuestion()` is rpc `btw`. The running record, the deltas and the final record are
+ *   frames, not responses, so the waiter exists before the command is written; none of those frames ever
+ *   reaches the turn, and the question runs beside a streaming prompt.
+ * - Wake turns. When the agent yields while background work can still wake it (`prompt_result` with
+ *   `sessionSettled:false`), the turn stays open until `session_settled`, so the wake run's output reaches
+ *   the same host turn. The hold ends when the user acts or nothing happens for `WAKE_SETTLE_MS`. A prompt
+ *   sent while a run the transport did not start is streaming is queued behind it (`followUp`).
+ * - Goals. `/goal` is rpc `goal` (get, create, pause, resume, drop). omp continues an active goal by itself only in the
+ *   run modes of `goal.continuationModes` (default: `interactive` alone), so `start()` writes a private config overlay
+ *   that adds `rpc` and launches omp with `--config <overlay>` (`omp-overlay.ts`; it goes once the process is gone).
+ *   `/goal` is a `prompt` command, not an immediate one, because an active goal makes omp start runs of its own: when
+ *   omp reports it is not settled after the command, the turn is held like a wake turn so those runs reach it and the
+ *   user can stop them. `goal_updated` frames become one-line notes.
+ * - Rewind. `/rewind` goes back to just before one of the user's messages: the conversation with rpc `branch` (a new
+ *   session, announced with `session_changed`), the files from what the agent's file tools recorded in the session
+ *   entries (`get_entries`, see `omp-rewind.ts`). It refuses to change anything while a turn runs.
  *
  * The process is spawned only through `options.spawn` (the host subprocess seam owns env merging and
  * process-tree teardown); nothing here reads the host environment, cwd or PATH.
@@ -47,14 +78,47 @@ import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { open, readdir } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { TextDecoder } from 'node:util'
 import type * as acp from '@agentclientprotocol/sdk'
 
 import { NativeTransportError } from './contract.ts'
+import { OMP_NATIVE_COMMANDS, OMP_SERVED_COMMAND_NAMES, OMP_TERMINAL_ONLY_COMMANDS } from './omp-commands.ts'
+import {
+  GOAL_USAGE,
+  GOAL_WAITS,
+  formatGoal,
+  goalFailure,
+  goalNote,
+  parseGoalArgs,
+  parseOmpGoal,
+  type GoalRequest,
+  type OmpGoal,
+} from './omp-goal.ts'
+import { createOmpConfigOverlay, type OmpConfigOverlay } from './omp-overlay.ts'
+import {
+  applyRestore,
+  findCheckpoint,
+  nodeRestoreIo,
+  parseRewindArgs,
+  planRestore,
+  readRewindModel,
+  renderCheckpoints,
+  renderRewindPreview,
+  renderRewindResult,
+  shownPath,
+  type OmpFileChange,
+  type OmpRewindModel,
+  type RestoreIo,
+  type RewindPoint,
+} from './omp-rewind.ts'
 import type {
+  NativeCommand,
+  NativeCommandResult,
+  NativeElicitationHandler,
+  NativeElicitationRequest,
   NativeContentBlock,
   NativeContextUsage,
   NativeControls,
@@ -70,8 +134,12 @@ import type {
   NativeTurnUsage,
 } from './contract.ts'
 
-/** `start()` waits this long for the first `{"type":"ready"}` frame. */
-const READY_TIMEOUT_MS = 20_000
+/**
+ * `start()` waits this long for the first `{"type":"ready"}` frame. OMP loads its extensions and provider
+ * catalog before it is ready: about 5 s on an idle machine, 27 s measured at load average 80. A dead
+ * process fails fast through its exit; this bound only catches one that lives but never becomes ready.
+ */
+const READY_TIMEOUT_MS = 90_000
 /** Default wall-clock timeout for control-plane RPCs. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 /** `get_available_models` awaits OMP's background provider discovery and may touch the network. */
@@ -86,8 +154,15 @@ const DEFAULT_STEER_TIMEOUT_MS = 10_000
 const PROMPT_ADMISSION_GRACE_MS = 1_500
 /** Wait this long after the run's terminal frame before settling a prompt without `prompt_result`. */
 const PROMPT_RESULT_FALLBACK_MS = 1_500
-/** After the abort signal fires, wait this long for the aborted `prompt_result`. */
+/** After a cancellation (abort signal, `abort_bash`, `btw_cancel`), wait this long for the vendor to confirm it. */
 const ABORT_SETTLE_GRACE_MS = 10_000
+/** A side question is one full-context model call; the watchdog cancels one the model never finishes. */
+const BTW_TIMEOUT_MS = 180_000
+/**
+ * A prompt whose agent yielded while background work remains stays open this long without any activity, waiting
+ * for the wake run; a run that is streaming keeps it open.
+ */
+const WAKE_SETTLE_MS = 120_000
 /** Context-usage read used when a turn settles. */
 const TURN_END_CONTEXT_TIMEOUT_MS = 3_000
 /** `stdin.end()` → wait → host terminate (spec §1.4). */
@@ -166,6 +241,137 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** What omp said when it refused a command; any other failure is described by its own message. */
+function refusalText(error: unknown): string {
+  return error instanceof NativeTransportError && error.code === 'request-failed' ? (error.detail ?? error.message) : errorText(error)
+}
+
+/** The first line of an OMP tool-approval `select` (`tools/approval.ts`): the dialog is a permission request, not a question. */
+const OMP_APPROVAL_TITLE = /^Allow tool:\s*\S+/
+/** The free-text companion option omp acp appends to every `ask` question. */
+const OMP_ASK_OTHER_TITLE = 'Other (type your own)'
+
+/** The single-field form omp acp builds for `select` / `confirm` / `input` / `editor`: property `value`, required. */
+function valueForm(property: acp.ElicitationPropertySchema): acp.ElicitationSchema {
+  return { type: 'object', properties: { value: property }, required: ['value'] }
+}
+
+/** `typeof value === 'string'` answers `{ value }`; anything else dismisses the dialog (acp returns `undefined`). */
+function decodeStringValue(content: JsonObject): JsonObject | undefined {
+  return typeof content.value === 'string' ? { value: content.value } : undefined
+}
+
+interface OmpAskQuestion {
+  readonly id: string
+  readonly question: string
+  readonly header: string | undefined
+  readonly options: ReadonlyArray<{ readonly label: string; readonly description: string | undefined }>
+  readonly multi: boolean
+  readonly recommended: number | undefined
+}
+
+/** The questions of an `ask` frame (`RpcAskDialogQuestion[]`); `undefined` when the frame is malformed or empty. */
+function parseOmpAskQuestions(value: unknown): OmpAskQuestion[] | undefined {
+  const raw = readArray(value)
+  if (raw === undefined || raw.length === 0) return undefined
+  const questions: OmpAskQuestion[] = []
+  for (const entry of raw) {
+    const item = asObject(entry)
+    const id = readString(item?.id)
+    const question = readString(item?.question)
+    const rawOptions = readArray(item?.options)
+    if (item === undefined || id === undefined || question === undefined || rawOptions === undefined) return undefined
+    const options: Array<{ label: string; description: string | undefined }> = []
+    for (const rawOption of rawOptions) {
+      const option = asObject(rawOption)
+      const label = readString(option?.label)
+      if (label === undefined) return undefined
+      options.push({ label, description: readString(option?.description) })
+    }
+    questions.push({
+      id,
+      question,
+      header: readString(item.header),
+      options,
+      multi: item.multi === true,
+      recommended: readNumber(item.recommended),
+    })
+  }
+  return questions
+}
+
+/** The form omp acp's `askDialog` sends: `q<i>` options field plus a `q<i>__other` free-text companion, no `required`. */
+function buildOmpAskForm(questions: readonly OmpAskQuestion[]): NativeElicitationRequest {
+  const properties: Record<string, acp.ElicitationPropertySchema> = {}
+  for (const [index, question] of questions.entries()) {
+    const key = `q${index}`
+    const entries = question.options.map((option) => {
+      const description = option.description?.trim()
+      return {
+        const: option.label,
+        title: option.label,
+        ...(description !== undefined && description.length > 0 ? { description } : {}),
+      }
+    })
+    const description = question.header?.trim()
+    if (entries.length > 0) {
+      if (question.multi) {
+        properties[key] = {
+          type: 'array',
+          title: question.question,
+          ...(description ? { description } : {}),
+          items: { anyOf: entries },
+        }
+      } else {
+        const recommended = question.recommended
+        const recommendedOption =
+          recommended !== undefined && recommended >= 0 && recommended < question.options.length
+            ? question.options[recommended]
+            : undefined
+        properties[key] = {
+          type: 'string',
+          title: question.question,
+          ...(description ? { description } : {}),
+          oneOf: entries,
+          ...(recommendedOption !== undefined ? { default: recommendedOption.label } : {}),
+        }
+      }
+    }
+    properties[`${key}__other`] = { type: 'string', title: OMP_ASK_OTHER_TITLE }
+  }
+  return {
+    message: questions.length === 1 ? (questions[0]?.question ?? '') : `Answer ${questions.length} questions`,
+    requestedSchema: { type: 'object', properties },
+  }
+}
+
+/**
+ * The `answers` of an `extension_ui_response` for an accepted `ask` form, one per question in order, decoded as
+ * omp acp does. A single-select with typed text keeps the text and drops the pick, and labels are offered and
+ * unique, so OMP's `parseAskDialogResponse` accepts the answer.
+ */
+function decodeOmpAskAnswers(
+  questions: readonly OmpAskQuestion[],
+  content: JsonObject,
+): Array<{ id: string; selectedOptions: string[]; customInput?: string }> {
+  return questions.map((question, index) => {
+    const key = `q${index}`
+    const labels = question.options.map((option) => option.label)
+    const otherValue = content[`${key}__other`]
+    const customInput = typeof otherValue === 'string' && otherValue.trim().length > 0 ? otherValue.trim() : undefined
+    const value = content[key]
+    let selectedOptions: string[] = []
+    if (question.multi) {
+      if (Array.isArray(value)) {
+        selectedOptions = [...new Set(value.filter((candidate): candidate is string => typeof candidate === 'string' && labels.includes(candidate)))]
+      }
+    } else if (customInput === undefined && typeof value === 'string' && labels.includes(value)) {
+      selectedOptions = [value]
+    }
+    return { id: question.id, selectedOptions, ...(customInput === undefined ? {} : { customInput }) }
+  })
+}
+
 function abortReason(signal: AbortSignal): Error {
   const reason: unknown = signal.reason
   return reason instanceof Error ? reason : new Error(reason === undefined ? 'Aborted' : String(reason))
@@ -235,6 +441,61 @@ function splitContent(content: readonly NativeContentBlock[]): {
 }
 
 // ---------------------------------------------------------------------------
+// Slash commands and shell escapes
+// ---------------------------------------------------------------------------
+
+/** CSI and OSC sequences (colors, cursor moves, hyperlinks): the host gets plain text, not terminal output. */
+const ANSI_SEQUENCE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001B]*(?:\u0007|\u001B\\)|[@-Z\\-_])/g
+
+/** The command name of a `/name args` message as omp parses it (`parseSlashCommand`): up to the first space or `:`. */
+function slashCommandName(message: string): string | undefined {
+  if (!message.startsWith('/')) return undefined
+  const body = message.slice(1)
+  const end = body.search(/[\s:]/)
+  const name = end === -1 ? body : body.slice(0, end)
+  return name.length === 0 ? undefined : name
+}
+
+/** What follows the command name, as omp parses it: everything after the first space or `:`, trimmed. */
+function slashCommandArgs(message: string): string {
+  const body = message.slice(1)
+  const end = body.search(/[\s:]/)
+  return end === -1 ? '' : body.slice(end + 1).trim()
+}
+
+const TERMINAL_ONLY_COMMANDS: Readonly<Record<string, true>> = Object.fromEntries(
+  OMP_TERMINAL_ONLY_COMMANDS.map((name) => [name, true] as const),
+)
+/** The terminal-only builtins the transport serves itself (`btw`, `new`, `clear`, `rewind`, `goal`). */
+const SERVED_COMMANDS: Readonly<Record<string, true>> = Object.fromEntries(
+  OMP_SERVED_COMMAND_NAMES.map((name) => [name, true] as const),
+)
+
+/** The user's `!cmd` shell escape: the host sends it bare, as the only content block. */
+function userShellLine(content: readonly NativeContentBlock[]): string | undefined {
+  const [only] = content
+  if (content.length !== 1 || only?.type !== 'text') return undefined
+  const line = only.text.trim()
+  return line.startsWith('!') ? line : undefined
+}
+
+/** What a `bash` result shows next to its output: the facts the output alone does not state. */
+function shellResultText(result: JsonObject): string {
+  const lines: string[] = []
+  const output = (readString(result.output) ?? '').replace(ANSI_SEQUENCE, '').trimEnd()
+  if (output.length > 0) lines.push(output)
+  if (readBoolean(result.truncated) === true) {
+    lines.push(
+      `[output truncated: ${readNumber(result.outputLines) ?? '?'} of ${readNumber(result.totalLines) ?? '?'} lines shown]`,
+    )
+  }
+  if (readBoolean(result.timedOut) === true) lines.push('[timed out]')
+  const exitCode = readNumber(result.exitCode)
+  if (exitCode !== undefined && exitCode !== 0) lines.push(`[exit code ${exitCode}]`)
+  return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // Launch arguments
 // ---------------------------------------------------------------------------
 
@@ -268,9 +529,11 @@ export interface OmpLaunchPlan {
  * Turn the launcher argv (`[omp, ...configured args]`) into the rpc-ui argv. The ACP subcommand `acp`
  * and every protocol/session-selecting flag are removed (sessions stay persisted: `--no-session` would
  * make ids unresumable); `--mode rpc-ui` is appended, plus `--auto-approve` unless the launcher
- * already chose an approval mode. Extension flags (`-e <file>`) pass through untouched.
+ * already chose an approval mode. Extension flags (`-e <file>`) pass through untouched. `overlayFile` (see
+ * `omp-overlay.ts`) is appended as the last `--config`: omp merges `--config` files in the order given, later over
+ * earlier, so it also wins over a `--config` of the launcher. The version probe never gets it.
  */
-export function buildOmpLaunchArgv(argv: readonly string[]): OmpLaunchPlan {
+export function buildOmpLaunchArgv(argv: readonly string[], overlayFile?: string): OmpLaunchPlan {
   const [executable, ...rest] = argv
   if (executable === undefined || executable.length === 0) {
     throw new NativeTransportError('OMP launch argv is empty', 'spawn-failed')
@@ -314,7 +577,14 @@ export function buildOmpLaunchArgv(argv: readonly string[]): OmpLaunchPlan {
     kept.push(arg)
   }
   return {
-    argv: [executable, ...kept, '--mode', 'rpc-ui', ...(approvalChosen ? [] : ['--auto-approve'])],
+    argv: [
+      executable,
+      ...kept,
+      '--mode',
+      'rpc-ui',
+      ...(approvalChosen ? [] : ['--auto-approve']),
+      ...(overlayFile === undefined ? [] : ['--config', overlayFile]),
+    ],
     versionArgv: [executable, ...kept, '--version'],
     dropped,
   }
@@ -572,6 +842,10 @@ export interface OmpControlsInput {
   readonly thinkingLevel: string | undefined
   /** Whether the configured selector is `auto`. */
   readonly thinkingAuto: boolean
+  /** `get_state.fastModeEnabled`; `undefined` when omp does not report it (the `fast` control is then not offered). */
+  readonly fastMode?: boolean | undefined
+  /** `get_state.slowModeEnabled` of a model that supports `/slow`; `undefined` otherwise (no `slow` control). */
+  readonly slowMode?: boolean | undefined
 }
 
 /**
@@ -627,6 +901,24 @@ export function deriveOmpControls(input: OmpControlsInput): NativeControls {
       ...efforts.map((level) => ({ value: level, name: level })),
     ],
   })
+  if (input.fastMode !== undefined) {
+    configOptions.push({
+      id: 'fast',
+      name: 'Fast mode',
+      description: 'Priority service tier for the current model (/fast)',
+      type: 'boolean',
+      currentValue: input.fastMode,
+    })
+  }
+  if (input.slowMode !== undefined) {
+    configOptions.push({
+      id: 'slow',
+      name: 'Slow mode',
+      description: 'Flex tier or low-priority lane for the current model (/slow)',
+      type: 'boolean',
+      currentValue: input.slowMode,
+    })
+  }
   return { configOptions, modes, imageInput: input.model?.input.includes('image') === true }
 }
 
@@ -1198,6 +1490,70 @@ function todoResultToPlan(toolName: string, isError: boolean, result: unknown): 
   return { sessionUpdate: 'plan', entries }
 }
 
+/**
+ * The one-line, user-facing text of a vendor notification frame (retry, model fallback, compaction, extension error,
+ * `notice`, extension `notify` / `open_url`); `undefined` for frames and levels that stay in the host log.
+ */
+function describeOmpNotice(frame: JsonObject): string | undefined {
+  switch (readString(frame.type)) {
+    case 'auto_retry_start':
+      return `OMP retry ${readNumber(frame.attempt) ?? '?'}/${readNumber(frame.maxAttempts) ?? '?'} in ${readNumber(frame.delayMs) ?? '?'}ms: ${readString(frame.errorMessage) ?? 'request failed'}`
+    case 'auto_retry_end':
+      return readBoolean(frame.success) === true
+        ? undefined
+        : `OMP retry failed: ${readString(frame.finalError) ?? 'unknown error'}`
+    case 'retry_fallback_applied': {
+      const reason = readString(frame.reason)
+      return `OMP switched model ${readString(frame.from) ?? '?'} → ${readString(frame.to) ?? '?'}${reason === undefined ? '' : ` (${reason})`}`
+    }
+    case 'retry_fallback_succeeded':
+      return `OMP continued on the fallback model ${readString(frame.model) ?? '?'}`
+    case 'auto_compaction_start':
+      return 'OMP is compacting the context window'
+    case 'auto_compaction_end': {
+      const errorMessage = readString(frame.errorMessage)
+      if (errorMessage !== undefined) return `OMP context compaction failed: ${errorMessage}`
+      if (readBoolean(frame.aborted) === true) return 'OMP context compaction was cancelled'
+      return readBoolean(frame.skipped) === true ? undefined : 'OMP finished compacting the context window'
+    }
+    case 'extension_error':
+      return `OMP extension error (${readString(frame.extensionPath) ?? 'unknown'} / ${readString(frame.event) ?? 'unknown'}): ${readString(frame.error) ?? 'failed'}`
+    case 'notice': {
+      const level = readString(frame.level)
+      const message = readString(frame.message)
+      // Side-question persistence failures belong to the question, not to the turn that happens to be open.
+      if (
+        message === undefined ||
+        (level !== 'warning' && level !== 'error') ||
+        readString(frame.source) === 'btw-history'
+      ) {
+        return undefined
+      }
+      return `${level}: ${message}`
+    }
+    case 'extension_ui_request': {
+      switch (readString(frame.method)) {
+        case 'notify': {
+          const message = readString(frame.message)
+          if (message === undefined || message.trim().length === 0) return undefined
+          const level = readString(frame.notifyType)
+          return level === 'warning' || level === 'error' ? `${level}: ${message}` : message
+        }
+        case 'open_url': {
+          const url = readString(frame.launchUrl) ?? readString(frame.url)
+          if (url === undefined) return undefined
+          const instructions = readString(frame.instructions)
+          return `OMP asks you to open ${url}${instructions === undefined ? '' : `: ${instructions}`}`
+        }
+        default:
+          return undefined
+      }
+    }
+    default:
+      return undefined
+  }
+}
+
 /** A tool call the vendor started and has not finished (for matching approval dialogs). */
 export interface OmpOpenToolCall {
   readonly toolCallId: string
@@ -1300,8 +1656,22 @@ export class OmpEventProjector {
       case 'todo_auto_clear':
         return [{ sessionUpdate: 'plan', entries: [] }]
       case 'command_output': {
-        const text = readString(frame.text)
+        const text = (readString(frame.text) ?? '').replace(ANSI_SEQUENCE, '')
         return text ? [this.messageChunk('agent_message_chunk', { type: 'text', text }, this.newId())] : []
+      }
+      case 'auto_retry_start':
+      case 'auto_retry_end':
+      case 'retry_fallback_applied':
+      case 'retry_fallback_succeeded':
+      case 'auto_compaction_start':
+      case 'auto_compaction_end':
+      case 'extension_error':
+      case 'notice':
+      case 'extension_ui_request': {
+        const note = describeOmpNotice(frame)
+        return note === undefined
+          ? []
+          : [this.messageChunk('agent_thought_chunk', { type: 'text', text: note }, this.newId())]
       }
       default:
         return []
@@ -1318,6 +1688,16 @@ export class OmpEventProjector {
     if (message === undefined || message.length === 0) return []
     this.errorTextEmitted = true
     return [this.messageChunk('agent_message_chunk', { type: 'text', text: message }, this.live?.id ?? this.newId())]
+  }
+
+  /** One line the transport itself says (a refused command, a usage hint): an assistant message with its own id. */
+  reply(text: string): acp.SessionUpdate {
+    return this.messageChunk('agent_message_chunk', { type: 'text', text }, this.newId())
+  }
+
+  /** One line the transport adds as a thought of the turn (a goal that changed state). */
+  note(text: string): acp.SessionUpdate {
+    return this.messageChunk('agent_thought_chunk', { type: 'text', text }, this.newId())
   }
 
   private messageChunk(
@@ -1499,21 +1879,52 @@ export class OmpEventProjector {
   }
 }
 
-/** Map an rpc `available_commands_update.commands` list to the ACP command list (`toAcpAvailableCommands`). */
-export function mapOmpAvailableCommands(commands: unknown): acp.AvailableCommand[] {
-  const result: acp.AvailableCommand[] = []
-  for (const command of readArray(commands) ?? []) {
-    const record = asObject(command)
+export interface OmpCommandCatalog {
+  readonly commands: readonly NativeCommand[]
+  /**
+   * Names and aliases omp runs itself although they sit on the terminal-only list: user commands (extension, custom,
+   * file, skill, MCP prompt) that take such a name, and builtins that gained a handler in a later omp.
+   */
+  readonly overrides: ReadonlySet<string>
+}
+
+/**
+ * The host's command list for omp's `available_commands_update.commands`. Everything omp advertises runs through
+ * `prompt`. `btw`, `new` and `clear` are terminal-only in omp, hence never advertised: the transport serves them
+ * (the `side` / `immediate` entries of the static table) unless an extension, custom or file command already owns
+ * the name, which omp runs before it looks at builtins.
+ */
+export function buildOmpCommandCatalog(raw: unknown): OmpCommandCatalog {
+  const overrides = new Set<string>()
+  const advertised: NativeCommand[] = []
+  for (const entry of readArray(raw) ?? []) {
+    const record = asObject(entry)
     const name = readString(record?.name)
     if (record === undefined || name === undefined || name.length === 0) continue
+    const aliases = readStringArray(record.aliases).filter((alias) => alias.length > 0 && alias !== name)
+    const userCommand = (readString(record.source) ?? 'builtin') !== 'builtin'
+    for (const claimed of [name, ...aliases]) {
+      // A name the transport serves yields only to a user command; any other terminal-only name is runnable once advertised.
+      if (userCommand || (Object.hasOwn(TERMINAL_ONLY_COMMANDS, claimed) && !Object.hasOwn(SERVED_COMMANDS, claimed))) overrides.add(claimed)
+    }
     const hint = readString(asObject(record.input)?.hint)
-    result.push({
+    advertised.push({
       name,
       description: readString(record.description) ?? '',
-      ...(hint === undefined ? {} : { input: { hint } }),
+      ...(hint === undefined || hint.length === 0 ? {} : { hint }),
+      ...(aliases.length === 0 ? {} : { aliases }),
+      dispatch: 'prompt',
     })
   }
-  return result
+  const served = OMP_NATIVE_COMMANDS.filter((command) => Object.hasOwn(SERVED_COMMANDS, command.name) && !overrides.has(command.name))
+  const taken = new Set(served.map((command) => command.name))
+  const commands: NativeCommand[] = [...served]
+  for (const command of advertised) {
+    if (taken.has(command.name)) continue
+    taken.add(command.name)
+    commands.push(command)
+  }
+  return { commands, overrides }
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,14 +1935,50 @@ interface ActivePromptState {
   readonly id: string
   readonly deferred: Deferred<NativePromptResult>
   readonly usage: OmpUsageAccumulator
+  /** The message is a `/name` command, which omp may finish locally without running the agent. */
+  readonly slash: boolean
   lastStopReason: string | undefined
   /** `errorMessage` of the run's final assistant message when it failed (from `agent_end`). */
   lastAssistantError: string | undefined
   admissionError: Error | undefined
   aborted: boolean
+  /** An agent run started while the prompt was open. */
+  agentRan: boolean
+  /** The terminal `prompt_result` arrived: the `agent_end` fallback has nothing left to settle. */
+  resultSeen: boolean
+  /** Set when the agent yielded while background work remains: how the turn ends once the session settles. */
+  heldStop: NativePromptResult['stopReason'] | undefined
+  /** Last sign of life of a held turn (frames of the wake run); the hold timer measures from it. */
+  lastActivityAt: number
   admissionTimer: NodeJS.Timeout | undefined
   abortTimer: NodeJS.Timeout | undefined
   fallbackTimer: NodeJS.Timeout | undefined
+  holdTimer: NodeJS.Timeout | undefined
+  removeAbortListener: (() => void) | undefined
+}
+
+/** A user shell command (`!cmd`) in flight; like a turn it owns the prompt slot. */
+interface ActiveShellState {
+  aborted: boolean
+}
+
+/** The side question in flight: omp runs one at a time per session. */
+interface ActiveBtwState {
+  readonly question: string
+  /** Topic id: learned from the running record that precedes the response, confirmed by the response. */
+  recordId: string | undefined
+  /** The `btw_delta` text so far. */
+  streamed: string
+  /** The longest answer any `btw_record` carried. */
+  answer: string
+  /** Why the transport itself cancelled the question. */
+  stop: 'aborted' | 'timeout' | undefined
+  cancelRequested: boolean
+  /** The last `btw_cancel` named the topic: one sent before the id was known can miss a question still queued. */
+  cancelTargeted: boolean
+  readonly deferred: Deferred<NativeCommandResult>
+  watchdog: NodeJS.Timeout | undefined
+  graceTimer: NodeJS.Timeout | undefined
   removeAbortListener: (() => void) | undefined
 }
 
@@ -1574,6 +2021,16 @@ export interface OmpNativeTransportOptions {
   readonly stdinCloseGraceMs?: number
   /** Delays between background `get_available_models` retries after a failed first attempt. */
   readonly modelListRetryDelaysMs?: readonly number[]
+  /** Inactivity bound of a turn held open for background work (default 120 s). */
+  readonly wakeSettleMs?: number
+  /** How long a side question may run before it is cancelled (default 180 s). */
+  readonly btwTimeoutMs?: number
+  /** How long to wait for the vendor to confirm a cancellation (default 10 s). */
+  readonly abortGraceMs?: number
+  /** How long after a terminal run frame to wait for `prompt_result` before settling without it (default 1.5 s). */
+  readonly promptResultFallbackMs?: number
+  /** Directory the transport creates the private directory of its config overlay in (default: the system temp directory). */
+  readonly overlayRoot?: string
 }
 
 /** OMP native transport: one `omp --mode rpc-ui` subprocess per instance. */
@@ -1587,11 +2044,17 @@ export class OmpNativeTransport implements NativeTransport {
   private readonly steerTimeoutMs: number
   private readonly stdinCloseGraceMs: number
   private readonly modelListRetryDelaysMs: readonly number[]
+  private readonly wakeSettleMs: number
+  private readonly btwTimeoutMs: number
+  private readonly abortGraceMs: number
+  private readonly promptResultFallbackMs: number
+  private readonly overlayRoot: string
 
   private proc: NativeProcess | undefined
   private agentEnv: Readonly<Record<string, string>> = {}
   private eventSink: NativeTransportStartOptions['onEvent'] | undefined
   private permissionHandler: NativePermissionHandler | undefined
+  private elicitationHandler: NativeElicitationHandler | undefined
   private logSink: ((message: string) => void) | undefined
   private projector: OmpEventProjector | undefined
   private startPromise: Promise<void> | undefined
@@ -1630,6 +2093,10 @@ export class OmpNativeTransport implements NativeTransport {
     thinkingLevel: undefined,
     thinkingAuto: false,
   })
+  /** `get_state.fastModeEnabled` when omp reports it; without it there is no `fast` control. */
+  private fastMode: boolean | undefined
+  /** `/slow` state of a model that supports it; without support there is no `slow` control. */
+  private slowMode: boolean | undefined
   private emittedSignature = ''
   private selfChange = 0
   private configTail: Promise<void> = Promise.resolve()
@@ -1641,11 +2108,35 @@ export class OmpNativeTransport implements NativeTransport {
   private busy = false
   private contextPollTimer: NodeJS.Timeout | undefined
   private contextPollInFlight = false
+  /** Agent runs in progress (`agent_start` minus `agent_end`); nested runs count. */
+  private agentRuns = 0
 
   private activePrompt: ActivePromptState | undefined
   private activeSteer: ActiveSteerState | undefined
   private steerTail: Promise<void> = Promise.resolve()
   private readonly dialogs = new Map<string, AbortController>()
+  private activeShell: ActiveShellState | undefined
+  private activeBtw: ActiveBtwState | undefined
+  /** The session cwd the host passed: tool paths in the session entries resolve against it, and a restore of files stays inside it. */
+  private cwd: string | undefined
+  /** The goal as omp last reported it (`get_state`, `goal`, `goal_updated`): the next frame is compared with it. */
+  private goal: OmpGoal | undefined
+  /** A `/goal` command is waiting for omp: its own reply says what it did, so the frames it causes add no note. */
+  private goalCommandOpen = false
+  /** `session_settled` frames seen: a goal command that sees one while it decides holds nothing. */
+  private settledFrames = 0
+  /** A `/rewind` is changing the conversation: no prompt may start meanwhile. */
+  private rewinding = false
+  /** The `--config` overlay of this process (see `omp-overlay.ts`); deleted once, after the process is gone. */
+  private overlay: OmpConfigOverlay | undefined
+  private overlayRemoval: Promise<void> | undefined
+  /** omp was launched with the overlay that lets goals continue over rpc. */
+  private overlayApplied = false
+  /** The command list built from omp's last `available_commands_update`; the static table until one arrived. */
+  private liveCatalog: readonly NativeCommand[] | undefined
+  private catalogSignature = ''
+  /** Names the live catalog gives to extension, custom and file commands: omp runs those before its builtins. */
+  private catalogOverrides: ReadonlySet<string> = new Set()
 
   constructor(options: OmpNativeTransportOptions = {}) {
     this.readyTimeoutMs = options.readyTimeoutMs ?? READY_TIMEOUT_MS
@@ -1655,6 +2146,11 @@ export class OmpNativeTransport implements NativeTransport {
     this.steerTimeoutMs = options.steerTimeoutMs ?? DEFAULT_STEER_TIMEOUT_MS
     this.stdinCloseGraceMs = options.stdinCloseGraceMs ?? STDIN_CLOSE_GRACE_MS
     this.modelListRetryDelaysMs = options.modelListRetryDelaysMs ?? MODEL_LIST_RETRY_DELAYS_MS
+    this.wakeSettleMs = options.wakeSettleMs ?? WAKE_SETTLE_MS
+    this.btwTimeoutMs = options.btwTimeoutMs ?? BTW_TIMEOUT_MS
+    this.abortGraceMs = options.abortGraceMs ?? ABORT_SETTLE_GRACE_MS
+    this.promptResultFallbackMs = options.promptResultFallbackMs ?? PROMPT_RESULT_FALLBACK_MS
+    this.overlayRoot = options.overlayRoot ?? tmpdir()
   }
 
   get sessionId(): string | undefined {
@@ -1688,6 +2184,11 @@ export class OmpNativeTransport implements NativeTransport {
     return this.contextUsageValue
   }
 
+  /** omp's own list once it reported one (plus the commands the transport serves), else the static table. */
+  commands(): readonly NativeCommand[] {
+    return this.liveCatalog ?? OMP_NATIVE_COMMANDS
+  }
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
@@ -1702,17 +2203,25 @@ export class OmpNativeTransport implements NativeTransport {
     if (this.closing) throw new NativeTransportError('OMP transport is closed', 'closed')
     this.eventSink = options.onEvent
     this.permissionHandler = options.onPermission
+    this.elicitationHandler = options.onElicitation
     this.logSink = options.log
     this.agentEnv = options.env
+    this.cwd = options.cwd
     this.projector = new OmpEventProjector({ cwd: options.cwd, homeDir: options.env['HOME'] })
 
-    const plan = buildOmpLaunchArgv(options.argv)
-    if (plan.dropped.length > 0) this.log(`ignoring launcher args the transport owns: ${redactArgv(plan.dropped)}`)
-    this.log(`spawning ${redactArgv(plan.argv)} (cwd=${options.cwd})`)
+    // omp continues a goal over rpc only when its settings say so, and by default they do not: the overlay does. Without it the
+    // transport still runs; `/goal` then says that the goal waits for the next message.
+    await this.createOverlay()
+    let plan: OmpLaunchPlan
     let proc: NativeProcess
     try {
+      if (this.closing) throw new NativeTransportError('OMP transport is closed', 'closed')
+      plan = buildOmpLaunchArgv(options.argv, this.overlay?.file)
+      if (plan.dropped.length > 0) this.log(`ignoring launcher args the transport owns: ${redactArgv(plan.dropped)}`)
+      this.log(`spawning ${redactArgv(plan.argv)} (cwd=${options.cwd})`)
       proc = options.spawn({ argv: plan.argv, cwd: options.cwd, env: options.env })
     } catch (error) {
+      await this.removeOverlay()
       throw error instanceof NativeTransportError
         ? error
         : new NativeTransportError('failed to spawn omp', 'spawn-failed', errorText(error))
@@ -1735,6 +2244,28 @@ export class OmpNativeTransport implements NativeTransport {
       await this.close().catch(() => undefined)
       throw error
     }
+  }
+
+  /** The `--config` overlay that lets goals continue over rpc. The transport runs without it, so a failure is only logged. */
+  private async createOverlay(): Promise<void> {
+    try {
+      this.overlay = await createOmpConfigOverlay(this.overlayRoot)
+      this.overlayApplied = true
+    } catch (error) {
+      this.log(`could not write the omp config overlay that lets goals continue over rpc: ${errorText(error)}`)
+    }
+  }
+
+  /** Deletes the overlay, once; every caller may await the deletion. Only called when the process is gone or never started. */
+  private removeOverlay(): Promise<void> {
+    const overlay = this.overlay
+    if (overlay !== undefined) {
+      this.overlay = undefined
+      this.overlayRemoval = overlay.remove().catch((error: unknown) => {
+        this.log(`could not remove the omp config overlay: ${errorText(error)}`)
+      })
+    }
+    return this.overlayRemoval ?? Promise.resolve()
   }
 
   /** `omp --version` → `18.12.6`; `undefined` when the launcher does not answer in time. Never throws. */
@@ -1820,6 +2351,7 @@ export class OmpNativeTransport implements NativeTransport {
       ),
     )
     this.exitDeferred.resolve()
+    void this.removeOverlay()
   }
 
   private async handshake(ready: JsonObject): Promise<void> {
@@ -1849,6 +2381,16 @@ export class OmpNativeTransport implements NativeTransport {
       await this.request({ type: 'set_event_filter', events: null, messageUpdates: 'delta' }, 5_000).response
     } catch (error) {
       this.log(`OMP set_event_filter was rejected: ${errorText(error)}`)
+    }
+
+    // Opt in to OMP's rich `ask` dialog only when the host can put a form to the user (omp acp does the same
+    // for clients with form elicitation). Without it `ask` degrades to a plain `select`, which is dismissed.
+    if (this.elicitationHandler !== undefined) {
+      try {
+        await this.request({ type: 'set_ask_dialog', enabled: true }, this.requestTimeoutMs).response
+      } catch (error) {
+        this.log(`OMP set_ask_dialog was rejected: ${errorText(error)}`)
+      }
     }
   }
 
@@ -1966,22 +2508,29 @@ export class OmpNativeTransport implements NativeTransport {
     await this.refreshState()
     await this.loadThinkingLevels()
     await this.loadModels()
-    if (this.sessionFile !== undefined) {
-      // `auto` is only visible in the transcript (the state reports the level it resolved to).
-      const recorded = await readOmpSessionThinking(this.sessionFile)
-      if (recorded?.configured === THINKING_AUTO) this.thinkingAuto = true
-    }
+    await this.refreshThinkingSelector()
     this.rebuildControls()
     this.emittedSignature = controlsSignature(this.controlsValue)
   }
 
-  /** `get_state`: the current model and effective thinking level. */
+  /** `auto` is only visible in the transcript (the state reports the level it resolved to). */
+  private async refreshThinkingSelector(): Promise<void> {
+    if (this.sessionFile === undefined) return
+    const recorded = await readOmpSessionThinking(this.sessionFile)
+    if (recorded?.configured === THINKING_AUTO) this.thinkingAuto = true
+  }
+
+  /** `get_state`: the current model, the effective thinking level and the `/fast` and `/slow` switches. */
   private async refreshState(): Promise<void> {
     const state = asObject(await this.request({ type: 'get_state' }, SESSION_COMMAND_TIMEOUT_MS).response)
     if (state === undefined) return
+    this.goal = parseOmpGoal(asObject(state.goal)?.goal)
     const model = parseOmpModel(state.model)
     if (model !== undefined) this.model = model
     this.thinkingLevel = readString(state.thinkingLevel)
+    this.fastMode = readBoolean(state.fastModeEnabled)
+    this.slowMode =
+      readBoolean(state.slowModeSupported) === true ? (readBoolean(state.slowModeEnabled) ?? false) : undefined
   }
 
   private async loadThinkingLevels(): Promise<void> {
@@ -2045,6 +2594,8 @@ export class OmpNativeTransport implements NativeTransport {
       thinkingLevels: this.thinkingLevels,
       thinkingLevel: this.thinkingLevel,
       thinkingAuto: this.thinkingAuto,
+      fastMode: this.fastMode,
+      slowMode: this.slowMode,
     })
   }
 
@@ -2082,26 +2633,42 @@ export class OmpNativeTransport implements NativeTransport {
 
   async setConfigOption(configId: string, value: string | boolean, signal?: AbortSignal): Promise<void> {
     this.assertUsable()
+    if (configId === 'fast' || configId === 'slow') {
+      if (typeof value !== 'boolean') {
+        throw new NativeTransportError(`Config option ${configId} takes a boolean`, 'unsupported-config-value')
+      }
+      const enabled = value
+      return this.writeConfig(signal, () =>
+        raceAbort(configId === 'fast' ? this.applyFast(enabled) : this.applySlow(enabled), signal),
+      )
+    }
     if (typeof value === 'boolean') {
       throw new NativeTransportError(`Unsupported boolean config option: ${configId}`, 'unsupported-config-value')
     }
+    return this.writeConfig(signal, async () => {
+      switch (configId) {
+        case 'mode':
+          this.applyMode(value)
+          break
+        case 'model':
+          await raceAbort(this.applyModel(value), signal)
+          break
+        case 'thinking':
+          await raceAbort(this.applyThinking(value), signal)
+          break
+        default:
+          throw new NativeTransportError(`Unknown config option: ${configId}`, 'unknown-config-option')
+      }
+    })
+  }
+
+  /** One serialized control write: the vendor change, then a rebuild the caller reads back through `controls()`. */
+  private writeConfig(signal: AbortSignal | undefined, apply: () => Promise<void>): Promise<void> {
     const run = this.configTail.then(async () => {
       if (signal?.aborted === true) throw abortReason(signal)
       this.selfChange += 1
       try {
-        switch (configId) {
-          case 'mode':
-            this.applyMode(value)
-            break
-          case 'model':
-            await raceAbort(this.applyModel(value), signal)
-            break
-          case 'thinking':
-            await raceAbort(this.applyThinking(value), signal)
-            break
-          default:
-            throw new NativeTransportError(`Unknown config option: ${configId}`, 'unknown-config-option')
-        }
+        await apply()
       } finally {
         this.selfChange -= 1
       }
@@ -2155,6 +2722,22 @@ export class OmpNativeTransport implements NativeTransport {
     this.thinkingAuto = selector === THINKING_AUTO
   }
 
+  private async applyFast(enabled: boolean): Promise<void> {
+    if (this.fastMode === undefined) {
+      throw new NativeTransportError('Unknown config option: fast', 'unknown-config-option')
+    }
+    const data = asObject(await this.request({ type: 'set_fast_mode', enabled }, this.requestTimeoutMs).response)
+    this.fastMode = readBoolean(data?.enabled) ?? enabled
+  }
+
+  private async applySlow(enabled: boolean): Promise<void> {
+    if (this.slowMode === undefined) {
+      throw new NativeTransportError('Unknown config option: slow', 'unknown-config-option')
+    }
+    const data = asObject(await this.request({ type: 'set_slow_mode', enabled }, this.requestTimeoutMs).response)
+    this.slowMode = readBoolean(data?.enabled) ?? enabled
+  }
+
   private assertUsable(): void {
     if (this.closing) throw new NativeTransportError('OMP transport is closed', 'closed')
     if (this.exitError !== undefined) throw this.exitError
@@ -2176,6 +2759,7 @@ export class OmpNativeTransport implements NativeTransport {
     this.closing = true
     this.stopContextPolling()
     this.busy = false
+    this.agentRuns = 0
     if (this.modelListRetryTimer !== undefined) {
       clearTimeout(this.modelListRetryTimer)
       this.modelListRetryTimer = undefined
@@ -2190,17 +2774,22 @@ export class OmpNativeTransport implements NativeTransport {
     this.dialogs.clear()
     if (this.activePrompt !== undefined) this.failPrompt(this.activePrompt, closeError)
     if (this.activeSteer !== undefined) this.failSteer(this.activeSteer, closeError)
+    if (this.activeBtw !== undefined) this.endBtw(this.activeBtw, closeError)
 
     const proc = this.proc
-    if (proc === undefined) return
-    try {
-      proc.stdin.end()
-    } catch {
-      // Cleanup race: the pipe may already be gone.
+    if (proc !== undefined) {
+      try {
+        proc.stdin.end()
+      } catch {
+        // Cleanup race: the pipe may already be gone.
+      }
+      if (!(await this.waitForExit(this.stdinCloseGraceMs))) {
+        proc.terminate()
+        await this.waitForExit(TERMINATE_WAIT_MS)
+      }
     }
-    if (await this.waitForExit(this.stdinCloseGraceMs)) return
-    proc.terminate()
-    await this.waitForExit(TERMINATE_WAIT_MS)
+    // omp watches the overlay's directory and reloads on change: it goes only after the process.
+    await this.removeOverlay()
   }
 
   private async waitForExit(timeoutMs: number): Promise<boolean> {
@@ -2220,12 +2809,17 @@ export class OmpNativeTransport implements NativeTransport {
     this.dialogs.clear()
     if (this.activePrompt !== undefined) {
       const prompt = this.activePrompt
+      // A turn the user already got its answer for (held for background work) ends normally; the notice below
+      // reports the lost process, and the next prompt re-attaches.
       if (prompt.aborted) void this.finishPrompt(prompt, { stopReason: 'cancelled' })
+      else if (prompt.heldStop !== undefined) void this.finishPrompt(prompt, { stopReason: prompt.heldStop })
       else this.failPrompt(prompt, error)
     }
     if (this.activeSteer !== undefined) this.failSteer(this.activeSteer, error)
+    if (this.activeBtw !== undefined) this.endBtw(this.activeBtw, error)
     this.stopContextPolling()
     this.busy = false
+    this.agentRuns = 0
     if (!this.closing) {
       const detail = this.stderrTail()
       this.emitNotice(`${error.message}${detail.length === 0 ? '' : `: ${detail.slice(-500)}`}`)
@@ -2520,15 +3114,19 @@ export class OmpNativeTransport implements NativeTransport {
   private handleEvent(frame: JsonObject, type: string | undefined): void {
     switch (type) {
       case 'agent_start':
+        this.agentRuns += 1
         this.setBusy(true)
+        this.noteAgentStart()
         return
       case 'agent_end':
+        this.agentRuns = Math.max(0, this.agentRuns - 1)
         this.handleAgentEnd(frame)
         return
       case 'session_settled':
+        this.settledFrames += 1
+        this.agentRuns = 0
         this.setBusy(false)
-        if (this.activePrompt === undefined) void this.refreshContextUsage(TURN_END_CONTEXT_TIMEOUT_MS).catch(() => undefined)
-        this.schedulePromptResultFallback()
+        this.handleSessionSettled()
         return
       case 'prompt_result':
         this.handlePromptResult(frame)
@@ -2557,11 +3155,25 @@ export class OmpNativeTransport implements NativeTransport {
         void this.handleExtensionUiRequest(frame)
         return
       case 'available_commands_update':
-        this.emit({
-          kind: 'update',
-          update: { sessionUpdate: 'available_commands_update', availableCommands: mapOmpAvailableCommands(frame.commands) },
-        })
+        this.handleCommandsUpdate(frame)
         return
+      case 'goal_updated':
+        this.handleGoalUpdated(frame)
+        return
+      // Side-question frames belong to the waiter of `sideQuestion()`, never to the turn.
+      case 'btw_record': {
+        const record = asObject(frame.record)
+        if (this.activeBtw !== undefined && record !== undefined) this.noteBtwRecord(this.activeBtw, record)
+        return
+      }
+      case 'btw_delta': {
+        const btw = this.activeBtw
+        if (btw?.recordId !== undefined && readString(frame.recordId) === btw.recordId) {
+          btw.streamed += readString(frame.delta) ?? ''
+          if (btw.streamed.length > btw.answer.length) btw.answer = btw.streamed
+        }
+        return
+      }
       case 'session_info_update': {
         const title = readString(frame.title)
         this.emit({
@@ -2585,54 +3197,36 @@ export class OmpNativeTransport implements NativeTransport {
         return
       case 'notice':
         this.emitNoticeFrame(frame)
+        this.projectTurnFrame(frame)
         return
       case 'retry_fallback_applied':
-        this.emitNotice(
-          `OMP switched model ${readString(frame.from) ?? '?'} → ${readString(frame.to) ?? '?'}${readString(frame.reason) === undefined ? '' : ` (${readString(frame.reason)})`}`,
-        )
-        return
+      case 'retry_fallback_succeeded':
       case 'auto_retry_start':
-        this.emitNotice(
-          `OMP retry ${readNumber(frame.attempt) ?? '?'}/${readNumber(frame.maxAttempts) ?? '?'} in ${readNumber(frame.delayMs) ?? '?'}ms: ${readString(frame.errorMessage) ?? 'request failed'}`,
-        )
-        return
       case 'auto_retry_end':
-        if (readBoolean(frame.success) !== true) {
-          this.emitNotice(`OMP retry failed: ${readString(frame.finalError) ?? 'unknown error'}`)
-        }
-        return
       case 'auto_compaction_start':
-        this.emitNotice('OMP is compacting the context window')
-        return
-      case 'auto_compaction_end': {
-        const errorMessage = readString(frame.errorMessage)
-        if (errorMessage !== undefined) this.emitNotice(`OMP context compaction failed: ${errorMessage}`)
+      case 'auto_compaction_end':
+      case 'extension_error': {
+        const note = describeOmpNotice(frame)
+        if (note !== undefined) this.emitNotice(note)
+        this.projectTurnFrame(frame)
         return
       }
-      case 'extension_error':
-        this.emitNotice(
-          `OMP extension error (${readString(frame.extensionPath) ?? 'unknown'} / ${readString(frame.event) ?? 'unknown'}): ${readString(frame.error) ?? 'failed'}`,
-        )
-        return
       case 'rpc_frame_error':
         this.emitNotice(
           `OMP dropped an oversized frame (${readString(frame.originalType) ?? 'unknown'}): ${readString(frame.error) ?? 'transport limit'}`,
         )
         return
       default:
-        // subagent_* / host_* / live_* / btw_* and the remaining telemetry frames need no projection.
+        // subagent_* / host_* / live_* and the remaining telemetry frames need no projection.
         return
     }
   }
 
   /** Turn content is only forwarded while a `prompt()` owns the turn, exactly like `#handlePromptEvent`. */
-  private turnOpen(): boolean {
-    const prompt = this.activePrompt
-    return prompt !== undefined && !prompt.aborted
-  }
-
   private projectTurnFrame(frame: JsonObject): void {
-    if (!this.turnOpen()) return
+    const prompt = this.activePrompt
+    if (prompt === undefined || prompt.aborted) return
+    prompt.lastActivityAt = Date.now()
     for (const update of this.projector?.project(frame) ?? []) this.emit({ kind: 'update', update })
   }
 
@@ -2664,6 +3258,7 @@ export class OmpNativeTransport implements NativeTransport {
   private handleAgentEnd(frame: JsonObject): void {
     const prompt = this.activePrompt
     if (prompt !== undefined) {
+      prompt.lastActivityAt = Date.now()
       const messages = readArray(frame.messages) ?? []
       for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = asObject(messages[index])
@@ -2678,7 +3273,8 @@ export class OmpNativeTransport implements NativeTransport {
         break
       }
     }
-    this.schedulePromptResultFallback()
+    // `yielded:false` is the agent going on with its own work (retry, compaction, a stop-time reminder): no result yet.
+    if (readBoolean(frame.yielded) !== false) this.schedulePromptResultFallback()
   }
 
   private handleThinkingLevelChanged(frame: JsonObject): void {
@@ -2727,7 +3323,13 @@ export class OmpNativeTransport implements NativeTransport {
     const id = readString(frame.id)
     if (id !== undefined && id !== prompt.id) return
     clearPromptTimers(prompt)
-    if (readBoolean(frame.sessionSettled) === true) this.setBusy(false)
+    prompt.resultSeen = true
+    const sessionSettled = readBoolean(frame.sessionSettled)
+    if (sessionSettled === true) {
+      // Settled means nothing is running and nothing can wake the agent: no run is live, whatever frames were lost.
+      this.agentRuns = 0
+      this.setBusy(false)
+    }
     const status = readString(frame.status) ?? 'completed'
     const errorMessage = readString(asObject(frame.error)?.message)
     if (status === 'error' && readBoolean(frame.agentInvoked) === false) {
@@ -2747,21 +3349,72 @@ export class OmpNativeTransport implements NativeTransport {
         this.emit({ kind: 'update', update })
       }
     }
+    // omp ends a local command such as `/fresh` with an aborted result nobody asked for: no agent run, no output.
+    const unrequestedAbort = status === 'aborted' && !prompt.aborted && prompt.slash && !prompt.agentRan
     const stopReason: NativePromptResult['stopReason'] =
-      status === 'aborted' || prompt.aborted
+      prompt.aborted || (status === 'aborted' && !unrequestedAbort)
         ? 'cancelled'
         : prompt.lastStopReason === 'length'
           ? 'max_tokens'
           : failure !== undefined && /content[_ ]?filter|refus(al|ed)/i.test(failure)
             ? 'refusal'
             : 'end_turn'
+    if (status === 'completed' && sessionSettled === false && !prompt.aborted) {
+      // The agent yielded, but background work can still wake it: the wake run's output belongs to this turn.
+      prompt.heldStop = stopReason
+      prompt.lastActivityAt = Date.now()
+      this.armHoldTimer(prompt, this.wakeSettleMs)
+      return
+    }
     const usage = prompt.usage.snapshot()
     void this.finishPrompt(prompt, { stopReason, ...(usage === undefined ? {} : { usage }) })
   }
 
+  /** A new run supersedes a terminal frame that was waiting for its `prompt_result`. */
+  private noteAgentStart(): void {
+    const prompt = this.activePrompt
+    if (prompt === undefined) return
+    prompt.agentRan = true
+    prompt.lastActivityAt = Date.now()
+    if (prompt.fallbackTimer !== undefined) {
+      clearTimeout(prompt.fallbackTimer)
+      prompt.fallbackTimer = undefined
+    }
+  }
+
+  /** The session went quiet: that ends a turn held for background work, and settles one that never got a result. */
+  private handleSessionSettled(): void {
+    const prompt = this.activePrompt
+    if (prompt?.heldStop !== undefined) {
+      void this.finishPrompt(prompt, { stopReason: prompt.heldStop })
+      return
+    }
+    if (prompt === undefined) void this.refreshContextUsage(TURN_END_CONTEXT_TIMEOUT_MS).catch(() => undefined)
+    this.schedulePromptResultFallback()
+  }
+
+  /**
+   * Ends a held turn that saw no activity for `wakeSettleMs`. The bound is on silence, not on the turn: a run that keeps
+   * producing frames postpones it, and so does a run that is live but quiet (a long tool call of a goal run). It only
+   * waits out a session that went quiet without saying so.
+   */
+  private armHoldTimer(prompt: ActivePromptState, delayMs: number): void {
+    prompt.holdTimer = setTimeout(() => {
+      prompt.holdTimer = undefined
+      if (this.activePrompt !== prompt || prompt.heldStop === undefined) return
+      const remaining = this.wakeSettleMs - (Date.now() - prompt.lastActivityAt)
+      if (remaining > 0 || this.agentRuns > 0) {
+        this.armHoldTimer(prompt, remaining > 0 ? remaining : this.wakeSettleMs)
+        return
+      }
+      this.log('OMP did not settle after the agent yielded; ending the turn')
+      void this.finishPrompt(prompt, { stopReason: prompt.heldStop })
+    }, delayMs)
+  }
+
   private schedulePromptResultFallback(): void {
     const prompt = this.activePrompt
-    if (prompt === undefined || prompt.fallbackTimer !== undefined) return
+    if (prompt === undefined || prompt.resultSeen || prompt.fallbackTimer !== undefined) return
     prompt.fallbackTimer = setTimeout(() => {
       prompt.fallbackTimer = undefined
       if (this.activePrompt !== prompt) return
@@ -2777,7 +3430,37 @@ export class OmpNativeTransport implements NativeTransport {
         stopReason: prompt.aborted ? 'cancelled' : prompt.lastStopReason === 'length' ? 'max_tokens' : 'end_turn',
         ...(usage === undefined ? {} : { usage }),
       })
-    }, PROMPT_RESULT_FALLBACK_MS)
+    }, this.promptResultFallbackMs)
+  }
+
+  /**
+   * The goal changed: a command, the agent's own `goal` tool, or the counters that move with every turn. Only a new goal or a new status
+   * is worth a line; a `/goal` command's reply already says what that command did. Outside a turn the line is only logged.
+   */
+  private handleGoalUpdated(frame: JsonObject): void {
+    const next = parseOmpGoal(frame.goal)
+    const note = this.goalCommandOpen ? undefined : goalNote(this.goal, next)
+    // A dropped goal is gone: omp reports it once, with that status, and clears its state without another frame.
+    this.goal = next === undefined || next.status === 'dropped' ? undefined : next
+    if (note === undefined) return
+    this.emitNotice(note)
+    const prompt = this.activePrompt
+    if (prompt === undefined || prompt.aborted || this.projector === undefined) return
+    prompt.lastActivityAt = Date.now()
+    this.emit({ kind: 'update', update: this.projector.note(note) })
+  }
+
+  /** The catalog reaches the host as a `commands` event: the first one always, later ones when they differ. */
+  private handleCommandsUpdate(frame: JsonObject): void {
+    if (!Array.isArray(frame.commands)) return
+    const catalog = buildOmpCommandCatalog(frame.commands)
+    this.catalogOverrides = catalog.overrides
+    const signature = JSON.stringify(catalog.commands)
+    const reported = this.liveCatalog !== undefined
+    this.liveCatalog = catalog.commands
+    if (reported && signature === this.catalogSignature) return
+    this.catalogSignature = signature
+    this.emit({ kind: 'commands', commands: catalog.commands })
   }
 
   // ---------------------------------------------------------------------------
@@ -2848,41 +3531,34 @@ export class OmpNativeTransport implements NativeTransport {
 
   async prompt(content: readonly NativeContentBlock[], signal: AbortSignal): Promise<NativePromptResult> {
     this.assertUsable()
-    if (this.activePrompt !== undefined) {
+    if (this.activePrompt !== undefined || this.activeShell !== undefined) {
       throw new NativeTransportError('OMP prompt is already in flight', 'prompt-in-flight')
     }
+    if (this.rewinding) throw new NativeTransportError('The OMP conversation is being changed', 'busy')
     if (signal.aborted) throw abortReason(signal)
     const { message, images } = splitContent(content)
     if (message.length === 0 && images.length === 0) {
       throw new NativeTransportError('OMP prompt needs text or image content', 'empty-prompt')
     }
+    const shellLine = userShellLine(content)
+    if (shellLine !== undefined) return await this.runUserShell(shellLine, signal)
+    const goalArgs = this.goalCommandArgs(message)
+    if (goalArgs !== undefined) return await this.runGoalCommand(goalArgs, signal)
+    const refusal = this.terminalOnlyReply(message)
+    if (refusal !== undefined) return this.answerLocally(refusal)
 
-    const result = Promise.withResolvers<NativePromptResult>()
-    const id = this.mintRequestId()
-    const prompt: ActivePromptState = {
-      id,
-      deferred: result,
-      usage: new OmpUsageAccumulator(),
-      lastStopReason: undefined,
-      lastAssistantError: undefined,
-      admissionError: undefined,
-      aborted: false,
-      admissionTimer: undefined,
-      abortTimer: undefined,
-      fallbackTimer: undefined,
-      removeAbortListener: undefined,
-    }
-    // The turn owns the frames from the moment the command is written: register it before sending.
-    this.activePrompt = prompt
-    this.projector?.reset()
+    const prompt = this.openPrompt(message.startsWith('/'))
     const request = this.request(
       {
         type: 'prompt',
         message,
         ...(images.length > 0 ? { images } : {}),
+        // omp refuses a plain prompt while a run it started itself is streaming (the wake run after background
+        // work); queued behind that run, the prompt is processed at its next yield.
+        ...(this.busy ? { streamingBehavior: 'followUp' } : {}),
       },
       this.requestTimeoutMs,
-      id,
+      prompt.id,
     )
 
     // The acknowledgement means "admitted", never "turn finished"; local-only slash commands report
@@ -2914,24 +3590,208 @@ export class OmpNativeTransport implements NativeTransport {
       },
     )
 
+    this.watchAbort(prompt, signal)
+    return prompt.deferred.promise
+  }
+
+  /** A turn owns the frames from the moment its command is written: register it before sending anything. */
+  private openPrompt(slash: boolean): ActivePromptState {
+    const prompt: ActivePromptState = {
+      id: this.mintRequestId(),
+      deferred: Promise.withResolvers<NativePromptResult>(),
+      usage: new OmpUsageAccumulator(),
+      slash,
+      lastStopReason: undefined,
+      lastAssistantError: undefined,
+      admissionError: undefined,
+      aborted: false,
+      agentRan: false,
+      resultSeen: false,
+      heldStop: undefined,
+      lastActivityAt: Date.now(),
+      admissionTimer: undefined,
+      abortTimer: undefined,
+      fallbackTimer: undefined,
+      holdTimer: undefined,
+      removeAbortListener: undefined,
+    }
+    this.activePrompt = prompt
+    this.projector?.reset()
+    return prompt
+  }
+
+  /** The host's stop: interrupt omp, and end the turn even when omp never confirms. */
+  private watchAbort(prompt: ActivePromptState, signal: AbortSignal): void {
     const onAbort = (): void => {
       if (this.activePrompt !== prompt || prompt.aborted) return
       prompt.aborted = true
       void this.interrupt().catch((error: unknown) => {
         this.log(`OMP abort request failed: ${errorText(error)}`)
       })
+      // A turn held for background work has no run of its own to confirm the abort, unless a wake run is streaming.
+      if (prompt.heldStop !== undefined) {
+        prompt.heldStop = 'cancelled'
+        if (this.agentRuns === 0) {
+          void this.finishPrompt(prompt, { stopReason: 'cancelled' })
+          return
+        }
+      }
       prompt.abortTimer = setTimeout(() => {
         prompt.abortTimer = undefined
         if (this.activePrompt !== prompt) return
         void this.finishPrompt(prompt, { stopReason: 'cancelled' })
-      }, ABORT_SETTLE_GRACE_MS)
+      }, this.abortGraceMs)
     }
     signal.addEventListener('abort', onAbort, { once: true })
     prompt.removeAbortListener = () => {
       signal.removeEventListener('abort', onAbort)
     }
+  }
 
-    return result.promise
+  /** The refusal for a `/name` omp keeps terminal-only, unless an extension, custom or file command owns the name. */
+  private terminalOnlyReply(message: string): string | undefined {
+    const name = slashCommandName(message)
+    if (name === undefined || !Object.hasOwn(TERMINAL_ONLY_COMMANDS, name) || this.catalogOverrides.has(name)) return undefined
+    return Object.hasOwn(SERVED_COMMANDS, name)
+      ? `/${name} runs as a command of its own, not as part of a message. Nothing was sent to the model.`
+      : `/${name} is a terminal-only Oh My Pi command and has no effect in this session. Nothing was sent to the model.`
+  }
+
+  /** One assistant line the transport itself says, inside the turn that is open. */
+  private say(text: string): void {
+    const update = this.projector?.reply(text)
+    if (update !== undefined) this.emit({ kind: 'update', update })
+  }
+
+  /** Answer a prompt on the transport's own authority: one assistant line, no round trip to omp, no model turn. */
+  private answerLocally(text: string): NativePromptResult {
+    this.say(text)
+    return { stopReason: 'end_turn' }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Goals
+  // ---------------------------------------------------------------------------
+
+  /** The arguments of `/goal …` when the transport runs it (rpc `goal`); an extension, custom or file command named `goal` keeps the line. */
+  private goalCommandArgs(message: string): string | undefined {
+    if (slashCommandName(message) !== 'goal' || this.catalogOverrides.has('goal')) return undefined
+    return slashCommandArgs(message)
+  }
+
+  /**
+   * `/goal`: rpc `goal`. Its reply is the whole turn unless omp goes on working by itself (an active goal under a configuration that
+   * lets rpc hosts continue goals): then the turn stays open, like a wake turn, until omp settles, so the runs omp starts reach the
+   * host and the user's stop reaches them.
+   */
+  private runGoalCommand(args: string, signal: AbortSignal): Promise<NativePromptResult> {
+    const prompt = this.openPrompt(true)
+    // No `prompt_result` is coming: a goal command is answered by the response to its own rpc.
+    prompt.resultSeen = true
+    this.watchAbort(prompt, signal)
+    void this.answerGoalCommand(prompt, parseGoalArgs(args))
+    return prompt.deferred.promise
+  }
+
+  private async answerGoalCommand(prompt: ActivePromptState, request: GoalRequest): Promise<void> {
+    try {
+      const outcome = await this.goalOutcome(request)
+      if (this.activePrompt !== prompt) return
+      if (prompt.aborted) {
+        await this.finishPrompt(prompt, { stopReason: 'cancelled' })
+        return
+      }
+      this.say(outcome.text)
+      if (outcome.working) {
+        const continues = await this.goalContinues()
+        if (this.activePrompt !== prompt) return
+        if (continues && !prompt.aborted) {
+          // Held like a wake turn: it ends when omp settles, when the user acts, or after `wakeSettleMs` of silence.
+          prompt.heldStop = 'end_turn'
+          prompt.lastActivityAt = Date.now()
+          this.armHoldTimer(prompt, this.wakeSettleMs)
+          return
+        }
+        // Only a launch without the overlay (`createOverlay`) makes "waits for your next message" the answer: with it, a goal that
+        // stays put is omp's own decision (plan mode, nothing actionable left). A run that already happened (it settled while
+        // this was asked) is an answer too.
+        if (!continues && !prompt.aborted && !prompt.agentRan && !this.overlayApplied) this.say(GOAL_WAITS)
+      }
+      await this.finishPrompt(prompt, { stopReason: prompt.aborted ? 'cancelled' : 'end_turn' })
+    } catch (error: unknown) {
+      if (this.activePrompt !== prompt) return
+      if (error instanceof NativeTransportError && error.code === 'request-failed') {
+        // omp's own refusal ("Goal mode is disabled (goal.enabled).", "A goal is already active. …"): an answer for the user.
+        if (!prompt.aborted) this.say(goalFailure(error.detail ?? error.message))
+        await this.finishPrompt(prompt, { stopReason: prompt.aborted ? 'cancelled' : 'end_turn' })
+      } else {
+        this.failPrompt(prompt, error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+  }
+
+  /** Runs the goal command; `working` says that it left an active goal, which omp may go on with by itself. */
+  private async goalOutcome(request: GoalRequest): Promise<{ readonly text: string; readonly working: boolean }> {
+    this.goalCommandOpen = true
+    try {
+      switch (request.action) {
+        case 'usage':
+          return { text: `${request.problem}\n\n${GOAL_USAGE}`, working: false }
+        case 'show': {
+          const goal = await this.goalRpc('get')
+          return { text: goal === undefined ? `There is no goal in this session. ${GOAL_USAGE}` : formatGoal(goal), working: false }
+        }
+        case 'clear': {
+          const goal = await this.goalRpc('get')
+          if (goal === undefined) return { text: 'There is no goal to clear.', working: false }
+          await this.goalRpc('drop')
+          return { text: formatGoal({ ...goal, status: 'dropped' }), working: false }
+        }
+        case 'pause': {
+          const goal = await this.goalRpc('pause')
+          return { text: goal === undefined ? 'There is no goal to pause.' : formatGoal(goal), working: false }
+        }
+        case 'resume': {
+          const goal = await this.goalRpc('resume')
+          return goal === undefined
+            ? { text: 'Oh My Pi did not report the goal it resumed.', working: false }
+            : { text: formatGoal(goal), working: goal.status === 'active' }
+        }
+        case 'set': {
+          const goal = await this.goalRpc('create', request.objective)
+          return goal === undefined
+            ? { text: 'Oh My Pi did not report the goal it created.', working: false }
+            : { text: formatGoal(goal, 'Goal set'), working: goal.status === 'active' }
+        }
+      }
+    } finally {
+      this.goalCommandOpen = false
+    }
+  }
+
+  /** rpc `goal`: the goal after the operation (`undefined` when there is none). */
+  private async goalRpc(op: 'get' | 'create' | 'resume' | 'pause' | 'drop', objective?: string): Promise<OmpGoal | undefined> {
+    const data = asObject(
+      await this.request({ type: 'goal', op, ...(objective === undefined ? {} : { objective }) }, SESSION_COMMAND_TIMEOUT_MS).response,
+    )
+    this.goal = parseOmpGoal(data?.goal)
+    return this.goal
+  }
+
+  /**
+   * Whether omp goes on with the goal by itself: it reports the session not settled once the command is answered (a continuation is
+   * scheduled or running). A `session_settled` seen while this is asked means it already stopped. A failed read holds nothing.
+   */
+  private async goalContinues(): Promise<boolean> {
+    const settledBefore = this.settledFrames
+    try {
+      const state = asObject(await this.request({ type: 'get_state' }, this.requestTimeoutMs).response)
+      return readBoolean(state?.isSettled) === false && this.settledFrames === settledBefore
+    } catch (error) {
+      if (this.exitError !== undefined) throw this.exitError
+      this.log(`OMP get_state after a goal command failed: ${errorText(error)}`)
+      return false
+    }
   }
 
   private async finishPrompt(prompt: ActivePromptState, result: NativePromptResult): Promise<void> {
@@ -2942,12 +3802,19 @@ export class OmpNativeTransport implements NativeTransport {
     prompt.removeAbortListener = undefined
     // The turn's usage includes everything accounted until now, even after a cancel.
     const usage = result.usage ?? prompt.usage.snapshot()
+    await this.refreshContextAfterTurn()
+    prompt.deferred.resolve({ stopReason: result.stopReason, ...(usage === undefined ? {} : { usage }) })
+    // A slash command may have changed what omp reports as controls (`/fast`, `/slow`, `/effort`): read it back.
+    if (prompt.slash && this.started && !this.closed && this.selfChange === 0) this.scheduleModelRefresh()
+  }
+
+  /** Read the window occupancy once a turn ended; a failed read only costs freshness. */
+  private async refreshContextAfterTurn(): Promise<void> {
     try {
       await this.refreshContextUsage(TURN_END_CONTEXT_TIMEOUT_MS)
     } catch (error) {
       this.log(`OMP context usage refresh after turn failed: ${errorText(error)}`)
     }
-    prompt.deferred.resolve({ stopReason: result.stopReason, ...(usage === undefined ? {} : { usage }) })
   }
 
   private failPrompt(prompt: ActivePromptState, error: Error): void {
@@ -2990,11 +3857,26 @@ export class OmpNativeTransport implements NativeTransport {
     if (this.exitError !== undefined) throw this.exitError
     if (signal?.aborted === true) throw abortReason(signal)
     const { message, images } = splitContent(content)
+    // On a native runtime `promptRequired` makes the host interrupt the running vendor turn and prompt the line again.
+    // The early answers below are therefore given only where no model turn can take the text, never because of what
+    // the text says: slash lines and `!cmd` are injected like any other steering text (a line the host claims as a
+    // command never reaches this method).
+    // Nothing to inject (whitespace only); `NativeSessionRuntime.steer` answers the same for content without blocks.
     if (message.length === 0 && images.length === 0) return 'promptRequired'
-    // Like ACP's `_session/steering`, an idle (or aborting) session is never started or consumed by a
-    // steer: the host submits the content through `prompt()` and keeps owning the turn.
+    // Safe: with no model turn in flight there is nothing to interrupt. An idle or just finished session needs a
+    // prompt (a steer never starts a turn, like ACP's `_session/steering`), an aborting turn is already being stopped
+    // by the host, and a user shell run (`!cmd`) cannot take text: the user's send-now then ends the command
+    // (`abort_bash`) and runs the line, as for any input the vendor cannot take mid-turn.
     const prompt = this.activePrompt
     if (prompt === undefined || prompt.aborted) return 'promptRequired'
+    if (prompt.heldStop !== undefined && this.agentRuns === 0) {
+      // Safe: the agent already yielded its answer and only background work is pending, so no answer is in flight. The
+      // finished turn has dropped its abort listener, so the host's interrupt sends no `abort` and the background
+      // jobs keep running. An rpc `steer` would only park the text for a wake run that may never come, and the
+      // host would wait out the steer proof for it.
+      void this.finishPrompt(prompt, { stopReason: prompt.heldStop })
+      return 'promptRequired'
+    }
 
     const confirmation = Promise.withResolvers<'injected' | 'promptRequired'>()
     const steer: ActiveSteerState = {
@@ -3083,6 +3965,433 @@ export class OmpNativeTransport implements NativeTransport {
   }
 
   // ---------------------------------------------------------------------------
+  // Side questions, immediate commands and the user shell
+  // ---------------------------------------------------------------------------
+
+  /**
+   * `/btw`: a separate model call beside the main agent (rpc `btw`). The running record precedes the response and
+   * the deltas follow it, none of them responses, so the waiter exists before the command is written. omp runs one
+   * side question at a time and cancels it itself on a session change.
+   */
+  async sideQuestion(question: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    this.assertUsable()
+    const text = question.trim()
+    if (text.length === 0) return { kind: 'error', text: 'Usage: /btw <question>' }
+    if (signal.aborted) return { kind: 'error', text: 'The side question was cancelled before it started.' }
+    if (this.activeBtw !== undefined) {
+      return { kind: 'error', text: 'A side question is still running; wait for it to finish or cancel it first.' }
+    }
+    const btw: ActiveBtwState = {
+      question: text,
+      recordId: undefined,
+      streamed: '',
+      answer: '',
+      stop: undefined,
+      cancelRequested: false,
+      cancelTargeted: false,
+      deferred: Promise.withResolvers<NativeCommandResult>(),
+      watchdog: undefined,
+      graceTimer: undefined,
+      removeAbortListener: undefined,
+    }
+    this.activeBtw = btw
+    btw.watchdog = setTimeout(() => {
+      btw.watchdog = undefined
+      btw.stop ??= 'timeout'
+      this.cancelBtw(btw)
+    }, this.btwTimeoutMs)
+    const onAbort = (): void => {
+      btw.stop ??= 'aborted'
+      this.cancelBtw(btw)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    btw.removeAbortListener = () => {
+      signal.removeEventListener('abort', onAbort)
+    }
+    // No request timer: the command waits behind the serial queue, and the watchdog bounds the whole question.
+    this.request({ type: 'btw', question: text }, 0).response.then(
+      (data) => {
+        if (this.activeBtw !== btw) return
+        const record = asObject(asObject(data)?.record)
+        if (record === undefined) return
+        btw.recordId ??= readString(record.id)
+        this.noteBtwRecord(btw, record)
+        // A cancel sent before the topic id was known can have missed a question that was still queued.
+        if (this.activeBtw === btw && btw.cancelRequested && !btw.cancelTargeted) this.sendBtwCancel(btw)
+      },
+      (error: unknown) => {
+        if (this.activeBtw !== btw) return
+        if (error instanceof NativeTransportError && error.code === 'request-failed') {
+          // The vendor's own refusal ("A /btw question is still running", "No active model available for /btw.").
+          this.endBtw(btw, { kind: 'error', text: error.detail ?? error.message })
+        } else {
+          // The process is gone or closing: nothing can answer any more.
+          this.endBtw(btw, error instanceof Error ? error : new Error(String(error)))
+        }
+      },
+    )
+    return await btw.deferred.promise
+  }
+
+  /**
+   * Apply one record of the question in flight: a `btw_record` frame or the record of the `btw` response. The
+   * top-level fields of a topic describe its first turn; the turn that decides whether the question ended is the last
+   * of `followUps` (after a follow-up the top-level status stays `complete` while the follow-up still runs).
+   */
+  private noteBtwRecord(btw: ActiveBtwState, record: JsonObject): void {
+    const latest = asObject(readArray(record.followUps)?.at(-1)) ?? record
+    const status = readString(latest.status)
+    const id = readString(record.id)
+    if (btw.recordId === undefined) {
+      // omp announces the question as `running` before it answers the command.
+      if (id === undefined || status !== 'running' || readString(latest.question)?.trim() !== btw.question) return
+      btw.recordId = id
+    } else if (id !== btw.recordId) {
+      return
+    }
+    const answer = readString(latest.answer) ?? ''
+    if (answer.length > btw.answer.length) btw.answer = answer
+    switch (status) {
+      case 'complete': {
+        const text = answer.trim().length > 0 ? answer : btw.answer
+        this.endBtw(
+          btw,
+          text.trim().length > 0
+            ? { kind: 'success', text }
+            : { kind: 'error', text: 'Oh My Pi returned an empty answer.' },
+        )
+        return
+      }
+      case 'cancelled':
+        this.endBtw(btw, this.btwCancelled(btw))
+        return
+      case 'error':
+        this.endBtw(btw, this.btwFailure(btw, readString(latest.error) ?? 'The side question failed.'))
+        return
+      case 'interrupted':
+        this.endBtw(btw, this.btwFailure(btw, 'The side question was interrupted.'))
+        return
+      default:
+        // `running`: the deltas keep coming.
+        return
+    }
+  }
+
+  /** An error result that keeps whatever was streamed before the question ended. */
+  private btwFailure(btw: ActiveBtwState, headline: string): NativeCommandResult {
+    const partial = btw.answer.trim()
+    return { kind: 'error', text: partial.length > 0 ? `${headline}\n\nPartial answer:\n\n${partial}` : headline }
+  }
+
+  /** The result of a cancelled question, worded after who cancelled it. */
+  private btwCancelled(btw: ActiveBtwState): NativeCommandResult {
+    const headline =
+      btw.stop === 'timeout'
+        ? 'The side question ran too long and was cancelled.'
+        : btw.stop === 'aborted'
+          ? 'The side question was cancelled.'
+          : 'Oh My Pi cancelled the side question.'
+    return this.btwFailure(btw, headline)
+  }
+
+  /** Cancel the question in flight (abort signal, watchdog); it ends even when omp never confirms. */
+  private cancelBtw(btw: ActiveBtwState): void {
+    if (this.activeBtw !== btw) return
+    btw.cancelRequested = true
+    this.sendBtwCancel(btw)
+    btw.graceTimer ??= setTimeout(() => {
+      btw.graceTimer = undefined
+      this.endBtw(btw, this.btwCancelled(btw))
+    }, this.abortGraceMs)
+  }
+
+  /** `btw_cancel` bypasses the command queue; the cancelled record arrives before its response. */
+  private sendBtwCancel(btw: ActiveBtwState): void {
+    btw.cancelTargeted = btw.recordId !== undefined
+    const command = { type: 'btw_cancel', ...(btw.recordId === undefined ? {} : { recordId: btw.recordId }) }
+    this.request(command, 5_000).response.catch((error: unknown) => {
+      if (this.exitError === undefined) this.log(`OMP btw_cancel failed: ${errorText(error)}`)
+    })
+  }
+
+  /** End the question in flight: drop its timers and listener, then answer or fail its waiter. */
+  private endBtw(btw: ActiveBtwState, outcome: NativeCommandResult | Error): void {
+    if (this.activeBtw !== btw) return
+    this.activeBtw = undefined
+    clearTimeout(btw.watchdog)
+    clearTimeout(btw.graceTimer)
+    btw.removeAbortListener?.()
+    if (outcome instanceof Error) btw.deferred.reject(outcome)
+    else btw.deferred.resolve(outcome)
+  }
+
+  /**
+   * The immediate commands. `new` and `clear` both start a fresh omp session: rpc has no in-place clear, and the
+   * session id changes either way, which the host learns from `session_changed`. `rewind` goes back to an earlier message.
+   */
+  async runCommand(name: string, args: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    this.assertUsable()
+    if (name !== 'new' && name !== 'clear' && name !== 'rewind') {
+      return { kind: 'error', text: `/${name} is not a command Oh My Pi runs without a turn.` }
+    }
+    if (signal.aborted) return { kind: 'error', text: `/${name} was cancelled before it started.` }
+    if (name === 'rewind') return await this.rewindCommand(args, signal)
+    // Serialized with the control writes: both change the session the controls describe.
+    const run = this.configTail.then(() => this.startNewSession(name))
+    this.configTail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return await run
+  }
+
+  private async startNewSession(command: 'new' | 'clear'): Promise<NativeCommandResult> {
+    // The new session detaches whatever run is live and would orphan a turn of ours: idle only.
+    if (this.activePrompt !== undefined || this.activeShell !== undefined || this.agentRuns > 0) {
+      return { kind: 'error', text: `/${command} needs an idle session; stop the running turn first.` }
+    }
+    let data: JsonObject | undefined
+    try {
+      data = asObject(await this.request({ type: 'new_session' }, SESSION_COMMAND_TIMEOUT_MS).response)
+    } catch (error) {
+      if (error instanceof NativeTransportError && error.code === 'request-failed') {
+        return { kind: 'error', text: error.detail ?? error.message }
+      }
+      throw error
+    }
+    if (readBoolean(data?.cancelled) === true) {
+      return { kind: 'error', text: `An extension vetoed /${command}; the conversation is unchanged.` }
+    }
+    const stats = await this.statsRequest(this.requestTimeoutMs)
+    this.sessionIdValue = stats.sessionId
+    this.sessionFile = stats.sessionFile
+    this.projector?.reset()
+    this.applyStats(stats.data)
+    // A new session starts from omp's defaults, not from what the previous one had selected.
+    await this.refreshState()
+    await this.loadThinkingLevels()
+    this.thinkingAuto = false
+    await this.refreshThinkingSelector()
+    this.onControlInputsChanged()
+    this.emit({ kind: 'session_changed', sessionId: stats.sessionId, reason: command })
+    return {
+      kind: 'success',
+      text:
+        command === 'new'
+          ? `Started a new Oh My Pi session (\`${stats.sessionId}\`).`
+          : `Cleared the conversation. Oh My Pi continues in a new session (\`${stats.sessionId}\`); the previous one is no longer in context.`,
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rewind
+  // ---------------------------------------------------------------------------
+
+  /** Whether omp is working, a turn of ours is open, or the conversation is being changed: a branch would cut the work off. */
+  private conversationBusy(): boolean {
+    return this.activePrompt !== undefined || this.activeShell !== undefined || this.agentRuns > 0 || this.busy || this.rewinding
+  }
+
+  /** `get_entries`: the session as omp recorded it. Nothing is cached, so the list is the same after a restart. */
+  private async sessionModel(cwd: string): Promise<OmpRewindModel> {
+    const data = asObject(await this.request({ type: 'get_entries' }, SESSION_COMMAND_TIMEOUT_MS).response)
+    const leaf = data?.leafId
+    return readRewindModel({
+      entries: readArray(data?.entries) ?? [],
+      leafId: typeof leaf === 'string' || leaf === null ? leaf : undefined,
+      cwd,
+    })
+  }
+
+  /**
+   * `/rewind`: list the user's messages, preview going back to just before one (the conversation omp would forget, the files that would
+   * be restored and those that cannot be), or do it. Listing and previews may run at any time; changing anything needs an idle session.
+   */
+  private async rewindCommand(args: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    const request = parseRewindArgs(args)
+    if (request.action === 'usage') return { kind: 'error', text: `${request.problem}\n\nUsage: /rewind [<n> [code|chat] [confirm]]` }
+    const cwd = this.cwd
+    if (cwd === undefined) throw new NativeTransportError('OMP transport is not started', 'not-started')
+    try {
+      const model = await this.sessionModel(cwd)
+      if (request.action === 'list') return { kind: 'success', text: renderCheckpoints(model.checkpoints) }
+      const found = findCheckpoint(model.checkpoints, request.reference)
+      if ('error' in found) return { kind: 'error', text: found.error }
+      const { checkpoint, position } = found
+      const point: RewindPoint = {
+        checkpoint,
+        position,
+        total: model.checkpoints.length,
+        mode: request.mode,
+        display: (path: string): string => shownPath(cwd, path),
+        unrecorded: model.unrecorded.filter((call) => call.index > checkpoint.index).length,
+      }
+      const changes = model.changes.filter((change) => change.index > checkpoint.index)
+      // Only the session's own directory is ever read or written, however a recorded path leads out of it.
+      const io = nodeRestoreIo([cwd])
+      if (request.action === 'preview') {
+        const plan = request.mode === 'chat' ? undefined : await planRestore(changes, io)
+        return { kind: 'success', text: renderRewindPreview({ ...point, plan }) }
+      }
+      // Serialized with the control writes and `new`/`clear`: all of them change the session the controls describe.
+      const run = this.configTail.then(() => this.applyRewind(point, changes, io, signal))
+      this.configTail = run.then(
+        () => undefined,
+        () => undefined,
+      )
+      return await run
+    } catch (error: unknown) {
+      // A lost process is the runtime's to handle; anything else is an answer for the user.
+      if (this.closed) throw error
+      if (signal.aborted) return { kind: 'error', text: 'The command was cancelled.' }
+      return { kind: 'error', text: `\`/rewind\` failed: ${refusalText(error)}` }
+    }
+  }
+
+  /** The files go back first (what the agent's file tools recorded), then the conversation moves to a branch that ends before the message. */
+  private async applyRewind(
+    point: RewindPoint,
+    changes: readonly OmpFileChange[],
+    io: RestoreIo,
+    signal: AbortSignal,
+  ): Promise<NativeCommandResult> {
+    if (this.conversationBusy()) {
+      return { kind: 'error', text: 'Wait for the current turn to finish before rewinding: Oh My Pi is working right now.' }
+    }
+    if (signal.aborted) return { kind: 'error', text: 'The command was cancelled.' }
+    // No prompt may start while the files and the conversation are going back.
+    this.rewinding = true
+    try {
+      const plan = point.mode === 'chat' ? undefined : await planRestore(changes, io)
+      const restore = plan === undefined ? undefined : await applyRestore(plan, io)
+      let rolledBack = false
+      let rollbackError: string | undefined
+      if (point.mode !== 'code') {
+        try {
+          await this.branchBefore(point.checkpoint.entryId)
+          rolledBack = true
+        } catch (error: unknown) {
+          if (this.closed) throw error
+          rollbackError = refusalText(error)
+        }
+        if (rolledBack) await this.adoptBranchedSession()
+      }
+      return {
+        kind: rollbackError === undefined ? 'success' : 'error',
+        text: renderRewindResult({ ...point, plan, restore, rolledBack, rollbackError }),
+      }
+    } finally {
+      this.rewinding = false
+    }
+  }
+
+  /** rpc `branch`: the conversation moves to a new session that holds everything before the message. */
+  private async branchBefore(entryId: string): Promise<void> {
+    const data = asObject(await this.request({ type: 'branch', entryId }, SESSION_COMMAND_TIMEOUT_MS).response)
+    if (readBoolean(data?.cancelled) === true) throw new Error('an extension vetoed the branch; the conversation is unchanged')
+  }
+
+  /** The branch is a session with an id of its own; the host learns it from `session_changed`. */
+  private async adoptBranchedSession(): Promise<void> {
+    const stats = await this.statsRequest(this.requestTimeoutMs)
+    this.sessionIdValue = stats.sessionId
+    this.sessionFile = stats.sessionFile
+    this.projector?.reset()
+    this.applyStats(stats.data)
+    // The goal of the branch is whatever the branch journaled; omp reattaches it before it answers.
+    await this.refreshState()
+    this.onControlInputsChanged()
+    this.emit({ kind: 'session_changed', sessionId: stats.sessionId, reason: 'rewind' })
+  }
+
+  /** `!cmd`: omp's user shell (rpc `bash`) as one `execute` tool call, with no model call. */
+  private async runUserShell(line: string, signal: AbortSignal): Promise<NativePromptResult> {
+    if (line.startsWith('!!')) {
+      return this.answerLocally(
+        "`!!` runs a command without adding its output to the conversation, which Oh My Pi's rpc protocol cannot do. Use `!` to run it and keep the output in the conversation.",
+      )
+    }
+    const command = line.slice(1).trim()
+    if (command.length === 0) return this.answerLocally('Type a shell command after `!`.')
+    const shell: ActiveShellState = { aborted: false }
+    this.activeShell = shell
+    const toolCallId = `omp-shell:${randomUUID()}`
+    const rawInput = { command }
+    const startContent = buildToolStartContent('bash', rawInput)
+    this.emit({
+      kind: 'update',
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId,
+        title: buildOmpToolTitle('bash', rawInput),
+        name: 'bash',
+        kind: 'execute',
+        status: 'in_progress',
+        rawInput,
+        ...(startContent.length > 0 ? { content: startContent } : {}),
+      },
+    })
+    const finishCall = (ok: boolean, rawOutput: unknown, text: string): void => {
+      const content = mergeToolUpdateContent(startContent, text.length > 0 ? [textToolContent(limitText(text))] : [])
+      this.emit({
+        kind: 'update',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId,
+          name: 'bash',
+          status: ok ? 'completed' : 'failed',
+          ...(rawOutput === undefined ? {} : { rawOutput }),
+          ...(content.length > 0 ? { content } : {}),
+        },
+      })
+    }
+    // `bash` answers once, when the command is over; `abort_bash` is answered first, then `bash` reports the kill.
+    const request = this.request({ type: 'bash', command }, 0)
+    const unconfirmed = Promise.withResolvers<undefined>()
+    let confirmationExpired = false
+    let graceTimer: NodeJS.Timeout | undefined
+    const onAbort = (): void => {
+      shell.aborted = true
+      this.request({ type: 'abort_bash' }, 5_000).response.catch((error: unknown) => {
+        if (this.exitError === undefined) this.log(`OMP abort_bash failed: ${errorText(error)}`)
+      })
+      graceTimer = setTimeout(() => {
+        confirmationExpired = true
+        unconfirmed.resolve(undefined)
+      }, this.abortGraceMs)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      const response = await Promise.race([request.response, unconfirmed.promise])
+      if (confirmationExpired) {
+        // omp never confirmed the kill: the turn ends anyway, and a late answer is only logged.
+        this.pending.delete(request.id)
+        finishCall(false, undefined, '[cancelled]')
+        return { stopReason: 'cancelled' }
+      }
+      const result = asObject(response) ?? {}
+      const succeeded =
+        readBoolean(result.cancelled) !== true &&
+        readBoolean(result.timedOut) !== true &&
+        (readNumber(result.exitCode) ?? 0) === 0
+      finishCall(succeeded, result, shellResultText(result))
+      await this.refreshContextAfterTurn()
+      return { stopReason: shell.aborted ? 'cancelled' : 'end_turn' }
+    } catch (error) {
+      if (error instanceof NativeTransportError && error.code === 'request-failed') {
+        finishCall(false, undefined, error.detail ?? error.message)
+        return { stopReason: shell.aborted ? 'cancelled' : 'end_turn' }
+      }
+      finishCall(false, undefined, errorText(error))
+      throw error
+    } finally {
+      clearTimeout(graceTimer)
+      signal.removeEventListener('abort', onAbort)
+      this.activeShell = undefined
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Permission dialogs
   // ---------------------------------------------------------------------------
 
@@ -3090,23 +4399,141 @@ export class OmpNativeTransport implements NativeTransport {
     const id = readString(frame.id)
     const method = readString(frame.method)
     if (id === undefined || method === undefined) return
-    if (method === 'select') {
-      await this.answerSelectDialog(id, frame)
+    switch (method) {
+      case 'select': {
+        const title = readString(frame.title) ?? readString(frame.message) ?? ''
+        if (OMP_APPROVAL_TITLE.test(title.split('\n')[0] ?? '')) {
+          await this.answerSelectDialog(id, frame)
+          return
+        }
+        await this.answerSelectQuestion(id, frame, title)
+        return
+      }
+      case 'ask':
+        await this.answerAskQuestion(id, frame)
+        return
+      case 'confirm': {
+        const title = readString(frame.title) ?? ''
+        const message = readString(frame.message) ?? ''
+        await this.answerWithForm(
+          id,
+          { message: message.trim().length > 0 ? `${title}\n\n${message}` : title, requestedSchema: valueForm({ type: 'boolean' }) },
+          (content) => ({ confirmed: typeof content.value === 'boolean' ? content.value : false }),
+        )
+        return
+      }
+      case 'input': {
+        const placeholder = readString(frame.placeholder)
+        await this.answerWithForm(
+          id,
+          {
+            message: readString(frame.title) ?? '',
+            requestedSchema: valueForm({
+              type: 'string',
+              ...(placeholder !== undefined && placeholder.trim().length > 0 ? { description: placeholder } : {}),
+            }),
+          },
+          decodeStringValue,
+        )
+        return
+      }
+      case 'editor': {
+        const prefill = readString(frame.prefill)
+        await this.answerWithForm(
+          id,
+          {
+            message: readString(frame.title) ?? '',
+            requestedSchema: valueForm({
+              type: 'string',
+              ...(prefill !== undefined && prefill.length > 0 ? { default: prefill } : {}),
+            }),
+          },
+          decodeStringValue,
+        )
+        return
+      }
+      case 'cancel': {
+        // OMP settled the dialog itself (abort, timeout, supersede): withdraw the host prompt.
+        const target = readString(frame.targetId)
+        if (target !== undefined) this.dialogs.get(target)?.abort()
+        return
+      }
+      case 'notify':
+      case 'open_url':
+        // Fire-and-forget extension output: a thought line while a turn is open.
+        this.projectTurnFrame(frame)
+        return
+      default:
+      // setStatus / setWidget / setTitle / set_editor_text need no reply and have no surface here.
+    }
+  }
+
+  /**
+   * A non-approval `select` is a question: the form omp acp's `select` sends (`value`, required, the labels as
+   * `enum`), answered with the chosen label.
+   */
+  private async answerSelectQuestion(requestId: string, frame: JsonObject, title: string): Promise<void> {
+    const labels = readStringArray(frame.options)
+    if (labels.length === 0) {
+      this.writeFrame({ type: 'extension_ui_response', id: requestId, cancelled: true })
       return
     }
-    if (method === 'cancel') {
-      // OMP settled the dialog itself (abort, timeout, supersede): withdraw the host prompt.
-      const target = readString(frame.targetId)
-      if (target !== undefined) this.dialogs.get(target)?.abort()
+    await this.answerWithForm(
+      requestId,
+      { message: title, requestedSchema: valueForm({ type: 'string', enum: labels }) },
+      decodeStringValue,
+    )
+  }
+
+  /** An `ask` dialog: the form omp acp's `askDialog` sends, decoded the way it decodes the answer. */
+  private async answerAskQuestion(requestId: string, frame: JsonObject): Promise<void> {
+    const questions = parseOmpAskQuestions(frame.questions)
+    if (questions === undefined) {
+      this.log('OMP ask dialog carried no usable questions; dismissing')
+      this.writeFrame({ type: 'extension_ui_response', id: requestId, cancelled: true })
       return
     }
-    if (method === 'confirm' || method === 'input' || method === 'editor' || method === 'ask') {
-      // The host has no dialog surface for these; dismissing keeps the agent moving and is what ACP
-      // does for a client without elicitation (a `confirm` cancelled means "no").
-      this.writeFrame({ type: 'extension_ui_response', id, cancelled: true })
+    const call = this.projector?.findOpenToolCall('ask')
+    await this.answerWithForm(
+      requestId,
+      {
+        ...buildOmpAskForm(questions),
+        ...(call !== undefined && call.toolName === 'ask' ? { toolCallId: call.toolCallId } : {}),
+      },
+      (content) => ({ answers: decodeOmpAskAnswers(questions, content) }),
+    )
+  }
+
+  /**
+   * Put one form to the host and answer the OMP dialog from the response. `decode` turns the accepted form
+   * content into the response fields; anything but an accepted form (decline, cancel, a throw, no surface)
+   * answers `cancelled`. Nothing is written once OMP withdrew the dialog or the transport is closing.
+   */
+  private async answerWithForm(
+    requestId: string,
+    request: NativeElicitationRequest,
+    decode: (content: JsonObject) => JsonObject | undefined,
+  ): Promise<void> {
+    const handler = this.elicitationHandler
+    if (handler === undefined) {
+      this.writeFrame({ type: 'extension_ui_response', id: requestId, cancelled: true })
       return
     }
-    // notify / setStatus / setWidget / setTitle / set_editor_text / open_url need no reply.
+    const controller = new AbortController()
+    this.dialogs.set(requestId, controller)
+    let answer: JsonObject | undefined
+    try {
+      const response: unknown = await handler(request, controller.signal)
+      const accepted = asObject(response)
+      const content = accepted?.action === 'accept' ? asObject(accepted.content) : undefined
+      answer = content === undefined ? undefined : decode(content)
+    } catch (error) {
+      this.log(`OMP question handler failed: ${errorText(error)}`)
+    }
+    if (this.dialogs.get(requestId) === controller) this.dialogs.delete(requestId)
+    // OMP withdrew the dialog (or the transport is going down): there is nothing left to answer.
+    if (controller.signal.aborted || this.closing) return
+    this.writeFrame({ type: 'extension_ui_response', id: requestId, ...(answer ?? { cancelled: true }) })
   }
 
   private async answerSelectDialog(requestId: string, frame: JsonObject): Promise<void> {
@@ -3226,6 +4653,10 @@ function clearPromptTimers(prompt: ActivePromptState): void {
   if (prompt.fallbackTimer !== undefined) {
     clearTimeout(prompt.fallbackTimer)
     prompt.fallbackTimer = undefined
+  }
+  if (prompt.holdTimer !== undefined) {
+    clearTimeout(prompt.holdTimer)
+    prompt.holdTimer = undefined
   }
 }
 

@@ -55,12 +55,15 @@ export function agentControlMenuGroups(snapshot: AcpAgentSessionSnapshotView, t:
   for (const option of snapshot.configOptions ?? []) {
     // Model and reasoning remain exclusively in DSH's native ModelPicker.
     if (isAcpModelOrReasoningOption(option)) continue
+    // A choice waiting for the next turn shows as selected; the Agent keeps its current value until then.
+    const pending = isModeConfigOption(option) ? snapshot.pendingModeId : snapshot.pendingOptions?.[option.id]
+    const selected = pending ?? option.currentValue
     const choices: AgentControlChoice[] =
       option.type === 'boolean'
         ? [false, true].map((value) => ({
             id: `config:${option.id}:${value}`,
             label: t(value ? 'agentControlOn' : 'agentControlOff'),
-            current: value === option.currentValue,
+            current: value === selected,
             write: { kind: 'config', id: option.id, value },
             disabled,
           }))
@@ -70,9 +73,7 @@ export function agentControlMenuGroups(snapshot: AcpAgentSessionSnapshotView, t:
               label: value.name,
               ...(value.description == null ? {} : { description: value.description }),
               ...('group' in entry ? { group: entry.name } : {}),
-              current:
-                value.value ===
-                (isModeConfigOption(option) ? (snapshot.pendingModeId ?? option.currentValue) : option.currentValue),
+              current: value.value === selected,
               write: { kind: 'config' as const, id: option.id, value: value.value },
               disabled,
             })),

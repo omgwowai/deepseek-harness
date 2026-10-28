@@ -464,3 +464,46 @@ describe('prompt content conversion', () => {
     expect(validImageLimits({ ...limits, mediaTypes: ['text/plain'] as never })).toBe(false)
   })
 })
+
+describe('lines the agent runs itself: slash commands and the shell escape', () => {
+  const options = { imageEnabled: false, system: 'host rules', signal: new AbortController().signal }
+
+  it.each([
+    '/compact',
+    '/review src/a.ts',
+    '/mcp:docs:search react hooks',
+    '/plugin:deploy now',
+    '/skill.v2 go',
+    '  /clear  ',
+    '!ls -la',
+    '!  git status',
+    '!echo a\necho b',
+  ])('sends %j as the whole prompt, with no host instructions before it', async (line) => {
+    expect(await toAcpPrompt([text(line)], options)).toEqual([{ type: 'text', text: line.trim() }])
+  })
+
+  it.each(['!', '!   ', '/', '/ compact', '/etc/hosts is wrong', '//comment', 'run /compact later', 'please !ls'])(
+    'treats %j as ordinary text: the host instructions come first',
+    async (line) => {
+      const blocks = await toAcpPrompt([text(line)], options)
+      expect(blocks).toHaveLength(2)
+      expect(blocks[0]).toMatchObject({ type: 'text', text: expect.stringContaining('host rules') })
+      expect(blocks[1]).toEqual({ type: 'text', text: line })
+    },
+  )
+
+  it('is not a command line unless it is the whole prompt: another message or another block goes along with it', async () => {
+    const split = createUserMessage({
+      content: [
+        { type: 'text', text: '!ls' },
+        { type: 'text', text: 'and a second block' },
+      ],
+      source: { kind: 'user' },
+    })
+    for (const messages of [[text('/compact'), text('and then this')], [split]]) {
+      const blocks = await toAcpPrompt(messages, options)
+      expect(blocks[0]).toMatchObject({ type: 'text', text: expect.stringContaining('host rules') })
+      expect(blocks).toHaveLength(3)
+    }
+  })
+})

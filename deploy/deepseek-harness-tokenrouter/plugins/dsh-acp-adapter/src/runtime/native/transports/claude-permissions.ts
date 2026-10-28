@@ -468,7 +468,8 @@ export interface PermissionContext {
   readonly autoUnavailable: boolean
 }
 
-function allowResult(input: unknown, toolUseID: string, updatedPermissions?: readonly unknown[], permanent = false): Json {
+/** The Claude `PermissionResult` that lets the tool run (`input` is what it runs with), echoing the tool use it answers. */
+export function allowResult(input: unknown, toolUseID: string, updatedPermissions?: readonly unknown[], permanent = false): Json {
   return {
     behavior: 'allow',
     updatedInput: input,
@@ -478,7 +479,8 @@ function allowResult(input: unknown, toolUseID: string, updatedPermissions?: rea
   }
 }
 
-function denyResult(toolUseID: string, message = 'User refused permission to run tool', interrupt = false): Json {
+/** The Claude `PermissionResult` that refuses the tool, echoing the tool use it answers. */
+export function denyResult(toolUseID: string, message = 'User refused permission to run tool', interrupt = false): Json {
   return { behavior: 'deny', message, ...(interrupt ? { interrupt: true } : {}), toolUseID, decisionClassification: 'user_reject' }
 }
 

@@ -86,6 +86,7 @@ async function harness() {
     append: async () => undefined,
     readLatestBinding: async () => undefined,
     readModeIntent: async () => undefined,
+    listOptionIntents: async () => [],
     readRecoveryState: async () => undefined,
     writeRecoveryState: async () => undefined,
     writeOptionSnapshot: async () => undefined,

@@ -1,5 +1,4 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
@@ -29,7 +28,7 @@ export function projectNativeAgentAccess(session: SessionLike | undefined): void
 }
 
 /** Follow the host's pending selection, then committed route, then entry-point default. */
-function accessProvider(ctx: Context, agent: Agent): string | undefined {
+export function accessProvider(ctx: Context, agent: Agent): string | undefined {
   const selected = ctx.get('sessionProjections')?.stateOf(agent.session, 'modelSelection')
   const explicit = selected?.pending?.provider ?? agent.session.requestHeader()?.config.provider
   if (explicit !== undefined) return explicit
@@ -89,63 +88,3 @@ export function installNativeAgentAccess(ctx: Context, ownsRoute: (provider: str
   })
 }
 
-/** The slice of DSH's command registry this module uses (`ctx.commands`, injected by name). */
-interface CommandRegistryLike {
-  register(definition: {
-    readonly name: string
-    readonly description: string
-    readonly handler: (invocation: { readonly agent: Agent; readonly rawInput: string }) => {
-      readonly kind: 'success' | 'error'
-      readonly text: string
-    }
-  }): () => void
-}
-
-/** `ctx.commands` is injected by name; this checks the one method used. */
-function isCommandRegistry(value: unknown): value is CommandRegistryLike {
-  return typeof value === 'object' && value !== null && 'register' in value && typeof value.register === 'function'
-}
-
-/**
- * `/compact` in an ACP session compacts the Agent's own context. DSH's stock command summarizes DSH's
- * session log through an auxiliary model call, which an ACP route refuses (the Agent owns its context), so
- * it could only fail. Claude Code, Codex and Oh My Pi all implement `/compact` as an ACP prompt command:
- * a per-agent shadow of the command forwards it as the next prompt, and the Agent's native compaction
- * runs (and is reported by the Agent's own telemetry like any compaction it starts itself).
- */
-export function installNativeCompact(ctx: Context, ownsRoute: (provider: string | undefined) => boolean): void {
-  const shadowed = new WeakSet<Agent>()
-  const shadow = (agent: Agent): void => {
-    if (shadowed.has(agent) || !ownsRoute(agent.session.requestHeader()?.config.provider ?? accessProvider(ctx, agent)))
-      return
-    shadowed.add(agent)
-    agent.ctx.plugin({
-      name: 'dsh-acp-native-compact',
-      inject: ['commands'],
-      apply(child: Context) {
-        const commands: unknown = Reflect.get(child, 'commands')
-        if (!isCommandRegistry(commands)) return
-        child.effect(
-          () =>
-            commands.register({
-              name: 'compact',
-              description: "Compact the Agent's own context (native /compact)",
-              handler: ({ agent: target, rawInput }) => {
-                target.followup(
-                  createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: `/compact${rawInput}` }] }),
-                )
-                return { kind: 'success', text: 'Sent /compact to the Agent; it compacts its own context.' }
-              },
-            }),
-          'dsh-acp native /compact',
-        )
-      },
-    })
-  }
-  ctx.on('agent/created', ({ agent }) => {
-    shadow(agent)
-  })
-  ctx.on('agent/inbox/claimed', ({ agent }) => {
-    shadow(agent)
-  })
-}

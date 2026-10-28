@@ -13,30 +13,56 @@
  */
 import { spawn } from 'node:child_process'
 import { accessSync, constants, existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { delimiter, dirname, join } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, afterEach, describe, expect, it } from 'vitest'
 
 import {
   NativeTransportError,
   type NativeContentBlock,
+  type NativeElicitationHandler,
+  type NativeElicitationRequest,
   type NativePermissionDecision,
   type NativePermissionRequest,
   type NativeProcess,
+  type NativePromptResult,
   type NativeSessionTarget,
   type NativeSpawn,
   type NativeTransportEvent,
 } from '../../src/runtime/native/transports/contract.ts'
 import {
+  formatGoal,
+  goalFailure,
+  goalNote,
+  parseGoalArgs,
+  parseOmpGoal,
+  type OmpGoal,
+} from '../../src/runtime/native/transports/omp-goal.ts'
+import { createOmpConfigOverlay } from '../../src/runtime/native/transports/omp-overlay.ts'
+import {
+  applyRestore,
+  findCheckpoint,
+  nodeRestoreIo,
+  parseRewindArgs,
+  planRestore,
+  readRewindModel,
+  renderCheckpoints,
+  renderRewindPreview,
+  type DiskFile,
+  type OmpCheckpoint,
+  type OmpFileChange,
+  type RestoreIo,
+} from '../../src/runtime/native/transports/omp-rewind.ts'
+import {
+  buildOmpCommandCatalog,
   buildOmpLaunchArgv,
   buildOmpToolTitle,
   createOmpTransport,
   deriveOmpControls,
   extractOmpAssistantText,
   findOmpSessionFile,
-  mapOmpAvailableCommands,
   mapOmpPermissionOptions,
   mapOmpToolKind,
   OmpEventProjector,
@@ -111,6 +137,27 @@ describe('buildOmpLaunchArgv', () => {
     ])
     expect(buildOmpLaunchArgv(['omp', '--auto-approve']).argv).toEqual(['omp', '--auto-approve', '--mode', 'rpc-ui'])
     expect(buildOmpLaunchArgv(['omp', '--yolo']).argv).toEqual(['omp', '--yolo', '--mode', 'rpc-ui'])
+  })
+
+  it("appends the config overlay as the last --config, after the launcher's own, and keeps it out of the version probe", () => {
+    const launcher = ['/bin/omp', 'acp', '--config', '/etc/mine.yml', '-e', '/x/link.js', '--approval-mode', 'ask']
+    const plan = buildOmpLaunchArgv(launcher, '/tmp/dsh-acp-omp-x/overlay.yml')
+    expect(plan.argv).toEqual([
+      '/bin/omp',
+      '--config',
+      '/etc/mine.yml',
+      '-e',
+      '/x/link.js',
+      '--approval-mode',
+      'ask',
+      '--mode',
+      'rpc-ui',
+      '--config',
+      '/tmp/dsh-acp-omp-x/overlay.yml',
+    ])
+    expect(plan.versionArgv).toEqual(['/bin/omp', '--config', '/etc/mine.yml', '-e', '/x/link.js', '--approval-mode', 'ask', '--version'])
+    // Without an overlay nothing about --config changes.
+    expect(buildOmpLaunchArgv(launcher).argv).not.toContain('/tmp/dsh-acp-omp-x/overlay.yml')
   })
 
   it('keeps the wrapper arguments of a launcher that is not the omp binary itself', () => {
@@ -231,6 +278,28 @@ describe('deriveOmpControls', () => {
     })
     expect(controls.configOptions.map((option) => option.id)).toEqual(['mode', 'thinking'])
     expect(controls.imageInput).toBe(false)
+  })
+
+  it('adds fast and slow as boolean toggles only when omp reports them', () => {
+    const base = {
+      models: [MODEL_SOL],
+      model: MODEL_SOL,
+      thinkingLevels: ['off', 'low'],
+      thinkingLevel: 'low',
+      thinkingAuto: false,
+    }
+    expect(deriveOmpControls(base).configOptions.map((option) => option.id)).toEqual(['mode', 'model', 'thinking'])
+    const toggles = deriveOmpControls({ ...base, fastMode: true, slowMode: false }).configOptions.slice(3)
+    expect(toggles.map((option) => [option.id, option.type, option.currentValue])).toEqual([
+      ['fast', 'boolean', true],
+      ['slow', 'boolean', false],
+    ])
+    expect(deriveOmpControls({ ...base, fastMode: false }).configOptions.map((option) => option.id)).toEqual([
+      'mode',
+      'model',
+      'thinking',
+      'fast',
+    ])
   })
 })
 
@@ -370,16 +439,88 @@ describe('tool call projection helpers', () => {
     expect(extractOmpAssistantText({ content: 'nope' })).toBe('')
   })
 
-  it('maps the rpc command catalogue to ACP available commands', () => {
+  it('classifies the rpc command catalogue for the host', () => {
+    const catalog = buildOmpCommandCatalog([
+      {
+        name: 'security',
+        description: 'Scan',
+        input: { hint: '<plan|scan>' },
+        subcommands: [{ name: 'plan' }],
+        source: 'builtin',
+      },
+      { name: 'model', description: 'Show', aliases: ['models', 'model'], source: 'builtin' },
+      { name: 'hello', description: 'Greet', input: { hint: 'name' }, source: 'file' },
+      { name: 'skill:demo', source: 'skill' },
+      { name: 'compact' },
+      { description: 'nameless' },
+    ])
     expect(
-      mapOmpAvailableCommands([
-        { name: 'security', description: 'Scan', input: { hint: '<plan|scan>' }, subcommands: [{ name: 'plan' }] },
-        { name: 'compact' },
-        { description: 'nameless' },
-      ]),
+      catalog.commands
+        .filter((command) => command.dispatch !== 'prompt')
+        .map((command) => [command.name, command.dispatch]),
     ).toEqual([
-      { name: 'security', description: 'Scan', input: { hint: '<plan|scan>' } },
-      { name: 'compact', description: '' },
+      ['btw', 'side'],
+      ['new', 'immediate'],
+      ['clear', 'immediate'],
+      ['rewind', 'immediate'],
+    ])
+    // `goal` is one of the commands the transport serves, but it runs as a turn the host holds open: a `prompt` command.
+    expect(catalog.commands.filter((command) => command.dispatch === 'prompt').map((command) => command.name)).toEqual([
+      'goal',
+      'security',
+      'model',
+      'hello',
+      'skill:demo',
+      'compact',
+    ])
+    expect(catalog.commands.find((command) => command.name === 'security')).toEqual({
+      name: 'security',
+      description: 'Scan',
+      hint: '<plan|scan>',
+      dispatch: 'prompt',
+    })
+    expect(catalog.commands.find((command) => command.name === 'model')).toEqual({
+      name: 'model',
+      description: 'Show',
+      aliases: ['models'],
+      dispatch: 'prompt',
+    })
+    // Only commands omp resolves before its builtins can take a terminal-only name.
+    expect([...catalog.overrides].sort()).toEqual(['hello', 'skill:demo'])
+  })
+
+  it('serves btw, new, clear, rewind and goal unless a user command already owns the name', () => {
+    const catalog = buildOmpCommandCatalog([
+      { name: 'btw', description: 'omp handles it some day', source: 'builtin' },
+      { name: 'new', description: 'my extension', source: 'extension' },
+      { name: 'goal', description: 'my goal command', source: 'file' },
+    ])
+    expect(Object.fromEntries(catalog.commands.map((command) => [command.name, command.dispatch]))).toEqual({
+      btw: 'side',
+      clear: 'immediate',
+      rewind: 'immediate',
+      new: 'prompt',
+      goal: 'prompt',
+    })
+    expect(catalog.commands.find((command) => command.name === 'new')?.description).toBe('my extension')
+    expect(catalog.commands.find((command) => command.name === 'goal')?.description).toBe('my goal command')
+    expect(buildOmpCommandCatalog(undefined).commands.map((command) => command.name)).toEqual(['btw', 'new', 'clear', 'rewind', 'goal'])
+  })
+
+  it('treats a terminal-only builtin that omp now advertises as runnable, except the ones the transport serves', () => {
+    const catalog = buildOmpCommandCatalog([
+      { name: 'branch', aliases: ['fork'], description: 'Branch', source: 'builtin' },
+      { name: 'btw', description: 'Side question', source: 'builtin' },
+      { name: 'rewind', description: 'Rewind', source: 'builtin' },
+      { name: 'goal', description: 'Goal', source: 'builtin' },
+      { name: 'context', description: 'Usage', source: 'builtin' },
+    ])
+    expect([...catalog.overrides].sort()).toEqual(['branch', 'fork'])
+    // The transport's entries stay, and keep their dispatch.
+    expect(catalog.commands.filter((command) => ['btw', 'rewind', 'goal'].includes(command.name)).map((command) => [command.name, command.dispatch])).toEqual([
+      ['btw', 'side'],
+      ['rewind', 'immediate'],
+      ['goal', 'prompt'],
     ])
   })
 })
@@ -783,6 +924,99 @@ describe('OmpEventProjector', () => {
     ])
   })
 
+  it('strips terminal escapes from slash-command output', () => {
+    const projector = newProjector()
+    const colored = '\u001B[38;5;243m░░\u001B[39m 6%\n\u001B]8;;https://example.test\u0007link\u001B]8;;\u0007\u001B[2K'
+    expect(projector.project({ type: 'command_output', text: colored })).toEqual([
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '░░ 6%\nlink' }, messageId: 'uuid-1' },
+    ])
+    expect(projector.project({ type: 'command_output', text: '\u001B[0m' })).toEqual([])
+  })
+
+  it('surfaces vendor notices as one-line thoughts and keeps routine ones out', () => {
+    const cases: Array<[Json, string | undefined]> = [
+      [
+        { type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: '429 rate limited' },
+        'OMP retry 1/3 in 2000ms: 429 rate limited',
+      ],
+      [{ type: 'auto_retry_end', success: true, attempt: 1 }, undefined],
+      [
+        { type: 'auto_retry_end', success: false, attempt: 3, finalError: 'overloaded' },
+        'OMP retry failed: overloaded',
+      ],
+      [
+        { type: 'retry_fallback_applied', from: 'a/m1', to: 'b/m2', role: 'default', reason: '429' },
+        'OMP switched model a/m1 → b/m2 (429)',
+      ],
+      [
+        { type: 'retry_fallback_succeeded', model: 'b/m2', role: 'default' },
+        'OMP continued on the fallback model b/m2',
+      ],
+      [
+        { type: 'auto_compaction_start', reason: 'threshold', action: 'context-full' },
+        'OMP is compacting the context window',
+      ],
+      [
+        { type: 'auto_compaction_end', action: 'context-full', aborted: false, willRetry: false },
+        'OMP finished compacting the context window',
+      ],
+      [
+        { type: 'auto_compaction_end', action: 'context-full', aborted: false, willRetry: false, skipped: true },
+        undefined,
+      ],
+      [
+        { type: 'auto_compaction_end', action: 'context-full', aborted: true, willRetry: false },
+        'OMP context compaction was cancelled',
+      ],
+      [
+        {
+          type: 'auto_compaction_end',
+          action: 'context-full',
+          aborted: false,
+          willRetry: false,
+          errorMessage: 'too small',
+        },
+        'OMP context compaction failed: too small',
+      ],
+      [
+        { type: 'extension_error', extensionPath: '/x/ext.js', event: 'tool_call', error: 'boom' },
+        'OMP extension error (/x/ext.js / tool_call): boom',
+      ],
+      [{ type: 'notice', level: 'warning', message: 'careful', source: 'compaction' }, 'warning: careful'],
+      [{ type: 'notice', level: 'info', message: 'fyi' }, undefined],
+      [{ type: 'notice', level: 'error', message: 'Could not save /btw history', source: 'btw-history' }, undefined],
+      [
+        { type: 'extension_ui_request', id: 'u1', method: 'notify', message: 'picked beta', notifyType: 'info' },
+        'picked beta',
+      ],
+      [
+        { type: 'extension_ui_request', id: 'u2', method: 'notify', message: 'low disk', notifyType: 'warning' },
+        'warning: low disk',
+      ],
+      [
+        {
+          type: 'extension_ui_request',
+          id: 'u3',
+          method: 'open_url',
+          url: 'https://a.test/login',
+          launchUrl: 'https://a.test/go',
+          instructions: 'Sign in',
+        },
+        'OMP asks you to open https://a.test/go: Sign in',
+      ],
+      [{ type: 'extension_ui_request', id: 'u4', method: 'setStatus', statusKey: 'k', statusText: 'busy' }, undefined],
+    ]
+    for (const [frame, expected] of cases) {
+      const updates = newProjector().project(frame)
+      if (expected === undefined) expect(updates, JSON.stringify(frame)).toEqual([])
+      else {
+        expect(updates).toEqual([
+          { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: expected }, messageId: 'uuid-1' },
+        ])
+      }
+    }
+  })
+
   it('finds the open call an approval dialog is about', () => {
     const projector = newProjector()
     projector.project({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'bash', args: { command: 'ls' } })
@@ -887,6 +1121,389 @@ describe('OMP session files', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 1b. Goals and rewind: command lines, records, plans (the file system is injected, or a temp dir)
+// ---------------------------------------------------------------------------
+
+describe('createOmpConfigOverlay', () => {
+  it('writes the overlay that adds rpc to the goal continuation modes into a private directory of its own', async () => {
+    const root = await tempDir('omp-overlay-')
+    const first = await createOmpConfigOverlay(root)
+    const second = await createOmpConfigOverlay(root)
+    expect(dirname(first.file).startsWith(root)).toBe(true)
+    expect(dirname(first.file)).not.toBe(dirname(second.file))
+    const content = await readFile(first.file, 'utf8')
+    // omp reads this strictly (a YAML mapping), and `interactive` stays as in omp's own default.
+    expect(content).toMatch(/^goal:\n {2}continuationModes: \[(?=[^\]]*\binteractive\b)(?=[^\]]*\brpc\b)[^\]]*\]\n$/)
+    if (process.platform !== 'win32') {
+      expect((await stat(dirname(first.file))).mode & 0o777).toBe(0o700)
+      expect((await stat(first.file)).mode & 0o777).toBe(0o600)
+    }
+  })
+
+  it('creates the root when it is missing and removes only its own directory', async () => {
+    const root = join(await tempDir('omp-overlay-'), 'not', 'yet')
+    const overlay = await createOmpConfigOverlay(root)
+    const other = await createOmpConfigOverlay(root)
+    expect(existsSync(overlay.file)).toBe(true)
+    await overlay.remove()
+    expect(existsSync(dirname(overlay.file))).toBe(false)
+    expect(existsSync(other.file)).toBe(true)
+    // Removing twice is not an error.
+    await overlay.remove()
+  })
+})
+
+describe('parseGoalArgs', () => {
+  it("reads omp's own control words and takes anything else as the objective", () => {
+    expect(parseGoalArgs('')).toEqual({ action: 'show' })
+    expect(parseGoalArgs('  Status ')).toEqual({ action: 'show' })
+    expect(parseGoalArgs('CLEAR')).toEqual({ action: 'clear' })
+    expect(parseGoalArgs('drop')).toEqual({ action: 'clear' })
+    expect(parseGoalArgs('pause')).toEqual({ action: 'pause' })
+    expect(parseGoalArgs('Resume')).toEqual({ action: 'resume' })
+    expect(parseGoalArgs('make the tests pass')).toEqual({ action: 'set', objective: 'make the tests pass' })
+    expect(parseGoalArgs('set fix the build\nthen deploy')).toEqual({ action: 'set', objective: 'fix the build\nthen deploy' })
+  })
+
+  it('refuses a control word followed by more words instead of acting on it', () => {
+    // omp's terminal ignores the rest, which would pause the goal for "pause the deployment pipeline".
+    for (const line of ['pause the deployment pipeline', 'clear everything up', 'show me', 'resume work on x']) {
+      expect(parseGoalArgs(line), line).toMatchObject({ action: 'usage' })
+    }
+    expect(parseGoalArgs('set')).toMatchObject({ action: 'usage' })
+    expect(parseGoalArgs('budget 50k')).toMatchObject({ action: 'usage' })
+  })
+})
+
+describe('goal records and notes', () => {
+  const parsed = (extra: Json = {}): OmpGoal => {
+    const goal = parseOmpGoal({ id: 'g1', objective: 'ship it', status: 'active', tokensUsed: 10, timeUsedSeconds: 3, ...extra })
+    if (goal === undefined) throw new Error('the goal did not parse')
+    return goal
+  }
+
+  it('reads a goal of omp and rejects anything without an objective and a status', () => {
+    expect(parsed({ tokenBudget: 50_000 })).toMatchObject({ objective: 'ship it', status: 'active', tokenBudget: 50_000, tokensUsed: 10, timeUsedSeconds: 3 })
+    expect(parsed({ tokenBudget: 0, tokensUsed: -5 })).toMatchObject({ tokenBudget: undefined, tokensUsed: 0 })
+    expect(parseOmpGoal(null)).toBeUndefined()
+    expect(parseOmpGoal({ objective: 'x' })).toBeUndefined()
+  })
+
+  it('notes a new goal and a new status, never the token counters that move with every turn', () => {
+    const active = parsed()
+    expect(goalNote(undefined, active)).toContain('ship it')
+    expect(goalNote(active, parsed({ tokensUsed: 5_000, timeUsedSeconds: 90 }))).toBeUndefined()
+    expect(goalNote(active, parsed({ status: 'paused' }))).toContain('paused')
+    expect(goalNote(active, parsed({ status: 'complete' }))).toContain('complete')
+    expect(goalNote(active, parsed({ id: 'g2', objective: 'another' }))).toContain('another')
+    // A goal that was already finished when the session opened is no news; a goal that is gone is.
+    expect(goalNote(undefined, parsed({ status: 'complete' }))).toBeUndefined()
+    expect(goalNote(active, undefined)).toBeDefined()
+    expect(goalNote(undefined, undefined)).toBeUndefined()
+  })
+
+  it('keeps a long or multi-line objective to one line in a note and to a quotation in a reply', () => {
+    const long = parsed({ objective: `first line\n${'word '.repeat(80)}` })
+    const note = goalNote(undefined, long) ?? ''
+    expect(note).not.toContain('\n')
+    expect(note.length).toBeLessThan(260)
+    expect(formatGoal(long).split('\n').filter((line) => line.startsWith('> '))).toHaveLength(2)
+  })
+
+  it('shows what the goal used against its budget', () => {
+    expect(formatGoal(parsed({ tokenBudget: 50_000, tokensUsed: 12_345, timeUsedSeconds: 250 }))).toContain('12.3K / 50K tokens · 4m')
+  })
+
+  it('turns the refusals of omp into what the user can do about them', () => {
+    expect(goalFailure('Goal mode is disabled (goal.enabled).')).toContain('goal.enabled')
+    expect(goalFailure('A goal is already active. Drop it before creating another.')).toContain('/goal clear')
+    expect(goalFailure('Resume or drop the paused goal before creating another.')).toContain('/goal clear')
+    expect(goalFailure('something else')).toContain('something else')
+  })
+})
+
+const STAMP = '2026-10-28T10:00:00.000Z'
+
+/** The entries of a session as `get_entries` reports them. */
+const entryUser = (id: string, parentId: string | null, content: string | Json[] = id): Json => ({
+  type: 'message',
+  id,
+  parentId,
+  timestamp: STAMP,
+  message: { role: 'user', content: typeof content === 'string' ? [{ type: 'text', text: content }] : content },
+})
+const entryCall = (id: string, parentId: string, callId: string, name: string, args: Json = {}): Json => ({
+  type: 'message',
+  id,
+  parentId,
+  timestamp: STAMP,
+  message: { role: 'assistant', content: [{ type: 'toolCall', id: callId, name, arguments: args }] },
+})
+const entryResult = (id: string, parentId: string, callId: string, toolName: string, details: Json, isError = false): Json => ({
+  type: 'message',
+  id,
+  parentId,
+  timestamp: STAMP,
+  message: { role: 'toolResult', toolCallId: callId, toolName, content: [], details, isError },
+})
+
+describe('readRewindModel', () => {
+  it('lists the user messages on the path to the leaf, in order, and leaves other branches and empty messages out', () => {
+    const entries = [
+      { type: 'model_change', id: 'm0', parentId: null },
+      entryUser('u1', 'm0', 'first task'),
+      entryUser('u2', 'u1', 'second task'),
+      entryUser('side', 'u1', 'a branch that was left'),
+      entryUser('u3', 'u2', [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }]),
+      entryUser('u4', 'u3', 'fourth'),
+    ]
+    const labels = (leafId: string | null | undefined): string[][] =>
+      readRewindModel({ entries, leafId, cwd: '/w' }).checkpoints.map((checkpoint) => [checkpoint.entryId, checkpoint.label])
+    expect(labels('u4')).toEqual([['u1', 'first task'], ['u2', 'second task'], ['u4', 'fourth']])
+    expect(labels('side')).toEqual([['u1', 'first task'], ['side', 'a branch that was left']])
+    // An empty session has no leaf; a leaf the answer did not name is the newest entry.
+    expect(labels(null)).toEqual([])
+    expect(labels(undefined)).toEqual(labels('u4'))
+  })
+
+  it('records edits with the file before and after, the files of a multi-file edit, and skips failed ones', () => {
+    const entries = [
+      entryUser('u1', null, 'edit things'),
+      entryResult('r1', 'u1', 'c1', 'edit', { op: 'update', path: '/w/a.txt', oldText: 'a\n', newText: 'A\n' }),
+      entryResult('r2', 'r1', 'c2', 'edit', {
+        perFileResults: [
+          { op: 'update', path: 'b.txt', oldText: 'b', newText: 'B' },
+          { op: 'create', path: '/w/c.txt', newText: 'c' },
+          { op: 'delete', path: '/w/d.txt', oldText: 'd' },
+        ],
+      }),
+      entryResult('r3', 'r2', 'c3', 'edit', { op: 'update', path: '/w/e.txt', oldText: 'e', newText: 'E' }, true),
+    ]
+    expect(readRewindModel({ entries, leafId: 'r3', cwd: '/w' }).changes).toEqual([
+      { kind: 'set', index: 1, path: '/w/a.txt', before: 'a\n', after: 'A\n' },
+      { kind: 'set', index: 2, path: '/w/b.txt', before: 'b', after: 'B' },
+      { kind: 'set', index: 2, path: '/w/c.txt', before: null, after: 'c' },
+      { kind: 'set', index: 2, path: '/w/d.txt', before: 'd', after: null },
+    ])
+  })
+
+  it('marks the changes the records cannot reverse, and ignores what is not a file of the workspace', () => {
+    const entries = [
+      entryUser('u1', null, 'go'),
+      entryCall('a1', 'u1', 'w1', 'write', { path: 'notes.md' }),
+      entryResult('r1', 'a1', 'w1', 'write', { resolvedPath: '/w/notes.md' }),
+      entryCall('a2', 'r1', 'w2', 'write', { path: 'xd://resolve' }),
+      entryResult('r2', 'a2', 'w2', 'write', { resolvedPath: '/w/xd:/resolve' }),
+      entryResult('r3', 'r2', 'c3', 'edit', { op: 'update', path: '/w/new.txt', move: '/w/moved.txt', sourcePath: '/w/old.txt' }),
+      entryResult('r4', 'r3', 'c4', 'ast_edit', { applied: true, files: ['code.ts'] }),
+      entryResult('r5', 'r4', 'c5', 'ast_edit', { applied: false, files: ['staged.ts'] }),
+      entryResult('r6', 'r5', 'c6', 'edit', { op: 'update', path: '/w/big.txt', snapshotsPruned: true }),
+    ]
+    const { changes } = readRewindModel({ entries, leafId: 'r6', cwd: '/w' })
+    expect(changes.every((change) => change.kind === 'opaque')).toBe(true)
+    expect(changes.map((change) => change.path).sort()).toEqual(
+      ['/w/big.txt', '/w/code.ts', '/w/moved.txt', '/w/new.txt', '/w/notes.md', '/w/old.txt'],
+    )
+  })
+
+  it('counts the calls whose effects on files omp does not record', () => {
+    const entries = [
+      entryUser('u1', null, 'go'),
+      entryResult('r1', 'u1', 'c1', 'bash', {}),
+      { type: 'message', id: 'b1', parentId: 'r1', message: { role: 'bashExecution', command: 'ls' } },
+      entryResult('r2', 'b1', 'c2', 'mcp__docs__fetch', {}),
+      entryResult('r3', 'r2', 'c3', 'read', {}),
+    ]
+    expect(readRewindModel({ entries, leafId: 'r3', cwd: '/w' }).unrecorded).toEqual([
+      { index: 1, tool: 'bash' },
+      { index: 2, tool: 'bash' },
+      { index: 3, tool: 'mcp__docs__fetch' },
+    ])
+  })
+})
+
+describe('findCheckpoint and parseRewindArgs', () => {
+  const checkpoints: OmpCheckpoint[] = ['first', 'second', 'third'].map((entryId, index) => ({ entryId, label: entryId, at: STAMP, index }))
+
+  it('finds a message by its number in the list, with or without the hash, and nothing else', () => {
+    expect(findCheckpoint(checkpoints, '2')).toMatchObject({ position: 2, checkpoint: { entryId: 'second' } })
+    expect(findCheckpoint(checkpoints, ' #3 ')).toMatchObject({ position: 3, checkpoint: { entryId: 'third' } })
+    for (const reference of ['0', '4', 'second', '2x', '-1', '']) {
+      expect(findCheckpoint(checkpoints, reference), reference).toHaveProperty('error')
+    }
+  })
+
+  it('reads the number, the half to roll back and the confirmation in any order after the number', () => {
+    expect(parseRewindArgs('')).toEqual({ action: 'list' })
+    expect(parseRewindArgs('3')).toEqual({ action: 'preview', reference: '3', mode: 'both' })
+    expect(parseRewindArgs('3 confirm')).toEqual({ action: 'apply', reference: '3', mode: 'both' })
+    expect(parseRewindArgs('3 code confirm')).toEqual({ action: 'apply', reference: '3', mode: 'code' })
+    expect(parseRewindArgs('3 CONFIRM chat')).toEqual({ action: 'apply', reference: '3', mode: 'chat' })
+    expect(parseRewindArgs('3 chat')).toEqual({ action: 'preview', reference: '3', mode: 'chat' })
+    for (const line of ['confirm', 'code 3', '3 code chat', '3 bogus']) {
+      expect(parseRewindArgs(line), line).toMatchObject({ action: 'usage' })
+    }
+  })
+})
+
+/** A file system in memory; a file the test did not put there is absent. */
+function memoryIo(initial: Record<string, DiskFile>): RestoreIo & { readonly disk: Map<string, DiskFile> } {
+  const disk = new Map(Object.entries(initial))
+  return {
+    disk,
+    read: async (path) => disk.get(path) ?? { kind: 'absent' },
+    write: async (path, content) => {
+      disk.set(path, { kind: 'text', content })
+    },
+    remove: async (path) => {
+      disk.set(path, { kind: 'absent' })
+    },
+  }
+}
+const textFile = (content: string): DiskFile => ({ kind: 'text', content })
+const setChange = (index: number, path: string, before: string | null, after: string | null): OmpFileChange => ({ kind: 'set', index, path, before, after })
+
+describe('planRestore', () => {
+  it('undoes the edits of a file newest first, checking each step against the state the previous one left', async () => {
+    const io = memoryIo({ '/w/a.txt': textFile('three\n') })
+    const plan = await planRestore([setChange(1, '/w/a.txt', 'one\n', 'two\n'), setChange(2, '/w/a.txt', 'two\n', 'three\n')], io)
+    expect(plan.conflicts).toEqual([])
+    expect(plan.files).toEqual([{ path: '/w/a.txt', action: 'write', content: 'one\n', insertions: 1, deletions: 1 }])
+  })
+
+  it('deletes a file the agent created and brings back one it deleted', async () => {
+    const io = memoryIo({ '/w/new.txt': textFile('made\n') })
+    const plan = await planRestore([setChange(1, '/w/new.txt', null, 'made\n'), setChange(1, '/w/gone.txt', 'was here\n', null)], io)
+    expect(plan.files.map((file) => [file.path, file.action, file.content])).toEqual([
+      ['/w/gone.txt', 'create', 'was here\n'],
+      ['/w/new.txt', 'delete', undefined],
+    ])
+  })
+
+  it('leaves a file alone that something else changed after the agent did', async () => {
+    const io = memoryIo({ '/w/a.txt': textFile('edited by hand\n') })
+    const plan = await planRestore([setChange(1, '/w/a.txt', 'one\n', 'two\n')], io)
+    expect(plan.files).toEqual([])
+    expect(plan.conflicts.map((conflict) => conflict.path)).toEqual(['/w/a.txt'])
+  })
+
+  it('refuses a chain with a gap: something changed the file between two of the agent edits', async () => {
+    const io = memoryIo({ '/w/a.txt': textFile('C\n') })
+    const plan = await planRestore([setChange(1, '/w/a.txt', 'A\n', 'B\n'), setChange(2, '/w/a.txt', 'B2\n', 'C\n')], io)
+    expect(plan.files).toEqual([])
+    expect(plan.conflicts.map((conflict) => conflict.path)).toEqual(['/w/a.txt'])
+  })
+
+  it('reports a file that is already as it was, and plans nothing for it', async () => {
+    const io = memoryIo({ '/w/a.txt': textFile('one\n') })
+    const plan = await planRestore([setChange(1, '/w/a.txt', 'one\n', 'two\n')], io)
+    expect(plan).toEqual({ files: [], unchanged: ['/w/a.txt'], conflicts: [] })
+  })
+
+  it('never plans a file with a change nothing can reverse, nor one it cannot read', async () => {
+    const io = memoryIo({ '/w/a.txt': textFile('x'), '/w/bin': { kind: 'unreadable', reason: 'is a binary file' } })
+    const plan = await planRestore(
+      [
+        { kind: 'opaque', index: 1, path: '/w/a.txt', reason: 'was written with `write`' },
+        setChange(1, '/w/bin', 'b', 'c'),
+      ],
+      io,
+    )
+    expect(plan.files).toEqual([])
+    expect(plan.conflicts).toEqual([
+      { path: '/w/a.txt', reason: 'was written with `write`' },
+      { path: '/w/bin', reason: 'is a binary file' },
+    ])
+  })
+})
+
+describe('applyRestore', () => {
+  it('carries out the plan and reports a file it cannot write without stopping the others', async () => {
+    const io = memoryIo({ '/w/a.txt': textFile('x'), '/w/b.txt': textFile('y') })
+    const failing: RestoreIo = {
+      read: io.read,
+      remove: io.remove,
+      write: async (path, content) => {
+        if (path === '/w/a.txt') throw new Error('EACCES')
+        await io.write(path, content)
+      },
+    }
+    const plan = await planRestore([setChange(1, '/w/a.txt', 'x0', 'x'), setChange(1, '/w/b.txt', null, 'y')], failing)
+    const result = await applyRestore(plan, failing)
+    expect(result.restored.map((file) => file.path)).toEqual(['/w/b.txt'])
+    expect(result.failed).toEqual([{ path: '/w/a.txt', reason: expect.stringContaining('EACCES') }])
+    expect(io.disk.get('/w/b.txt')).toEqual({ kind: 'absent' })
+    expect(io.disk.get('/w/a.txt')).toEqual(textFile('x'))
+  })
+})
+
+describe('nodeRestoreIo', () => {
+  it('reads text and absent files, and never touches binary files, links or anything outside its roots', async () => {
+    const root = await tempDir('omp-restore-')
+    const outside = await tempDir('omp-outside-')
+    await writeFile(join(root, 'a.txt'), 'hello\n')
+    await writeFile(join(root, 'bin.dat'), Buffer.from([1, 0, 2]))
+    await writeFile(join(root, 'latin.txt'), Buffer.from([0xff, 0xfe, 0x41]))
+    await writeFile(join(outside, 'secret.txt'), 'secret\n')
+    await symlink(join(outside, 'secret.txt'), join(root, 'link.txt'))
+    await symlink(outside, join(root, 'dir-link'))
+    await mkdir(join(root, 'sub'))
+    const io = nodeRestoreIo([root])
+    expect(await io.read(join(root, 'a.txt'))).toEqual({ kind: 'text', content: 'hello\n' })
+    expect(await io.read(join(root, 'missing.txt'))).toEqual({ kind: 'absent' })
+    for (const refused of [join(root, 'bin.dat'), join(root, 'latin.txt'), join(root, 'sub'), join(root, 'link.txt')]) {
+      expect(await io.read(refused), basename(refused)).toMatchObject({ kind: 'unreadable' })
+    }
+    // Outside the roots: by its own name, through a linked directory, and as a relative path.
+    for (const escaped of [join(outside, 'secret.txt'), join(root, 'dir-link', 'secret.txt'), 'relative.txt']) {
+      expect(await io.read(escaped), escaped).toMatchObject({ kind: 'unreadable' })
+    }
+  })
+
+  it('writes through missing directories and removes files', async () => {
+    const root = await tempDir('omp-restore-')
+    const io = nodeRestoreIo([root])
+    const file = join(root, 'deep', 'er', 'f.txt')
+    await io.write(file, 'x')
+    expect(await readFile(file, 'utf8')).toBe('x')
+    await io.remove(file)
+    expect(existsSync(file)).toBe(false)
+  })
+})
+
+describe('rewind rendering', () => {
+  const checkpoint = (position: number): OmpCheckpoint => ({ entryId: `e${position}`, label: `message ${position} | with a pipe`, at: STAMP, index: position })
+
+  it('lists the last twenty messages with their number in the whole conversation and keeps a pipe from breaking the table', () => {
+    const rows = renderCheckpoints(Array.from({ length: 25 }, (_, index) => checkpoint(index + 1)))
+      .split('\n')
+      .filter((line) => /^\| \d+ \|/.test(line))
+    expect(rows).toHaveLength(20)
+    expect(rows[0]).toMatch(/^\| 6 \|/)
+    expect(rows.at(-1)).toMatch(/^\| 25 \|/)
+    expect(rows[0]).toContain('\\|')
+  })
+
+  it('previews the conversation, the files or both, and never speaks of a half it was not asked about', () => {
+    const point = { checkpoint: checkpoint(3), position: 3, total: 5, display: (path: string) => path, unrecorded: 2 }
+    const plan = {
+      files: [{ path: 'a.txt', action: 'write' as const, content: 'x', insertions: 2, deletions: 1 }],
+      unchanged: [],
+      conflicts: [{ path: 'b.txt', reason: 'is a binary file' }],
+    }
+    const both = renderRewindPreview({ ...point, mode: 'both', plan })
+    expect(both).toContain('**Conversation:**')
+    expect(both).toContain('`a.txt`')
+    expect(both).toContain('`b.txt`')
+    expect(both).toContain('`/rewind 3 confirm`')
+    const chat = renderRewindPreview({ ...point, mode: 'chat', plan: undefined })
+    expect(chat).toContain('**Conversation:**')
+    expect(chat).not.toContain('**Files:**')
+    expect(renderRewindPreview({ ...point, mode: 'code', plan })).not.toContain('**Conversation:**')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 2. The transport against a scripted `omp --mode rpc-ui`
 // ---------------------------------------------------------------------------
 
@@ -900,6 +1517,23 @@ interface FakeState {
   contextTokens: number
   contextWindow: number
   cost: number
+  /** `get_state` reports these when set; an omp without `/fast` and `/slow` leaves them out. */
+  fastModeEnabled?: boolean
+  slowModeSupported?: boolean
+  slowModeEnabled?: boolean
+  /** The goal of the session (`goal` rpc, `get_state.goal`) as omp's `Goal`; `null` or absent for none. */
+  goal?: Json | null
+  /** Goal mode is off in the configuration: `goal create` and `goal resume` refuse. */
+  goalDisabled?: boolean
+  /** `get_state.isSettled`: false while omp runs, or is about to run, something by itself. Settled when absent. */
+  settled?: boolean
+  /** Runs while `get_state` is answered: the frames a test wants in the stream just before the response. */
+  onGetState?: (() => void) | undefined
+  /** `get_entries`: the session as omp recorded it, root first; `branch` cuts it before the message. */
+  entries?: Json[]
+  leafId?: string | null
+  /** Runs when `branch` is asked, before it changes anything: what the test wants to see of the world at that moment. */
+  onBranch?: () => void
 }
 
 const fakeModel = (info: OmpModelInfo): Json => ({
@@ -911,6 +1545,9 @@ const fakeModel = (info: OmpModelInfo): Json => ({
 })
 
 class FakeRpcError extends Error {}
+
+/** Returned by a handler override that leaves the request open; the test answers later with `FakeOmp.respond`. */
+const NO_RESPONSE = Symbol('no response')
 
 /** In-process stand-in for `omp --mode rpc-ui`: JSONL commands in, responses and events out. */
 class FakeOmp {
@@ -996,6 +1633,11 @@ class FakeOmp {
     return this.commands.filter((command) => command.type === type)
   }
 
+  /** Answer a request an override left open. */
+  respond(id: unknown, command: string, data?: unknown): void {
+    this.emit({ id, type: 'response', command, success: true, ...(data === undefined ? {} : { data }) })
+  }
+
   private read(chunk: string): void {
     this.buffer += chunk
     let newline = this.buffer.indexOf('\n')
@@ -1025,6 +1667,7 @@ class FakeOmp {
       })
       return
     }
+    if (data === NO_RESPONSE) return
     this.emit({
       id: command.id,
       type: 'response',
@@ -1032,6 +1675,56 @@ class FakeOmp {
       success: true,
       ...(data === undefined ? {} : { data }),
     })
+  }
+
+  /** `goal`: omp's `RpcGoalController`, errors included; every change is announced with `goal_updated` before the response. */
+  private goalCommand(command: Json): unknown {
+    const state = this.state
+    const current = state.goal ?? null
+    const reply = (goal: Json | null): unknown => ({
+      goal,
+      state: goal === null ? null : { enabled: goal.status === 'active', mode: 'active', goal },
+    })
+    const refuseWhenDisabled = (): void => {
+      if (state.goalDisabled === true) throw new FakeRpcError('Goal mode is disabled (goal.enabled).')
+    }
+    switch (String(command.op)) {
+      case 'get':
+        return reply(current)
+      case 'create': {
+        refuseWhenDisabled()
+        const objective = typeof command.objective === 'string' ? command.objective.trim() : ''
+        if (objective.length === 0) throw new FakeRpcError('objective is required when op=create')
+        if (current?.status === 'active') throw new FakeRpcError('A goal is already active. Drop it before creating another.')
+        if (current?.status === 'paused') throw new FakeRpcError('Resume or drop the paused goal before creating another.')
+        const goal = { id: 'goal-1', objective, status: 'active', tokensUsed: 0, timeUsedSeconds: 0 }
+        state.goal = goal
+        this.emit({ type: 'goal_updated', goal })
+        return reply(goal)
+      }
+      case 'pause': {
+        if (current === null) return reply(null)
+        const goal = { ...current, status: current.status === 'active' ? 'paused' : current.status }
+        state.goal = goal
+        this.emit({ type: 'goal_updated', goal })
+        return reply(goal)
+      }
+      case 'resume': {
+        refuseWhenDisabled()
+        if (current?.status !== 'paused') throw new FakeRpcError('No paused goal to resume.')
+        const goal = { ...current, status: 'active' }
+        state.goal = goal
+        this.emit({ type: 'goal_updated', goal })
+        return reply(goal)
+      }
+      case 'drop': {
+        if (current !== null) this.emit({ type: 'goal_updated', goal: { ...current, status: 'dropped' } })
+        state.goal = null
+        return reply(null)
+      }
+      default:
+        throw new FakeRpcError(`Unknown goal op: ${String(command.op)}`)
+    }
   }
 
   private nextSession(): void {
@@ -1062,13 +1755,25 @@ class FakeOmp {
           },
         })
       case 'get_state':
-        return () => ({
-          model: state.model,
-          thinkingLevel: state.thinkingLevel,
-          sessionId: state.sessionId,
-          sessionFile: state.sessionFile,
-          isStreaming: false,
-        })
+        return () => {
+          state.onGetState?.()
+          return {
+            model: state.model,
+            thinkingLevel: state.thinkingLevel,
+            sessionId: state.sessionId,
+            sessionFile: state.sessionFile,
+            isStreaming: false,
+            isSettled: state.settled ?? true,
+            goal:
+              state.goal === undefined || state.goal === null
+                ? null
+                : { enabled: state.goal.status === 'active', mode: 'active', goal: state.goal },
+            ...(state.fastModeEnabled === undefined ? {} : { fastModeEnabled: state.fastModeEnabled }),
+            ...(state.slowModeSupported === undefined
+              ? {}
+              : { slowModeSupported: state.slowModeSupported, slowModeEnabled: state.slowModeEnabled ?? false }),
+          }
+        }
       case 'get_available_thinking_levels':
         return () => ({ levels: state.thinkingLevels })
       case 'get_available_models':
@@ -1117,6 +1822,35 @@ class FakeOmp {
             this.emit({ type: 'thinking_level_changed', thinkingLevel: level })
           }
           return undefined
+        }
+      case 'set_fast_mode':
+        return (command) => {
+          state.fastModeEnabled = command.enabled === true
+          return { enabled: state.fastModeEnabled, active: state.fastModeEnabled }
+        }
+      case 'set_slow_mode':
+        return (command) => {
+          state.slowModeEnabled = command.enabled === true
+          return { enabled: state.slowModeEnabled }
+        }
+      case 'goal':
+        return (command) => this.goalCommand(command)
+      case 'get_entries':
+        return () => ({ entries: state.entries ?? [], leafId: state.leafId ?? null })
+      case 'branch':
+        return (command) => {
+          state.onBranch?.()
+          const entries = state.entries ?? []
+          const index = entries.findIndex((entry) => entry.id === command.entryId)
+          const target = entries[index]
+          if (target === undefined || target.type !== 'message' || fieldOf(target.message, 'role') !== 'user') {
+            throw new FakeRpcError('Invalid entry ID for branching')
+          }
+          // The branch is a session of its own that holds everything before the message.
+          state.entries = entries.slice(0, index)
+          state.leafId = entries[index - 1] === undefined ? null : String(entries[index - 1]?.id)
+          this.nextSession()
+          return { text: 'the message', cancelled: false }
         }
       case 'remove_queued_message':
         return () => ({ removed: false })
@@ -1168,13 +1902,31 @@ interface Harness {
   readonly transport: OmpNativeTransport
   readonly root: string
   decide: (request: NativePermissionRequest, signal?: AbortSignal) => Promise<NativePermissionDecision>
+  readonly elicitations: NativeElicitationRequest[]
+  answer: NativeElicitationHandler
   start: (session?: NativeSessionTarget, argv?: readonly string[]) => Promise<void>
   updates: () => Array<Extract<NativeTransportEvent, { kind: 'update' }>['update']>
 }
 
 const text = (value: string): NativeContentBlock[] => [{ type: 'text', text: value }]
 
-async function harness(options: { fakeOptions?: { sendReady?: boolean }; transport?: ConstructorParameters<typeof OmpNativeTransport>[0] } = {}): Promise<Harness> {
+/** An overlay root the transport cannot create (below a regular file): it then runs without the overlay. */
+async function blockedOverlayRoot(): Promise<string> {
+  const dir = await tempDir('omp-overlay-blocked-')
+  await writeFile(join(dir, 'file'), 'not a directory')
+  return join(dir, 'file', 'overlays')
+}
+
+async function harness(
+  options: {
+    fakeOptions?: { sendReady?: boolean }
+    transport?: ConstructorParameters<typeof OmpNativeTransport>[0]
+    /** Give the transport a question surface (`onElicitation`). */
+    questions?: boolean
+    /** The session directory the transport is started in (default: a path that does not exist). */
+    cwd?: string
+  } = {},
+): Promise<Harness> {
   const root = await tempDir('omp-fake-')
   const bucket = join(root, 'agent', 'sessions', '-work-here')
   await mkdir(bucket, { recursive: true })
@@ -1182,7 +1934,13 @@ async function harness(options: { fakeOptions?: { sendReady?: boolean }; transpo
   const calls: SpawnCall[] = []
   const events: NativeTransportEvent[] = []
   const permissions: NativePermissionRequest[] = []
-  const transport = new OmpNativeTransport({ contextPollIntervalMs: 60_000, ...options.transport })
+  const elicitations: NativeElicitationRequest[] = []
+  // Every transport keeps its overlay below the test's own root, so nothing is left in the system temp directory.
+  const transport = new OmpNativeTransport({
+    contextPollIntervalMs: 60_000,
+    overlayRoot: join(root, 'overlays'),
+    ...options.transport,
+  })
   const built: Harness = {
     fake,
     calls,
@@ -1195,15 +1953,25 @@ async function harness(options: { fakeOptions?: { sendReady?: boolean }; transpo
       const approve = request.options.find((option) => option.kind === 'allow_once')
       return approve === undefined ? { cancelled: true } : { optionId: approve.optionId }
     },
+    elicitations,
+    answer: async () => ({ action: 'cancel' }),
     start: (session = { kind: 'new' }, argv = ['/bin/omp', 'acp', '-e', '/x/link.js']) =>
       transport.start({
         argv,
         env: { PI_CODING_AGENT_DIR: join(root, 'agent'), HOME: '/home/u' },
-        cwd: '/work/here',
+        cwd: options.cwd ?? '/work/here',
         spawn: fakeSpawn(fake, calls),
         session,
         onEvent: (event) => events.push(event),
         onPermission: (request, signal) => built.decide(request, signal),
+        ...(options.questions === true
+          ? {
+              onElicitation: (request: NativeElicitationRequest, signal?: AbortSignal) => {
+                built.elicitations.push(request)
+                return built.answer(request, signal)
+              },
+            }
+          : {}),
       }),
     updates: () =>
       events.flatMap((event) => (event.kind === 'update' ? [event.update] : [])),
@@ -1296,6 +2064,50 @@ const USAGE_ONE = {
 }
 const USAGE_TWO = { input: 3, output: 5, cacheRead: 9075, cacheWrite: 103, totalTokens: 9186, cost: { total: 0.0012 } }
 
+/** Resolve after `ms`: lets scripted frames reach the transport, or lets a timer that must not fire run out. */
+function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>()
+  setTimeout(resolve, ms)
+  return promise
+}
+
+/** The reply text the host received so far. */
+function messageText(h: Harness): string {
+  return h
+    .updates()
+    .flatMap((update) =>
+      update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text' ? [update.content.text] : [],
+    )
+    .join('')
+}
+
+/** The one-line notes the host received as thoughts. */
+function thoughtLines(h: Harness): string[] {
+  return h
+    .updates()
+    .flatMap((update) =>
+      update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text' ? [update.content.text] : [],
+    )
+}
+
+const textDelta = (delta: string): Json =>
+  assistantFrame('message_update', { assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta } })
+
+/** A run the test owns: the prompt is sent and omp reports the agent as started. */
+async function openTurn(
+  h: Harness,
+  signal: AbortSignal = new AbortController().signal,
+): Promise<{ turn: Promise<NativePromptResult>; promptId: string }> {
+  h.fake.override('prompt', () => {
+    h.fake.emit({ type: 'agent_start' })
+    return undefined
+  })
+  const turn = h.transport.prompt(text('long task'), signal)
+  turn.catch(() => undefined)
+  await waitFor(() => h.fake.commandsOfType('prompt').length === 1, 2_000, 'prompt')
+  return { turn, promptId: String(h.fake.commandsOfType('prompt')[0]?.id) }
+}
+
 describe('OmpNativeTransport against a scripted rpc-ui process', () => {
   const transports: OmpNativeTransport[] = []
   afterEach(async () => {
@@ -1311,7 +2123,10 @@ describe('OmpNativeTransport against a scripted rpc-ui process', () => {
     const h = await create()
     await h.start()
     const main = h.calls.find((call) => !call.argv.includes('--version'))
-    expect(main?.argv).toEqual(['/bin/omp', '-e', '/x/link.js', '--mode', 'rpc-ui', '--auto-approve'])
+    expect(main?.argv.slice(0, -2)).toEqual(['/bin/omp', '-e', '/x/link.js', '--mode', 'rpc-ui', '--auto-approve'])
+    // The last two arguments are the config overlay that lets goals continue over rpc.
+    expect(main?.argv.at(-2)).toBe('--config')
+    expect(main?.argv.at(-1)?.startsWith(join(h.root, 'overlays'))).toBe(true)
     expect(main?.cwd).toBe('/work/here')
     expect(main?.env).toEqual({ PI_CODING_AGENT_DIR: join(h.root, 'agent'), HOME: '/home/u' })
     const probe = h.calls.find((call) => call.argv.includes('--version'))
@@ -1361,14 +2176,54 @@ describe('OmpNativeTransport against a scripted rpc-ui process', () => {
     ])
   })
 
-  it('forwards OMP command catalogue frames as available_commands_update', async () => {
-    const h = await create()
-    await h.start()
-    h.fake.emit({ type: 'available_commands_update', commands: [{ name: 'compact', description: 'Compact', input: { hint: '[focus]' } }] })
-    await waitFor(() => h.updates().some((update) => update.sessionUpdate === 'available_commands_update'), 2_000, 'commands')
-    expect(h.updates().find((update) => update.sessionUpdate === 'available_commands_update')).toEqual({
-      sessionUpdate: 'available_commands_update',
-      availableCommands: [{ name: 'compact', description: 'Compact', input: { hint: '[focus]' } }],
+  describe('command catalogue', () => {
+    it('reports the static table until omp sends its catalogue, then the classified live list', async () => {
+      const h = await create()
+      await h.start()
+      const before = h.transport.commands()
+      expect(before.find((command) => command.name === 'btw')?.dispatch).toBe('side')
+      expect(before.filter((command) => command.dispatch === 'prompt').length).toBeGreaterThan(10)
+      h.fake.emit({ type: 'available_commands_update' })
+      h.fake.emit({
+        type: 'available_commands_update',
+        commands: [
+          { name: 'compact', description: 'Compact', input: { hint: '[focus]' }, source: 'builtin' },
+          { name: 'hello', description: 'Greet', source: 'file' },
+        ],
+      })
+      await waitFor(() => h.events.some((event) => event.kind === 'commands'), 2_000, 'commands event')
+      expect(h.transport.commands().map((command) => [command.name, command.dispatch])).toEqual([
+        ['btw', 'side'],
+        ['new', 'immediate'],
+        ['clear', 'immediate'],
+        ['rewind', 'immediate'],
+        ['goal', 'prompt'],
+        ['compact', 'prompt'],
+        ['hello', 'prompt'],
+      ])
+      // A frame without a command list is not a catalogue; the real one is the only event, and no ACP update.
+      expect(h.events.filter((event) => event.kind === 'commands')).toEqual([
+        { kind: 'commands', commands: h.transport.commands() },
+      ])
+      expect(h.updates().some((update) => update.sessionUpdate === 'available_commands_update')).toBe(false)
+    })
+
+    it('reports a changed catalogue and stays quiet about an identical one', async () => {
+      const h = await create()
+      await h.start()
+      const first = [{ name: 'compact', description: 'Compact', source: 'builtin' }]
+      h.fake.emit({ type: 'available_commands_update', commands: first })
+      h.fake.emit({ type: 'available_commands_update', commands: first })
+      h.fake.emit({ type: 'available_commands_update', commands: [...first, { name: 'review', source: 'custom' }] })
+      await waitFor(() => h.events.filter((event) => event.kind === 'commands').length >= 2, 2_000, 'second catalogue')
+      await sleep(20)
+      const reported = h.events.flatMap((event) =>
+        event.kind === 'commands' ? [event.commands.map((command) => command.name)] : [],
+      )
+      expect(reported).toEqual([
+        ['btw', 'new', 'clear', 'rewind', 'goal', 'compact'],
+        ['btw', 'new', 'clear', 'rewind', 'goal', 'compact', 'review'],
+      ])
     })
   })
 
@@ -1610,7 +2465,7 @@ describe('OmpNativeTransport against a scripted rpc-ui process', () => {
       })
       expect(h.fake.commandsOfType('prompt')[0]).toMatchObject({ message: 'run it' })
 
-      const updates = h.updates().filter((update) => update.sessionUpdate !== 'available_commands_update')
+      const updates = h.updates()
       const names = updates.map((update) => update.sessionUpdate)
       expect(names).toEqual([
         'agent_thought_chunk',
@@ -2033,7 +2888,7 @@ describe('OmpNativeTransport against a scripted rpc-ui process', () => {
         signal = requestSignal
         return pending.promise
       }
-      h.fake.emit({ type: 'extension_ui_request', id: 'dlg-2', method: 'select', title: 'Pick one', options: ['A', 'B'] })
+      h.fake.emit({ type: 'extension_ui_request', id: 'dlg-2', method: 'select', title: 'Allow tool: bash', options: ['A', 'B'] })
       await waitFor(() => signal !== undefined, 2_000, 'host prompt')
       h.fake.emit({ type: 'extension_ui_request', id: 'cancel-1', method: 'cancel', targetId: 'dlg-2' })
       await waitFor(() => signal?.aborted === true, 2_000, 'withdrawal')
@@ -2042,16 +2897,1829 @@ describe('OmpNativeTransport against a scripted rpc-ui process', () => {
       expect(h.fake.commands.some((command) => command.type === 'extension_ui_response')).toBe(false)
     })
 
-    it('dismisses dialogs the host has no surface for and ignores UI chatter', async () => {
+    it('ignores UI chatter that needs no reply', async () => {
       const h = await create()
       await h.start()
-      h.fake.emit({ type: 'extension_ui_request', id: 'c1', method: 'confirm', title: 'Sure?', message: 'm' })
       h.fake.emit({ type: 'extension_ui_request', id: 'n1', method: 'notify', message: 'hello' })
       h.fake.emit({ type: 'extension_ui_request', id: 'w1', method: 'setWidget', widgetKey: 'k' })
-      await waitFor(() => h.fake.commands.some((command) => command.type === 'extension_ui_response'), 2_000, 'confirm dismissal')
-      expect(h.fake.commands.filter((command) => command.type === 'extension_ui_response')).toEqual([
-        { type: 'extension_ui_response', id: 'c1', cancelled: true },
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(h.fake.commands.some((command) => command.type === 'extension_ui_response')).toBe(false)
+    })
+  })
+
+  describe('questions', () => {
+    const responsesOf = (h: Harness): Json[] => h.fake.commands.filter((command) => command.type === 'extension_ui_response')
+
+    /** Emit one `extension_ui_request` frame and wait for the transport's answer to it. */
+    async function ask(h: Harness, frame: Json): Promise<Json> {
+      h.fake.emit({ type: 'extension_ui_request', ...frame })
+      await waitFor(() => responsesOf(h).some((response) => response.id === frame.id), 2_000, `answer to ${String(frame.id)}`)
+      return jsonObject(responsesOf(h).find((response) => response.id === frame.id))
+    }
+
+    const SINGLE: Json = {
+      id: 'q1',
+      question: 'Which database?',
+      header: ' Storage ',
+      options: [
+        { label: 'Postgres', description: ' Relational ' },
+        { label: 'SQLite' },
+      ],
+      recommended: 1,
+    }
+    const MULTI: Json = {
+      id: 'q2',
+      question: 'Which checks?',
+      multi: true,
+      options: [{ label: 'lint' }, { label: 'unit' }, { label: 'e2e' }],
+    }
+
+    it('sends set_ask_dialog once during start when the host has a question surface, and never without one', async () => {
+      const withSurface = await create({ questions: true })
+      await withSurface.start()
+      const types = withSurface.fake.commands.map((command) => command.type)
+      expect(types.filter((type) => type === 'set_ask_dialog')).toHaveLength(1)
+      expect(withSurface.fake.commandsOfType('set_ask_dialog')[0]).toMatchObject({ enabled: true })
+      expect(types.indexOf('set_ask_dialog')).toBeGreaterThan(types.indexOf('set_event_filter'))
+      expect(types.indexOf('set_ask_dialog')).toBeLessThan(types.indexOf('new_session'))
+
+      const without = await create()
+      await without.start()
+      expect(without.fake.commands.some((command) => command.type === 'set_ask_dialog')).toBe(false)
+    })
+
+    it('starts anyway when OMP rejects set_ask_dialog', async () => {
+      const logs: string[] = []
+      const h = await create({ questions: true })
+      h.fake.override('set_ask_dialog', () => {
+        throw new FakeRpcError('Unknown command: set_ask_dialog')
+      })
+      await h.transport.start({
+        argv: ['/bin/omp', 'acp'],
+        env: { PI_CODING_AGENT_DIR: join(h.root, 'agent'), HOME: '/home/u' },
+        cwd: '/work/here',
+        spawn: fakeSpawn(h.fake, h.calls),
+        session: { kind: 'new' },
+        onEvent: () => undefined,
+        onPermission: async () => ({ cancelled: true }),
+        onElicitation: async () => ({ action: 'cancel' }),
+        log: (message) => logs.push(message),
+      })
+      expect(h.transport.sessionId).toBe('fake-session-1')
+      expect(logs.some((message) => message.includes('set_ask_dialog was rejected'))).toBe(true)
+    })
+
+    it('puts a single-select ask to the host as omp acp does: options, recommended default, header, free-text companion', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'cancel' })
+      await ask(h, { id: 'a1', method: 'ask', questions: [SINGLE] })
+      expect(h.elicitations).toEqual([
+        {
+          message: 'Which database?',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              q0: {
+                type: 'string',
+                title: 'Which database?',
+                description: 'Storage',
+                oneOf: [
+                  { const: 'Postgres', title: 'Postgres', description: 'Relational' },
+                  { const: 'SQLite', title: 'SQLite' },
+                ],
+                default: 'SQLite',
+              },
+              q0__other: { type: 'string', title: 'Other (type your own)' },
+            },
+          },
+        },
       ])
+      expect(h.elicitations[0]?.requestedSchema).not.toHaveProperty('required')
+    })
+
+    it('puts several questions in one form, multi-select as an array of anyOf options', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      await ask(h, { id: 'a2', method: 'ask', questions: [SINGLE, MULTI] })
+      const request = h.elicitations[0]
+      expect(request?.message).toBe('Answer 2 questions')
+      expect(request?.requestedSchema.properties).toEqual({
+        q0: expect.objectContaining({ type: 'string', default: 'SQLite' }),
+        q0__other: { type: 'string', title: 'Other (type your own)' },
+        q1: {
+          type: 'array',
+          title: 'Which checks?',
+          items: {
+            anyOf: [
+              { const: 'lint', title: 'lint' },
+              { const: 'unit', title: 'unit' },
+              { const: 'e2e', title: 'e2e' },
+            ],
+          },
+        },
+        q1__other: { type: 'string', title: 'Other (type your own)' },
+      })
+    })
+
+    it('omits the default for an out-of-range recommended index', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      await ask(h, { id: 'a3', method: 'ask', questions: [{ ...SINGLE, recommended: 7 }] })
+      expect(h.elicitations[0]?.requestedSchema.properties?.q0).not.toHaveProperty('default')
+    })
+
+    it('names the running ask tool call on the form', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.fake.override('prompt', () => {
+        h.fake.emit({ type: 'agent_start' })
+        h.fake.emit({ type: 'tool_execution_start', toolCallId: 'ask_7', toolName: 'ask', args: { questions: [] } })
+        h.fake.emit({ type: 'extension_ui_request', id: 'a4', method: 'ask', questions: [SINGLE] })
+        return undefined
+      })
+      const turn = h.transport.prompt(text('decide'), new AbortController().signal)
+      turn.catch(() => undefined)
+      await waitFor(() => responsesOf(h).length === 1, 2_000, 'ask answer')
+      h.fake.emit({ type: 'prompt_result', id: h.fake.commandsOfType('prompt')[0]?.id, agentInvoked: true, status: 'completed', sessionSettled: true })
+      await turn
+      expect(h.elicitations[0]?.toolCallId).toBe('ask_7')
+    })
+
+    it('answers a picked option, one entry per question in order', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'accept', content: { q0: 'Postgres', q1: ['lint', 'e2e'] } })
+      expect(await ask(h, { id: 'a5', method: 'ask', questions: [SINGLE, MULTI] })).toEqual({
+        type: 'extension_ui_response',
+        id: 'a5',
+        answers: [
+          { id: 'q1', selectedOptions: ['Postgres'] },
+          { id: 'q2', selectedOptions: ['lint', 'e2e'] },
+        ],
+      })
+    })
+
+    it('keeps typed text and drops the pick of a single-select, trims it, and ignores blank text', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'accept', content: { q0: 'Postgres', q0__other: '  MySQL, please ', q1__other: '   ' } })
+      expect(await ask(h, { id: 'a6', method: 'ask', questions: [SINGLE, MULTI] })).toEqual({
+        type: 'extension_ui_response',
+        id: 'a6',
+        answers: [
+          { id: 'q1', selectedOptions: [], customInput: 'MySQL, please' },
+          { id: 'q2', selectedOptions: [] },
+        ],
+      })
+    })
+
+    it('sends picks together with typed text for a multi-select, deduplicated and only offered labels', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({
+        action: 'accept',
+        content: { q0: ['lint', 'lint', 'invented', 'unit'], q0__other: 'also fuzz' },
+      })
+      expect(await ask(h, { id: 'a7', method: 'ask', questions: [MULTI] })).toEqual({
+        type: 'extension_ui_response',
+        id: 'a7',
+        answers: [{ id: 'q2', selectedOptions: ['lint', 'unit'], customInput: 'also fuzz' }],
+      })
+    })
+
+    it('answers a skipped question with no selection', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'accept', content: { q1: ['unit'] } })
+      expect(await ask(h, { id: 'a8', method: 'ask', questions: [SINGLE, MULTI] })).toMatchObject({
+        answers: [
+          { id: 'q1', selectedOptions: [] },
+          { id: 'q2', selectedOptions: ['unit'] },
+        ],
+      })
+    })
+
+    it('cancels the ask on decline, cancel, a throw, an accept without content and a malformed frame', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      const outcomes: Array<[string, Harness['answer']]> = [
+        ['d1', async () => ({ action: 'decline' })],
+        ['d2', async () => ({ action: 'cancel' })],
+        [
+          'd3',
+          async () => {
+            throw new Error('ui gone')
+          },
+        ],
+        ['d4', async () => ({ action: 'accept' })],
+      ]
+      for (const [id, answer] of outcomes) {
+        h.answer = answer
+        expect(await ask(h, { id, method: 'ask', questions: [SINGLE] })).toEqual({ type: 'extension_ui_response', id, cancelled: true })
+      }
+      const count = h.elicitations.length
+      expect(await ask(h, { id: 'd5', method: 'ask', questions: [{ id: 'x' }] })).toEqual({
+        type: 'extension_ui_response',
+        id: 'd5',
+        cancelled: true,
+      })
+      expect(h.elicitations).toHaveLength(count)
+    })
+
+    it('still routes an Allow tool select to onPermission and never to the question surface', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      const answer = await ask(h, {
+        id: 's1',
+        method: 'select',
+        title: 'Allow tool: bash\nCommand: ls',
+        options: ['Approve', 'Deny'],
+      })
+      expect(answer).toEqual({ type: 'extension_ui_response', id: 's1', value: 'Approve' })
+      expect(h.permissions).toHaveLength(1)
+      expect(h.elicitations).toHaveLength(0)
+    })
+
+    it('turns any other select into a required value form and answers the chosen label', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'accept', content: { value: 'Beta' } })
+      expect(await ask(h, { id: 's2', method: 'select', title: 'Pick a channel', options: ['Alpha', 'Beta'] })).toEqual({
+        type: 'extension_ui_response',
+        id: 's2',
+        value: 'Beta',
+      })
+      expect(h.elicitations).toEqual([
+        {
+          message: 'Pick a channel',
+          requestedSchema: { type: 'object', properties: { value: { type: 'string', enum: ['Alpha', 'Beta'] } }, required: ['value'] },
+        },
+      ])
+      expect(h.permissions).toHaveLength(0)
+      h.answer = async () => ({ action: 'decline' })
+      expect(await ask(h, { id: 's3', method: 'select', title: 'Pick a channel', options: ['Alpha', 'Beta'] })).toEqual({
+        type: 'extension_ui_response',
+        id: 's3',
+        cancelled: true,
+      })
+    })
+
+    it('round-trips confirm, input and editor', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'accept', content: { value: true } })
+      expect(await ask(h, { id: 'c1', method: 'confirm', title: 'Delete?', message: 'This cannot be undone' })).toEqual({
+        type: 'extension_ui_response',
+        id: 'c1',
+        confirmed: true,
+      })
+      h.answer = async () => ({ action: 'accept', content: { value: false } })
+      expect(await ask(h, { id: 'c2', method: 'confirm', title: 'Delete?', message: '  ' })).toEqual({
+        type: 'extension_ui_response',
+        id: 'c2',
+        confirmed: false,
+      })
+      h.answer = async () => ({ action: 'decline' })
+      expect(await ask(h, { id: 'c3', method: 'confirm', title: 'Delete?', message: '' })).toEqual({
+        type: 'extension_ui_response',
+        id: 'c3',
+        cancelled: true,
+      })
+      h.answer = async () => ({ action: 'accept', content: { value: 'main' } })
+      expect(await ask(h, { id: 'i1', method: 'input', title: 'Branch name', placeholder: ' e.g. main ' })).toEqual({
+        type: 'extension_ui_response',
+        id: 'i1',
+        value: 'main',
+      })
+      expect(await ask(h, { id: 'i2', method: 'input', title: 'Anything else', placeholder: '  ' })).toMatchObject({ value: 'main' })
+      h.answer = async () => ({ action: 'accept', content: { value: 'edited text' } })
+      expect(await ask(h, { id: 'e1', method: 'editor', title: 'Edit the message', prefill: 'draft' })).toEqual({
+        type: 'extension_ui_response',
+        id: 'e1',
+        value: 'edited text',
+      })
+      expect(await ask(h, { id: 'e2', method: 'editor', title: 'Empty one' })).toMatchObject({ value: 'edited text' })
+
+      const required = ['value']
+      expect(h.elicitations.map((request) => [request.message, request.requestedSchema.properties?.value, request.requestedSchema.required])).toEqual([
+        ['Delete?\n\nThis cannot be undone', { type: 'boolean' }, required],
+        ['Delete?', { type: 'boolean' }, required],
+        ['Delete?', { type: 'boolean' }, required],
+        ['Branch name', { type: 'string', description: ' e.g. main ' }, required],
+        ['Anything else', { type: 'string' }, required],
+        ['Edit the message', { type: 'string', default: 'draft' }, required],
+        ['Empty one', { type: 'string' }, required],
+      ])
+    })
+
+    it('dismisses an input whose answer is not text', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      h.answer = async () => ({ action: 'accept', content: { value: 5 } })
+      expect(await ask(h, { id: 'i3', method: 'input', title: 'Name' })).toEqual({ type: 'extension_ui_response', id: 'i3', cancelled: true })
+    })
+
+    it('withdraws a pending question when OMP sends a cancel frame and writes nothing afterwards', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      let signal: AbortSignal | undefined
+      const pending = Promise.withResolvers<{ action: 'accept'; content: Record<string, string[]> }>()
+      h.answer = (_request, requestSignal) => {
+        signal = requestSignal
+        return pending.promise
+      }
+      h.fake.emit({ type: 'extension_ui_request', id: 'p1', method: 'ask', questions: [SINGLE] })
+      await waitFor(() => signal !== undefined, 2_000, 'host question')
+      expect(signal?.aborted).toBe(false)
+      h.fake.emit({ type: 'extension_ui_request', id: 'cancel-2', method: 'cancel', targetId: 'p1' })
+      await waitFor(() => signal?.aborted === true, 2_000, 'withdrawal')
+      pending.resolve({ action: 'accept', content: { q0: ['Postgres'] } })
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(responsesOf(h)).toEqual([])
+    })
+
+    it('writes nothing for a question still pending when the transport closes', async () => {
+      const h = await create({ questions: true })
+      await h.start()
+      const pending = Promise.withResolvers<{ action: 'cancel' }>()
+      let asked = false
+      h.answer = () => {
+        asked = true
+        return pending.promise
+      }
+      h.fake.emit({ type: 'extension_ui_request', id: 'p2', method: 'confirm', title: 'Sure?', message: '' })
+      await waitFor(() => asked, 2_000, 'host question')
+      await h.transport.close()
+      pending.resolve({ action: 'cancel' })
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(responsesOf(h)).toEqual([])
+    })
+
+    it('dismisses every question kind when the host has no question surface, while approvals still reach onPermission', async () => {
+      const h = await create()
+      await h.start()
+      const frames: Json[] = [
+        { id: 'n1', method: 'ask', questions: [SINGLE] },
+        { id: 'n2', method: 'select', title: 'Pick a channel', options: ['Alpha', 'Beta'] },
+        { id: 'n3', method: 'confirm', title: 'Sure?', message: 'm' },
+        { id: 'n4', method: 'input', title: 'Name' },
+        { id: 'n5', method: 'editor', title: 'Edit', prefill: 'x' },
+      ]
+      for (const frame of frames) {
+        expect(await ask(h, frame)).toEqual({ type: 'extension_ui_response', id: frame.id, cancelled: true })
+      }
+      expect(h.permissions).toHaveLength(0)
+      expect(await ask(h, { id: 'n6', method: 'select', title: 'Allow tool: bash', options: ['Approve', 'Deny'] })).toEqual({
+        type: 'extension_ui_response',
+        id: 'n6',
+        value: 'Approve',
+      })
+      expect(h.permissions).toHaveLength(1)
+    })
+  })
+
+  describe('side questions', () => {
+    const topic = (id: string, status: string, extra: Json = {}): Json => ({
+      id,
+      question: 'why?',
+      answer: '',
+      status,
+      createdAt: 1,
+      updatedAt: 2,
+      leafId: 'leaf-1',
+      ...extra,
+    })
+    const ask = (h: Harness, signal: AbortSignal = new AbortController().signal) =>
+      h.transport.sideQuestion('why?', signal)
+
+    /** omp's frame order for one question: the running record, then the response, then deltas and the final record. */
+    function scriptQuestion(
+      h: Harness,
+      deltas: readonly string[],
+      final: Json = topic('btw-1', 'complete', { answer: deltas.join('') }),
+    ): void {
+      h.fake.override('btw', () => {
+        h.fake.emit({ type: 'btw_record', record: topic('btw-1', 'running') })
+        setTimeout(() => {
+          for (const delta of deltas) h.fake.emit({ type: 'btw_delta', recordId: 'btw-1', delta })
+          h.fake.emit({ type: 'btw_record', record: final })
+        }, 15)
+        return { record: topic('btw-1', 'running') }
+      })
+    }
+
+    it('answers while a prompt streams, and no side-question frame reaches the turn', async () => {
+      const h = await create()
+      await h.start()
+      const { turn, promptId } = await openTurn(h)
+      h.fake.emit(assistantFrame('message_start'))
+      h.fake.emit(textDelta('main-1 '))
+      scriptQuestion(h, ['BTW-', 'REPLY'])
+      const answer = ask(h)
+      h.fake.emit(textDelta('main-2 '))
+      expect(await answer).toEqual({ kind: 'success', text: 'BTW-REPLY' })
+      // The main turn kept streaming, was neither steered nor aborted, and ends normally.
+      h.fake.emit({
+        type: 'prompt_result',
+        id: promptId,
+        agentInvoked: true,
+        status: 'completed',
+        sessionSettled: true,
+      })
+      expect((await turn).stopReason).toBe('end_turn')
+      expect(messageText(h)).toBe('main-1 main-2 ')
+      expect(h.fake.commandsOfType('btw')).toEqual([expect.objectContaining({ question: 'why?' })])
+      expect(h.fake.commandsOfType('steer')).toHaveLength(0)
+      expect(h.fake.commandsOfType('abort')).toHaveLength(0)
+    })
+
+    it('decides on the latest turn of a topic, not on its stale top-level status', async () => {
+      const h = await create()
+      await h.start()
+      // After a follow-up the topic's own fields stay `complete` (first turn) while the follow-up still runs.
+      const followUp = (latest: Json): Json =>
+        topic('btw-1', 'complete', {
+          question: 'earlier',
+          answer: 'old answer',
+          followUps: [{ question: 'why?', createdAt: 3, updatedAt: 4, ...latest }],
+        })
+      h.fake.override('btw', () => {
+        h.fake.emit({ type: 'btw_record', record: followUp({ status: 'running', answer: '' }) })
+        setTimeout(() => {
+          h.fake.emit({ type: 'btw_record', record: followUp({ status: 'running', answer: 'new ' }) })
+          setTimeout(
+            () => h.fake.emit({ type: 'btw_record', record: followUp({ status: 'complete', answer: 'new answer' }) }),
+            20,
+          )
+        }, 10)
+        return { record: followUp({ status: 'running', answer: '' }) }
+      })
+      expect(await ask(h)).toEqual({ kind: 'success', text: 'new answer' })
+    })
+
+    it('falls back to the streamed text when the final record carries no answer', async () => {
+      const h = await create()
+      await h.start()
+      scriptQuestion(h, ['part ', 'two'], topic('btw-1', 'complete'))
+      expect(await ask(h)).toEqual({ kind: 'success', text: 'part two' })
+    })
+
+    it.each([
+      ['error', { error: 'provider exploded' }, 'provider exploded'],
+      ['interrupted', {}, 'interrupted'],
+    ])('reports a %s record as an error and keeps the partial answer', async (status, extra, headline) => {
+      const h = await create()
+      await h.start()
+      scriptQuestion(h, ['half an ans'], topic('btw-1', status, { answer: 'half an ans', ...extra }))
+      const result = await ask(h)
+      expect(result.kind).toBe('error')
+      expect(result.text).toContain(headline)
+      expect(result.text).toContain('half an ans')
+    })
+
+    it.each(['A /btw question is still running; cancel it first', 'No active model available for /btw.'])(
+      'turns the refusal %j into an error result and stays usable',
+      async (message) => {
+        const h = await create()
+        await h.start()
+        h.fake.override('btw', () => {
+          throw new FakeRpcError(message)
+        })
+        expect(await ask(h)).toEqual({ kind: 'error', text: message })
+        scriptQuestion(h, ['fine'])
+        expect(await ask(h)).toEqual({ kind: 'success', text: 'fine' })
+      },
+    )
+
+    it('refuses a blank question and a second concurrent question without asking omp', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('btw', () => NO_RESPONSE)
+      const first = ask(h)
+      first.catch(() => undefined)
+      await waitFor(() => h.fake.commandsOfType('btw').length === 1, 2_000, 'first question')
+      expect(await ask(h)).toMatchObject({ kind: 'error' })
+      expect(await h.transport.sideQuestion('   ', new AbortController().signal)).toMatchObject({
+        kind: 'error',
+        text: expect.stringContaining('/btw'),
+      })
+      expect(h.fake.commandsOfType('btw')).toHaveLength(1)
+    })
+
+    it('cancels through btw_cancel on abort and resolves from the cancelled record that precedes the cancel response', async () => {
+      const h = await create()
+      await h.start()
+      scriptQuestion(h, ['b0 ', 'b1 '], topic('btw-1', 'running'))
+      h.fake.override('btw_cancel', () => {
+        h.fake.emit({ type: 'btw_record', record: topic('btw-1', 'cancelled', { answer: 'b0 b1 ' }) })
+        return { cancelled: true }
+      })
+      const controller = new AbortController()
+      const answer = ask(h, controller.signal)
+      await waitFor(() => h.fake.commandsOfType('btw').length === 1, 2_000, 'question')
+      await sleep(40)
+      controller.abort()
+      const result = await answer
+      expect(result.kind).toBe('error')
+      expect(result.text).toContain('cancelled')
+      expect(result.text).toContain('b0 b1')
+      expect(h.fake.commandsOfType('btw_cancel')).toEqual([expect.objectContaining({ recordId: 'btw-1' })])
+    })
+
+    it('aims a second btw_cancel at the topic when the first went out before its id was known', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('btw', () => NO_RESPONSE)
+      const controller = new AbortController()
+      const answer = ask(h, controller.signal)
+      await waitFor(() => h.fake.commandsOfType('btw').length === 1, 2_000, 'question')
+      controller.abort()
+      await waitFor(() => h.fake.commandsOfType('btw_cancel').length === 1, 2_000, 'first cancel')
+      expect(h.fake.commandsOfType('btw_cancel')[0]).not.toHaveProperty('recordId')
+      // omp takes the question up late: the running record and the response now name the topic.
+      h.fake.emit({ type: 'btw_record', record: topic('btw-1', 'running') })
+      h.fake.respond(h.fake.commandsOfType('btw')[0]?.id, 'btw', { record: topic('btw-1', 'running') })
+      await waitFor(() => h.fake.commandsOfType('btw_cancel').length === 2, 2_000, 'second cancel')
+      expect(h.fake.commandsOfType('btw_cancel')[1]).toMatchObject({ recordId: 'btw-1' })
+      h.fake.emit({ type: 'btw_record', record: topic('btw-1', 'cancelled') })
+      expect(await answer).toMatchObject({ kind: 'error' })
+    })
+
+    it('cancels a question the model never finishes', async () => {
+      const h = await create({ transport: { btwTimeoutMs: 40 } })
+      await h.start()
+      scriptQuestion(h, ['slow '], topic('btw-1', 'running'))
+      h.fake.override('btw_cancel', () => {
+        h.fake.emit({ type: 'btw_record', record: topic('btw-1', 'cancelled', { answer: 'slow ' }) })
+        return { cancelled: true }
+      })
+      const result = await ask(h)
+      expect(result).toMatchObject({ kind: 'error', text: expect.stringContaining('too long') })
+      expect(h.fake.commandsOfType('btw_cancel')).toHaveLength(1)
+    })
+
+    it('bounds a question omp never takes up by the same watchdog', async () => {
+      const h = await create({ transport: { btwTimeoutMs: 40, abortGraceMs: 30 } })
+      await h.start()
+      h.fake.override('btw', () => NO_RESPONSE)
+      const result = await ask(h)
+      expect(result).toMatchObject({ kind: 'error', text: expect.stringContaining('too long') })
+      // The cancel could not name a topic: omp never announced one.
+      expect(h.fake.commandsOfType('btw_cancel')).toEqual([
+        expect.not.objectContaining({ recordId: expect.anything() }),
+      ])
+    })
+
+    it('ends the question even when omp never confirms the cancellation', async () => {
+      const h = await create({ transport: { abortGraceMs: 30 } })
+      await h.start()
+      scriptQuestion(h, [], topic('btw-1', 'running'))
+      const controller = new AbortController()
+      const answer = ask(h, controller.signal)
+      await waitFor(() => h.fake.commandsOfType('btw').length === 1, 2_000, 'question')
+      controller.abort()
+      expect(await answer).toMatchObject({ kind: 'error', text: expect.stringContaining('cancelled') })
+      // The slot is free again.
+      scriptQuestion(h, ['next'])
+      expect(await ask(h)).toEqual({ kind: 'success', text: 'next' })
+    })
+
+    it('rejects when the process dies or the transport closes while a question is open', async () => {
+      const dying = await create()
+      await dying.start()
+      dying.fake.override('btw', () => NO_RESPONSE)
+      const lost = ask(dying)
+      lost.catch(() => undefined)
+      await waitFor(() => dying.fake.commandsOfType('btw').length === 1, 2_000, 'question')
+      dying.fake.crash(139)
+      await expect(lost).rejects.toMatchObject({ code: 'process-exit' })
+      await expect(ask(dying)).rejects.toMatchObject({ code: 'process-exit' })
+
+      const closing = await create()
+      await closing.start()
+      closing.fake.override('btw', () => NO_RESPONSE)
+      const pending = ask(closing)
+      pending.catch(() => undefined)
+      await waitFor(() => closing.fake.commandsOfType('btw').length === 1, 2_000, 'question')
+      await closing.transport.close()
+      await expect(pending).rejects.toMatchObject({ code: 'closed' })
+    })
+  })
+
+  describe('terminal-only commands', () => {
+    it('answers a terminal-only builtin itself instead of sending it to the model', async () => {
+      const h = await create()
+      await h.start()
+      expect(await h.transport.prompt(text('/settings'), new AbortController().signal)).toEqual({
+        stopReason: 'end_turn',
+      })
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+      expect(messageText(h)).toContain('/settings')
+    })
+
+    it('refuses aliases, colon forms and the commands the host serves itself, one reply each', async () => {
+      const h = await create()
+      await h.start()
+      for (const line of ['/q', '/providers extra args', '/new:now', '/clear', '/btw what?', '/rewind 2']) {
+        const before = h.updates().length
+        expect(await h.transport.prompt(text(line), new AbortController().signal)).toEqual({ stopReason: 'end_turn' })
+        expect(h.updates().length - before, line).toBe(1)
+      }
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+    })
+
+    it('sends everything else to omp: handled builtins, unknown names and ordinary text', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('prompt', () => ({ agentInvoked: false }))
+      const lines: NativeContentBlock[][] = [
+        text('/context'),
+        text('/bogus-unknown arg'),
+        text('hello /settings'),
+        // Only a lone text block is a shell escape; with more blocks around it the line is ordinary text.
+        [...text('!ls'), ...text('more')],
+      ]
+      for (const line of lines) {
+        await h.transport.prompt(line, new AbortController().signal)
+      }
+      expect(h.fake.commandsOfType('prompt').map((command) => command.message)).toEqual([
+        '/context',
+        '/bogus-unknown arg',
+        'hello /settings',
+        '!ls\n\nmore',
+      ])
+    })
+
+    it('lets a live extension, custom or file command keep a terminal-only name', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('prompt', () => ({ agentInvoked: false }))
+      h.fake.emit({
+        type: 'available_commands_update',
+        commands: [
+          { name: 'tree', description: 'my tree', source: 'extension' },
+          { name: 'q', description: 'quick', source: 'file' },
+        ],
+      })
+      await waitFor(() => h.events.some((event) => event.kind === 'commands'), 2_000, 'catalogue')
+      await h.transport.prompt(text('/tree 3'), new AbortController().signal)
+      await h.transport.prompt(text('/q'), new AbortController().signal)
+      await h.transport.prompt(text('/settings'), new AbortController().signal)
+      expect(h.fake.commandsOfType('prompt').map((command) => command.message)).toEqual(['/tree 3', '/q'])
+      // The override ends with the catalogue entry that caused it.
+      h.fake.emit({ type: 'available_commands_update', commands: [] })
+      await waitFor(() => h.events.filter((event) => event.kind === 'commands').length === 2, 2_000, 'second catalogue')
+      await h.transport.prompt(text('/tree 4'), new AbortController().signal)
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(2)
+    })
+
+    it('injects a slash line or a shell escape into the running turn like any other steering text', async () => {
+      const h = await create()
+      await h.start()
+      // omp admits the text, consumes it at the next step boundary and records it as a steering message.
+      h.fake.override('steer', (command) => {
+        const message = String(command.message)
+        h.fake.emit({ type: 'queue_update', steering: [message], followUp: [], liveSteered: 0 })
+        setTimeout(() => {
+          h.fake.emit({ type: 'queue_update', steering: [], followUp: [], liveSteered: 0 })
+          h.fake.emit({
+            type: 'message_start',
+            message: { role: 'user', content: [{ type: 'text', text: message }], steering: true },
+            messageId: `msg-${message}`,
+          })
+        }, 15)
+        return undefined
+      })
+      const { turn, promptId } = await openTurn(h)
+      // `promptRequired` would make the host interrupt this turn to prompt the line again.
+      expect(await h.transport.steer(text('/settings'))).toBe('injected')
+      expect(await h.transport.steer(text('!ls'))).toBe('injected')
+      expect(h.fake.commandsOfType('steer').map((command) => command.message)).toEqual(['/settings', '!ls'])
+      expect(h.fake.commandsOfType('bash')).toHaveLength(0)
+      h.fake.emit({
+        type: 'prompt_result',
+        id: promptId,
+        agentInvoked: true,
+        status: 'completed',
+        sessionSettled: true,
+      })
+      expect((await turn).stopReason).toBe('end_turn')
+    })
+  })
+
+  describe('slash command completion', () => {
+    it('ends a local command that omp closes with an aborted result nobody asked for (/fresh)', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('prompt', (command) => {
+        setTimeout(() => {
+          h.fake.emit({ type: 'command_output', text: 'Fresh provider session started.' })
+          h.fake.emit({
+            type: 'prompt_result',
+            id: command.id,
+            agentInvoked: true,
+            status: 'aborted',
+            sessionSettled: true,
+          })
+        }, 5)
+        return undefined
+      })
+      expect((await h.transport.prompt(text('/fresh'), new AbortController().signal)).stopReason).toBe('end_turn')
+      expect(messageText(h)).toBe('Fresh provider session started.')
+    })
+
+    it('still reports cancelled for an aborted result after a run started, or after a plain message', async () => {
+      const h = await create()
+      await h.start()
+      const abortedBy = (withRun: boolean) => (command: Json) => {
+        setTimeout(() => {
+          if (withRun) h.fake.emit({ type: 'agent_start' })
+          h.fake.emit({
+            type: 'prompt_result',
+            id: command.id,
+            agentInvoked: true,
+            status: 'aborted',
+            sessionSettled: true,
+          })
+        }, 5)
+        return undefined
+      }
+      h.fake.override('prompt', abortedBy(true))
+      expect((await h.transport.prompt(text('/review'), new AbortController().signal)).stopReason).toBe('cancelled')
+      h.fake.override('prompt', abortedBy(false))
+      expect((await h.transport.prompt(text('hello'), new AbortController().signal)).stopReason).toBe('cancelled')
+    })
+  })
+
+  describe('wake turns', () => {
+    /** A run omp starts on its own once background work finished: it streams `delta` and yields. */
+    function wakeRun(h: Harness, delta: string): void {
+      h.fake.emit({ type: 'agent_start' })
+      h.fake.emit(assistantFrame('message_start'))
+      h.fake.emit(textDelta(delta))
+      const message = {
+        role: 'assistant',
+        content: [{ type: 'text', text: delta }],
+        usage: USAGE_TWO,
+        stopReason: 'stop',
+      }
+      h.fake.emit({ type: 'message_end', messageId: 'msg-9', message })
+      h.fake.emit({ type: 'agent_end', messages: [message], isTerminal: true, yielded: true })
+    }
+
+    /** The agent yielded its answer while a background job is still running. */
+    async function yieldWithBackgroundWork(
+      h: Harness,
+      signal?: AbortSignal,
+    ): Promise<{ turn: Promise<NativePromptResult>; settled: () => boolean }> {
+      const { turn, promptId } = await openTurn(h, signal)
+      h.fake.emit(assistantFrame('message_start'))
+      h.fake.emit(textDelta('first answer. '))
+      const message = {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'first answer. ' }],
+        usage: USAGE_ONE,
+        stopReason: 'stop',
+      }
+      h.fake.emit({ type: 'message_end', messageId: 'msg-2', message })
+      h.fake.emit({ type: 'agent_end', messages: [message], isTerminal: false, yielded: true, awaitingAsyncWork: true })
+      h.fake.emit({
+        type: 'prompt_result',
+        id: promptId,
+        agentInvoked: true,
+        status: 'completed',
+        sessionSettled: false,
+      })
+      let done = false
+      const end = (): void => {
+        done = true
+      }
+      turn.then(end, end)
+      return { turn, settled: () => done }
+    }
+
+    it('keeps the turn open for the wake run and ends it when the session settles', async () => {
+      const h = await create()
+      await h.start()
+      const { turn, settled } = await yieldWithBackgroundWork(h)
+      await sleep(40)
+      expect(settled()).toBe(false)
+      wakeRun(h, 'background result. ')
+      h.fake.emit({ type: 'session_settled' })
+      const result = await turn
+      expect(result.stopReason).toBe('end_turn')
+      expect(messageText(h)).toBe('first answer. background result. ')
+      // The wake run's model call belongs to this turn.
+      expect(result.usage?.outputTokens).toBe(USAGE_ONE.output + USAGE_TWO.output)
+    })
+
+    it('ends a held turn after the settle window of silence, but never cuts a wake run that is producing output', async () => {
+      const quiet = await create({ transport: { wakeSettleMs: 40 } })
+      await quiet.start()
+      expect((await (await yieldWithBackgroundWork(quiet)).turn).stopReason).toBe('end_turn')
+
+      const busy = await create({ transport: { wakeSettleMs: 300 } })
+      await busy.start()
+      const { turn, settled } = await yieldWithBackgroundWork(busy)
+      busy.fake.emit({ type: 'agent_start' })
+      for (let index = 0; index < 5; index += 1) {
+        await sleep(100)
+        busy.fake.emit(textDelta(`w${index} `))
+      }
+      expect(settled()).toBe(false)
+      busy.fake.emit({ type: 'session_settled' })
+      await turn
+      expect(messageText(busy)).toBe('first answer. w0 w1 w2 w3 w4 ')
+    })
+
+    it('does not settle a held turn from the terminal frame of the wake run', async () => {
+      const h = await create({ transport: { promptResultFallbackMs: 30 } })
+      await h.start()
+      const { turn, settled } = await yieldWithBackgroundWork(h)
+      wakeRun(h, 'background result. ')
+      await sleep(120)
+      expect(settled()).toBe(false)
+      h.fake.emit({ type: 'session_settled' })
+      await turn
+    })
+
+    it('does not mistake a retrying run for the end of the turn', async () => {
+      const h = await create({ transport: { promptResultFallbackMs: 30 } })
+      await h.start()
+      const { turn, promptId } = await openTurn(h)
+      const failed = {
+        role: 'assistant',
+        content: [],
+        stopReason: 'error',
+        errorMessage: '429 rate limited',
+        usage: {},
+      }
+      h.fake.emit({ type: 'agent_end', messages: [failed], isTerminal: false, yielded: false })
+      let done = false
+      turn.then(() => {
+        done = true
+      })
+      await sleep(120)
+      expect(done).toBe(false)
+      wakeRun(h, 'retried answer. ')
+      h.fake.emit({
+        type: 'prompt_result',
+        id: promptId,
+        agentInvoked: true,
+        status: 'completed',
+        sessionSettled: true,
+      })
+      expect((await turn).stopReason).toBe('end_turn')
+      expect(messageText(h)).toBe('retried answer. ')
+    })
+
+    it('ends a held turn on a steer instead of injecting into a run that is not there', async () => {
+      const h = await create()
+      await h.start()
+      const { turn } = await yieldWithBackgroundWork(h)
+      expect(await h.transport.steer(text('actually, do something else'))).toBe('promptRequired')
+      expect(h.fake.commandsOfType('steer')).toHaveLength(0)
+      expect((await turn).stopReason).toBe('end_turn')
+    })
+
+    it('injects a steer, slash lines included, while the wake run of a held turn is streaming', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('steer', (command) => {
+        const message = String(command.message)
+        h.fake.emit({ type: 'queue_update', steering: [message], followUp: [], liveSteered: 0 })
+        setTimeout(() => {
+          h.fake.emit({ type: 'queue_update', steering: [], followUp: [], liveSteered: 0 })
+          h.fake.emit({
+            type: 'message_start',
+            message: { role: 'user', content: [{ type: 'text', text: message }], steering: true },
+            messageId: 'msg-steer',
+          })
+        }, 15)
+        return undefined
+      })
+      const { turn } = await yieldWithBackgroundWork(h)
+      // A run is live again, so this is an ordinary running turn: bouncing the line would interrupt the wake run.
+      h.fake.emit({ type: 'agent_start' })
+      expect(await h.transport.steer(text('/theme dark'))).toBe('injected')
+      expect(h.fake.commandsOfType('steer')).toEqual([expect.objectContaining({ message: '/theme dark' })])
+      h.fake.emit({ type: 'agent_end', messages: [], isTerminal: true, yielded: true })
+      h.fake.emit({ type: 'session_settled' })
+      expect((await turn).stopReason).toBe('end_turn')
+    })
+
+    it('cancels a held turn at once when no run is left to confirm the abort', async () => {
+      const h = await create({ transport: { abortGraceMs: 60_000 } })
+      await h.start()
+      const controller = new AbortController()
+      const { turn } = await yieldWithBackgroundWork(h, controller.signal)
+      controller.abort()
+      expect((await turn).stopReason).toBe('cancelled')
+    })
+
+    it('ends a held turn normally when the process dies after the answer was given', async () => {
+      const h = await create()
+      await h.start()
+      const { turn } = await yieldWithBackgroundWork(h)
+      h.fake.crash(137)
+      expect((await turn).stopReason).toBe('end_turn')
+      expect(messageText(h)).toBe('first answer. ')
+      await expect(h.transport.prompt(text('again'), new AbortController().signal)).rejects.toMatchObject({
+        code: 'process-exit',
+      })
+    })
+
+    it('reports a held turn cancelled when the user stops it while the wake run streams', async () => {
+      const h = await create({ transport: { abortGraceMs: 60_000 } })
+      await h.start()
+      const controller = new AbortController()
+      const { turn } = await yieldWithBackgroundWork(h, controller.signal)
+      h.fake.emit({ type: 'agent_start' })
+      await sleep(20)
+      // omp stops the wake run and then reports the session settled.
+      h.fake.override('abort', () => {
+        setTimeout(() => h.fake.emit({ type: 'session_settled' }), 5)
+        return undefined
+      })
+      controller.abort()
+      expect((await turn).stopReason).toBe('cancelled')
+      expect(h.fake.commandsOfType('abort')).toHaveLength(1)
+    })
+
+    it('keeps a held turn open while a wake run is live, however quiet it is', async () => {
+      const h = await create({ transport: { wakeSettleMs: 150 } })
+      await h.start()
+      const { turn, settled } = await yieldWithBackgroundWork(h)
+      h.fake.emit({ type: 'agent_start' })
+      // More than three windows of silence with a run live: a tool call of a long run says nothing for a long time.
+      await sleep(500)
+      expect(settled()).toBe(false)
+      // The run ends, and the session goes quiet without ever reporting it: that ends the turn after the window.
+      h.fake.emit({ type: 'agent_end', messages: [], isTerminal: true, yielded: true })
+      expect((await turn).stopReason).toBe('end_turn')
+    })
+
+    it('queues a prompt behind a run omp started on its own instead of failing it', async () => {
+      const h = await create()
+      await h.start()
+      const stats = h.fake.commandsOfType('get_session_stats').length
+      h.fake.emit({ type: 'agent_start' })
+      // Busy tracking starts a context poll: once it is out, the transport has seen the run.
+      await waitFor(() => h.fake.commandsOfType('get_session_stats').length > stats, 2_000, 'busy tracking')
+      h.fake.override('prompt', (command) => {
+        setTimeout(
+          () =>
+            h.fake.emit({
+              type: 'prompt_result',
+              id: command.id,
+              agentInvoked: true,
+              status: 'completed',
+              sessionSettled: true,
+            }),
+          5,
+        )
+        return undefined
+      })
+      await h.transport.prompt(text('next'), new AbortController().signal)
+      expect(h.fake.commandsOfType('prompt')[0]).toMatchObject({ message: 'next', streamingBehavior: 'followUp' })
+      // The session settled with that result: the next prompt is a plain one again.
+      await h.transport.prompt(text('after'), new AbortController().signal)
+      expect(h.fake.commandsOfType('prompt')[1]).toMatchObject({ message: 'after' })
+      expect(h.fake.commandsOfType('prompt')[1]).not.toHaveProperty('streamingBehavior')
+    })
+  })
+
+  describe('notices', () => {
+    it('shows retry, fallback and extension notices as thoughts while a turn is open', async () => {
+      const h = await create()
+      await h.start()
+      const { turn, promptId } = await openTurn(h)
+      h.fake.emit({
+        type: 'auto_retry_start',
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 2000,
+        errorMessage: '429 rate limited',
+      })
+      h.fake.emit({ type: 'retry_fallback_applied', from: 'a/m1', to: 'b/m2', role: 'default' })
+      h.fake.emit({
+        type: 'extension_ui_request',
+        id: 'n1',
+        method: 'notify',
+        message: 'picked beta',
+        notifyType: 'info',
+      })
+      h.fake.emit({ type: 'notice', level: 'info', message: 'routine' })
+      h.fake.emit({
+        type: 'prompt_result',
+        id: promptId,
+        agentInvoked: true,
+        status: 'completed',
+        sessionSettled: true,
+      })
+      await turn
+      expect(thoughtLines(h)).toEqual([
+        'OMP retry 1/3 in 2000ms: 429 rate limited',
+        'OMP switched model a/m1 → b/m2',
+        'picked beta',
+      ])
+    })
+
+    it('keeps them out of the turn stream when no turn is open, and still logs them', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.emit({
+        type: 'auto_retry_start',
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 2000,
+        errorMessage: '429 rate limited',
+      })
+      h.fake.emit({
+        type: 'extension_ui_request',
+        id: 'n1',
+        method: 'notify',
+        message: 'late news',
+        notifyType: 'info',
+      })
+      await waitFor(() => h.events.some((event) => event.kind === 'notice'), 2_000, 'notice')
+      await sleep(20)
+      expect(thoughtLines(h)).toEqual([])
+      expect(h.events.find((event) => event.kind === 'notice')).toEqual({
+        kind: 'notice',
+        text: 'OMP retry 1/3 in 2000ms: 429 rate limited',
+      })
+    })
+  })
+
+  describe('user shell', () => {
+    const shellResult = (extra: Json = {}): Json => ({
+      exitCode: 0,
+      cancelled: false,
+      output: '',
+      truncated: false,
+      totalLines: 0,
+      outputLines: 0,
+      ...extra,
+    })
+
+    it('runs !cmd through rpc bash as one execute tool call, without a model call', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('bash', () => shellResult({ output: 'hi\n', totalLines: 1, outputLines: 1 }))
+      expect(await h.transport.prompt(text('!echo hi'), new AbortController().signal)).toEqual({
+        stopReason: 'end_turn',
+      })
+      expect(h.fake.commandsOfType('bash')).toEqual([expect.objectContaining({ command: 'echo hi' })])
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+      const [call, done, ...rest] = h.updates()
+      expect(rest).toEqual([])
+      expect(call).toMatchObject({
+        sessionUpdate: 'tool_call',
+        name: 'bash',
+        kind: 'execute',
+        title: '$ echo hi',
+        status: 'in_progress',
+        rawInput: { command: 'echo hi' },
+      })
+      expect(done).toMatchObject({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: fieldOf(call, 'toolCallId'),
+        status: 'completed',
+        rawOutput: { exitCode: 0, output: 'hi\n' },
+      })
+      expect(JSON.stringify(done)).toContain('hi')
+    })
+
+    it('marks a failing command failed, shows its exit code and strips terminal colors', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('bash', () => shellResult({ exitCode: 2, output: '\u001B[31mboom\u001B[0m\n' }))
+      expect((await h.transport.prompt(text('!make'), new AbortController().signal)).stopReason).toBe('end_turn')
+      const done = h.updates().at(-1)
+      expect(done).toMatchObject({ sessionUpdate: 'tool_call_update', status: 'failed' })
+      const shown = JSON.stringify(fieldOf(done, 'content'))
+      expect(shown).toContain('boom')
+      expect(shown).toContain('exit code 2')
+      expect(shown).not.toContain('\\u001b')
+    })
+
+    it('kills the command with abort_bash on abort and reports the turn cancelled', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('bash', () => NO_RESPONSE)
+      h.fake.override('abort_bash', () => {
+        const bash = h.fake.commandsOfType('bash')[0]
+        setTimeout(
+          () => h.fake.respond(bash?.id, 'bash', shellResult({ cancelled: true, output: '[Command cancelled]\n' })),
+          5,
+        )
+        return undefined
+      })
+      const controller = new AbortController()
+      const turn = h.transport.prompt(text('!sleep 30'), controller.signal)
+      await waitFor(() => h.fake.commandsOfType('bash').length === 1, 2_000, 'bash')
+      controller.abort()
+      expect(await turn).toEqual({ stopReason: 'cancelled' })
+      expect(h.fake.commandsOfType('abort_bash')).toHaveLength(1)
+      expect(h.updates().at(-1)).toMatchObject({ sessionUpdate: 'tool_call_update', status: 'failed' })
+    })
+
+    it('ends the turn when omp never confirms the kill', async () => {
+      const h = await create({ transport: { abortGraceMs: 30 } })
+      await h.start()
+      h.fake.override('bash', () => NO_RESPONSE)
+      const controller = new AbortController()
+      const turn = h.transport.prompt(text('!sleep 30'), controller.signal)
+      await waitFor(() => h.fake.commandsOfType('bash').length === 1, 2_000, 'bash')
+      controller.abort()
+      expect(await turn).toEqual({ stopReason: 'cancelled' })
+      expect(h.updates().at(-1)).toMatchObject({ sessionUpdate: 'tool_call_update', status: 'failed' })
+      // The slot is free for the next turn.
+      h.fake.override('prompt', () => ({ agentInvoked: false }))
+      await h.transport.prompt(text('hello'), new AbortController().signal)
+    })
+
+    it('shows an rpc refusal as a failed call and still ends the turn', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('bash', () => {
+        throw new FakeRpcError('Shell is disabled')
+      })
+      expect((await h.transport.prompt(text('!ls'), new AbortController().signal)).stopReason).toBe('end_turn')
+      const done = h.updates().at(-1)
+      expect(done).toMatchObject({ sessionUpdate: 'tool_call_update', status: 'failed' })
+      expect(JSON.stringify(done)).toContain('Shell is disabled')
+    })
+
+    it('fails the call and rejects when the process dies mid-command', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('bash', () => NO_RESPONSE)
+      const turn = h.transport.prompt(text('!sleep 30'), new AbortController().signal)
+      turn.catch(() => undefined)
+      await waitFor(() => h.fake.commandsOfType('bash').length === 1, 2_000, 'bash')
+      h.fake.crash(137)
+      await expect(turn).rejects.toMatchObject({ code: 'process-exit' })
+      expect(h.updates().at(-1)).toMatchObject({ sessionUpdate: 'tool_call_update', status: 'failed' })
+    })
+
+    it('refuses !! and a bare ! locally', async () => {
+      const h = await create()
+      await h.start()
+      for (const line of ['!!ls', '!', '!   ']) {
+        const before = h.updates().length
+        expect(await h.transport.prompt(text(line), new AbortController().signal)).toEqual({ stopReason: 'end_turn' })
+        expect(h.updates().length - before, line).toBe(1)
+      }
+      expect(h.fake.commandsOfType('bash')).toHaveLength(0)
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+    })
+
+    it('holds the prompt slot while the command runs', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('bash', () => NO_RESPONSE)
+      const turn = h.transport.prompt(text('!sleep 1'), new AbortController().signal)
+      await waitFor(() => h.fake.commandsOfType('bash').length === 1, 2_000, 'bash')
+      await expect(h.transport.prompt(text('second'), new AbortController().signal)).rejects.toMatchObject({
+        code: 'prompt-in-flight',
+      })
+      expect(await h.transport.steer(text('anything'))).toBe('promptRequired')
+      h.fake.respond(h.fake.commandsOfType('bash')[0]?.id, 'bash', shellResult())
+      expect((await turn).stopReason).toBe('end_turn')
+    })
+  })
+
+  describe('fast and slow controls', () => {
+    const valueOf = (h: Harness, id: string): string | boolean | undefined =>
+      h.transport.controls().configOptions.find((option) => option.id === id)?.currentValue
+
+    it('offers fast, and slow only for a model that supports it, as boolean options', async () => {
+      const h = await create()
+      h.fake.state.fastModeEnabled = false
+      h.fake.state.slowModeSupported = true
+      h.fake.state.slowModeEnabled = true
+      await h.start()
+      expect(h.transport.controls().configOptions.map((option) => [option.id, option.type])).toEqual([
+        ['mode', 'select'],
+        ['model', 'select'],
+        ['thinking', 'select'],
+        ['fast', 'boolean'],
+        ['slow', 'boolean'],
+      ])
+      expect([valueOf(h, 'fast'), valueOf(h, 'slow')]).toEqual([false, true])
+    })
+
+    it('applies the toggles through rpc and reads the value back without a controls event', async () => {
+      const h = await create()
+      h.fake.state.fastModeEnabled = false
+      h.fake.state.slowModeSupported = true
+      await h.start()
+      const before = h.events.length
+      await h.transport.setConfigOption('fast', true)
+      await h.transport.setConfigOption('slow', true)
+      expect(h.fake.commandsOfType('set_fast_mode')).toEqual([expect.objectContaining({ enabled: true })])
+      expect(h.fake.commandsOfType('set_slow_mode')).toEqual([expect.objectContaining({ enabled: true })])
+      expect([valueOf(h, 'fast'), valueOf(h, 'slow')]).toEqual([true, true])
+      await h.transport.setConfigOption('fast', false)
+      expect(valueOf(h, 'fast')).toBe(false)
+      expect(h.events.slice(before).filter((event) => event.kind === 'controls')).toEqual([])
+    })
+
+    it('surfaces omp refusing a toggle and keeps the previous value', async () => {
+      const h = await create()
+      h.fake.state.fastModeEnabled = false
+      await h.start()
+      h.fake.override('set_fast_mode', () => {
+        throw new FakeRpcError('Fast mode is unavailable for the current model.')
+      })
+      const failure = await h.transport.setConfigOption('fast', true).catch((error: unknown) => error)
+      expect(failure).toMatchObject({
+        code: 'request-failed',
+        detail: 'Fast mode is unavailable for the current model.',
+      })
+      expect(valueOf(h, 'fast')).toBe(false)
+    })
+
+    it('rejects a string for a toggle and a toggle omp does not offer', async () => {
+      const h = await create()
+      h.fake.state.fastModeEnabled = false
+      await h.start()
+      expect(await h.transport.setConfigOption('fast', 'on').catch((error: unknown) => error)).toMatchObject({
+        code: 'unsupported-config-value',
+      })
+      expect(await h.transport.setConfigOption('slow', true).catch((error: unknown) => error)).toMatchObject({
+        code: 'unknown-config-option',
+      })
+      expect(h.fake.commandsOfType('set_fast_mode')).toHaveLength(0)
+      expect(h.fake.commandsOfType('set_slow_mode')).toHaveLength(0)
+    })
+
+    it('reads the toggles back after a typed slash command changed them', async () => {
+      const h = await create()
+      h.fake.state.fastModeEnabled = false
+      await h.start()
+      h.fake.override('prompt', () => {
+        h.fake.state.fastModeEnabled = true
+        return { agentInvoked: false }
+      })
+      await h.transport.prompt(text('/fast on'), new AbortController().signal)
+      await waitFor(() => h.events.some((event) => event.kind === 'controls'), 2_000, 'controls event')
+      expect(valueOf(h, 'fast')).toBe(true)
+    })
+  })
+
+  describe('immediate commands', () => {
+    const run = (h: Harness, name: string) => h.transport.runCommand(name, '', new AbortController().signal)
+    const valueOf = (h: Harness, id: string): string | boolean | undefined =>
+      h.transport.controls().configOptions.find((option) => option.id === id)?.currentValue
+
+    it('starts a new session for /new and tells the host before the command resolves', async () => {
+      const h = await create()
+      await h.start()
+      expect(h.transport.sessionId).toBe('fake-session-1')
+      // The new session reports other defaults than the one it replaces.
+      h.fake.state.thinkingLevel = 'low'
+      const result = await run(h, 'new')
+      expect(result.kind).toBe('success')
+      expect(result.text).toContain('fake-session-2')
+      expect(h.fake.commandsOfType('new_session')).toHaveLength(2)
+      expect(h.transport.sessionId).toBe('fake-session-2')
+      expect(h.transport.sessionFilePath).toBe(h.fake.state.sessionFile)
+      expect(h.events.filter((event) => event.kind === 'session_changed')).toEqual([
+        { kind: 'session_changed', sessionId: 'fake-session-2', reason: 'new' },
+      ])
+      expect(valueOf(h, 'thinking')).toBe('low')
+    })
+
+    it('reports /clear with its own reason', async () => {
+      const h = await create()
+      await h.start()
+      expect((await run(h, 'clear')).kind).toBe('success')
+      expect(h.events.filter((event) => event.kind === 'session_changed')).toEqual([
+        { kind: 'session_changed', sessionId: 'fake-session-2', reason: 'clear' },
+      ])
+    })
+
+    it('needs an idle session: nothing is sent while a turn runs', async () => {
+      const h = await create()
+      await h.start()
+      const { turn, promptId } = await openTurn(h)
+      expect(await run(h, 'new')).toMatchObject({ kind: 'error' })
+      expect(h.fake.commandsOfType('new_session')).toHaveLength(1)
+      h.fake.emit({
+        type: 'prompt_result',
+        id: promptId,
+        agentInvoked: true,
+        status: 'completed',
+        sessionSettled: true,
+      })
+      await turn
+      expect((await run(h, 'new')).kind).toBe('success')
+    })
+
+    it('reports an extension veto and an rpc refusal as errors and keeps the session', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('new_session', () => ({ cancelled: true }))
+      expect(await run(h, 'new')).toMatchObject({ kind: 'error', text: expect.stringContaining('vetoed') })
+      h.fake.override('new_session', () => {
+        throw new FakeRpcError('session store is read-only')
+      })
+      expect(await run(h, 'clear')).toEqual({ kind: 'error', text: 'session store is read-only' })
+      expect(h.transport.sessionId).toBe('fake-session-1')
+      expect(h.events.filter((event) => event.kind === 'session_changed')).toEqual([])
+    })
+
+    it('answers a command it does not run without a turn with an error', async () => {
+      const h = await create()
+      await h.start()
+      expect(await run(h, 'compact')).toMatchObject({ kind: 'error' })
+      const aborted = new AbortController()
+      aborted.abort()
+      expect(await h.transport.runCommand('new', '', aborted.signal)).toMatchObject({ kind: 'error' })
+      expect(h.fake.commandsOfType('new_session')).toHaveLength(1)
+    })
+  })
+
+  describe('config overlay', () => {
+    const overlayOf = (h: Harness): string | undefined => {
+      const argv = h.calls.find((call) => !call.argv.includes('--version'))?.argv ?? []
+      const at = argv.lastIndexOf('--config')
+      return at === -1 ? undefined : argv[at + 1]
+    }
+
+    it("launches omp with an overlay that lets goals continue over rpc, after the launcher's own --config", async () => {
+      const h = await create()
+      await h.start(undefined, ['/bin/omp', 'acp', '--config', '/etc/mine.yml'])
+      const argv = h.calls.find((call) => !call.argv.includes('--version'))?.argv ?? []
+      expect(argv.slice(0, 3)).toEqual(['/bin/omp', '--config', '/etc/mine.yml'])
+      const file = overlayOf(h) ?? ''
+      expect(argv.indexOf('--config')).toBeLessThan(argv.lastIndexOf('--config'))
+      expect(file.startsWith(join(h.root, 'overlays'))).toBe(true)
+      expect(await readFile(file, 'utf8')).toMatch(/continuationModes:.*\brpc\b/)
+      // The version probe asks the same launcher and has no use for it.
+      expect(h.calls.find((call) => call.argv.includes('--version'))?.argv).not.toContain(file)
+    })
+
+    it('removes the overlay with the process: on close, after a crash, and when start fails', async () => {
+      const closed = await create()
+      await closed.start()
+      const closedFile = overlayOf(closed) ?? ''
+      expect(existsSync(closedFile)).toBe(true)
+      await closed.transport.close()
+      expect(existsSync(dirname(closedFile))).toBe(false)
+
+      const crashed = await create()
+      await crashed.start()
+      const crashedFile = overlayOf(crashed) ?? ''
+      expect(existsSync(crashedFile)).toBe(true)
+      crashed.fake.crash(1)
+      await waitFor(() => !existsSync(dirname(crashedFile)), 2_000, 'the overlay to go after the crash')
+
+      const failed = await create({ fakeOptions: { sendReady: false }, transport: { readyTimeoutMs: 50 } })
+      await expect(failed.start()).rejects.toMatchObject({ code: 'ready-timeout' })
+      expect(overlayOf(failed)).toBeDefined()
+      expect(await readdir(join(failed.root, 'overlays'))).toEqual([])
+    })
+
+    it('removes the overlay when the process cannot be spawned', async () => {
+      const h = await create()
+      await expect(
+        h.transport.start({
+          argv: ['/bin/omp'],
+          env: {},
+          cwd: '/work/here',
+          spawn: () => {
+            throw new Error('ENOENT: omp')
+          },
+          session: { kind: 'new' },
+          onEvent: () => undefined,
+          onPermission: async () => ({ cancelled: true }),
+        }),
+      ).rejects.toMatchObject({ code: 'spawn-failed' })
+      expect(await readdir(join(h.root, 'overlays'))).toEqual([])
+    })
+
+    it('keeps no overlay behind when the transport is closed while it is being written', async () => {
+      const h = await create()
+      const started = h.start()
+      started.catch(() => undefined)
+      await h.transport.close()
+      await expect(started).rejects.toMatchObject({ code: 'closed' })
+      expect(await readdir(join(h.root, 'overlays')).catch(() => [])).toEqual([])
+    })
+
+    it('runs without a --config of its own when the overlay cannot be written', async () => {
+      const h = await create({ transport: { overlayRoot: await blockedOverlayRoot() } })
+      await h.start()
+      expect(overlayOf(h)).toBeUndefined()
+      expect(h.transport.sessionId).toBe('fake-session-1')
+      expect(h.transport.closed).toBe(false)
+    })
+  })
+
+  describe('goal command', () => {
+    const say = (h: Harness, args: string, signal: AbortSignal = new AbortController().signal) =>
+      h.transport.prompt(text(args === '' ? '/goal' : `/goal ${args}`), signal)
+    const goalOps = (h: Harness): unknown[] => h.fake.commandsOfType('goal').map((command) => command.op)
+    const active = (extra: Json = {}): Json => ({
+      id: 'goal-1',
+      objective: 'fix the build',
+      status: 'active',
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      ...extra,
+    })
+
+    /** A run omp starts by itself for the goal: it streams `delta` and yields. */
+    function continuation(h: Harness, delta: string): void {
+      h.fake.emit({ type: 'agent_start' })
+      h.fake.emit(assistantFrame('message_start'))
+      h.fake.emit(textDelta(delta))
+      const message = { role: 'assistant', content: [{ type: 'text', text: delta }], usage: USAGE_TWO, stopReason: 'stop' }
+      h.fake.emit({ type: 'message_end', messageId: 'msg-9', message })
+      h.fake.emit({ type: 'agent_end', messages: [message], isTerminal: true, yielded: true })
+    }
+
+    /** The command was answered and omp reported itself not settled: the turn is held for the runs that follow. */
+    async function held(
+      h: Harness,
+      args: string,
+      signal?: AbortSignal,
+    ): Promise<{ turn: Promise<NativePromptResult>; done: () => boolean }> {
+      h.fake.state.settled = false
+      const reads = h.fake.commandsOfType('get_state').length
+      const turn = say(h, args, signal)
+      let finished = false
+      const end = (): void => {
+        finished = true
+      }
+      turn.then(end, end)
+      await waitFor(() => h.fake.commandsOfType('get_state').length > reads, 2_000, 'the state read after the goal command')
+      await sleep(30)
+      return { turn, done: () => finished }
+    }
+
+    it('answers /goal through rpc and never sends the line to the model', async () => {
+      const h = await create()
+      await h.start()
+      expect((await say(h, '')).stopReason).toBe('end_turn')
+      expect(messageText(h)).toMatch(/no goal/i)
+      h.fake.state.goal = active({ status: 'paused', tokensUsed: 1_200 })
+      expect((await say(h, 'status')).stopReason).toBe('end_turn')
+      expect(messageText(h)).toContain('fix the build')
+      expect(messageText(h)).toContain('paused')
+      expect(goalOps(h)).toEqual(['get', 'get'])
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+    })
+
+    it('creates a goal and ends the turn with the goal alone when omp does not go on by itself', async () => {
+      const h = await create()
+      await h.start()
+      expect((await say(h, 'fix the build')).stopReason).toBe('end_turn')
+      expect(h.fake.commandsOfType('goal')).toEqual([expect.objectContaining({ op: 'create', objective: 'fix the build' })])
+      expect(h.fake.state.goal).toMatchObject({ status: 'active' })
+      // The reply tells what the command did, so the frame it caused adds no note of its own.
+      expect(thoughtLines(h)).toEqual([])
+      // omp was launched with the overlay, so a goal that stays put is its own decision: no remark about the configuration.
+      expect(h.updates().filter((update) => update.sessionUpdate === 'agent_message_chunk')).toHaveLength(1)
+      expect(messageText(h)).toContain('fix the build')
+      expect(messageText(h)).not.toContain('continuationModes')
+    })
+
+    it('says that the goal waits for the next message when the overlay could not be applied', async () => {
+      const h = await create({ transport: { overlayRoot: await blockedOverlayRoot() } })
+      await h.start()
+      expect((await say(h, 'fix the build')).stopReason).toBe('end_turn')
+      expect(h.updates().filter((update) => update.sessionUpdate === 'agent_message_chunk')).toHaveLength(2)
+      expect(messageText(h)).toContain('fix the build')
+      expect(messageText(h)).toContain('continuationModes')
+    })
+
+    it('holds the turn for the runs omp starts by itself, and lets them reach it', async () => {
+      const h = await create()
+      await h.start()
+      const { turn, done } = await held(h, 'fix the build')
+      expect(done()).toBe(false)
+      continuation(h, 'working on it. ')
+      // The counters moving are no news; the goal finishing is.
+      h.fake.emit({ type: 'goal_updated', goal: active({ tokensUsed: 300 }) })
+      h.fake.emit({ type: 'goal_updated', goal: active({ status: 'complete', tokensUsed: 500 }) })
+      expect(done()).toBe(false)
+      h.fake.emit({ type: 'session_settled' })
+      const result = await turn
+      expect(result.stopReason).toBe('end_turn')
+      expect(result.usage?.outputTokens).toBe(USAGE_TWO.output)
+      const reply = messageText(h)
+      expect(reply.indexOf('fix the build')).toBeGreaterThanOrEqual(0)
+      expect(reply.indexOf('fix the build')).toBeLessThan(reply.indexOf('working on it. '))
+      expect(thoughtLines(h)).toHaveLength(1)
+      expect(thoughtLines(h)[0]).toContain('complete')
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+    })
+
+    it('ends a held goal turn when the user stops it', async () => {
+      const h = await create({ transport: { abortGraceMs: 60_000 } })
+      await h.start()
+      const controller = new AbortController()
+      const { turn } = await held(h, 'fix the build', controller.signal)
+      controller.abort()
+      expect((await turn).stopReason).toBe('cancelled')
+      expect(h.fake.commandsOfType('abort')).toHaveLength(1)
+    })
+
+    it('ends a held goal turn on a steer: the line the user typed runs as a prompt of its own', async () => {
+      const h = await create()
+      await h.start()
+      const { turn } = await held(h, 'fix the build')
+      expect(await h.transport.steer(text('actually, stop'))).toBe('promptRequired')
+      expect(h.fake.commandsOfType('steer')).toHaveLength(0)
+      expect((await turn).stopReason).toBe('end_turn')
+    })
+
+    it('does not hold the turn when omp settled while the transport was deciding', async () => {
+      // Without the overlay the remark would be due; a run that already happened makes it wrong.
+      const h = await create({ transport: { wakeSettleMs: 60_000, overlayRoot: await blockedOverlayRoot() } })
+      await h.start()
+      h.fake.state.settled = false
+      // The run was short: it started, answered and settled before the state read came back.
+      h.fake.state.onGetState = () => {
+        h.fake.state.onGetState = undefined
+        continuation(h, 'quick. ')
+        h.fake.emit({ type: 'session_settled' })
+      }
+      const outcome = await Promise.race([say(h, 'fix the build'), sleep(1_000).then(() => 'held' as const)])
+      expect(outcome).not.toBe('held')
+      expect(messageText(h)).toContain('quick. ')
+      expect(messageText(h)).not.toContain('continuationModes')
+    })
+
+    it('answers the refusals of omp as the reply of the turn, not as a failure', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.state.goal = active()
+      expect((await say(h, 'another goal')).stopReason).toBe('end_turn')
+      expect(messageText(h)).toContain('/goal clear')
+      h.fake.state.goal = null
+      h.fake.state.goalDisabled = true
+      expect((await say(h, 'a goal')).stopReason).toBe('end_turn')
+      expect(messageText(h)).toContain('goal.enabled')
+    })
+
+    it('clears, pauses and resumes through rpc, and holds a resumed goal like a new one', async () => {
+      const h = await create()
+      await h.start()
+      // Nothing to clear: omp is not asked to drop anything. Nothing to pause: the answer says so.
+      await say(h, 'clear')
+      await say(h, 'pause')
+      expect(goalOps(h)).toEqual(['get', 'pause'])
+      h.fake.state.goal = active()
+      await say(h, 'pause')
+      expect(h.fake.state.goal).toMatchObject({ status: 'paused' })
+      const { turn } = await held(h, 'resume')
+      expect(h.fake.state.goal).toMatchObject({ status: 'active' })
+      h.fake.emit({ type: 'session_settled' })
+      expect((await turn).stopReason).toBe('end_turn')
+      await say(h, 'clear')
+      expect(h.fake.state.goal).toBeNull()
+      expect(goalOps(h)).toEqual(['get', 'pause', 'pause', 'resume', 'get', 'drop'])
+      expect(thoughtLines(h)).toEqual([])
+    })
+
+    it('refuses a control word with more words after it without calling omp', async () => {
+      const h = await create()
+      await h.start()
+      await say(h, 'pause the deployment pipeline')
+      expect(h.fake.commandsOfType('goal')).toHaveLength(0)
+      expect(messageText(h)).toContain('/goal set pause the deployment pipeline')
+    })
+
+    it('leaves /goal to a user command of that name', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('prompt', () => ({ agentInvoked: false }))
+      h.fake.emit({ type: 'available_commands_update', commands: [{ name: 'goal', description: 'Mine', source: 'file' }] })
+      await waitFor(() => h.events.some((event) => event.kind === 'commands'), 2_000, 'catalogue')
+      await say(h, 'ship it')
+      expect(h.fake.commandsOfType('prompt').map((command) => command.message)).toEqual(['/goal ship it'])
+      expect(h.fake.commandsOfType('goal')).toHaveLength(0)
+    })
+
+    it('rejects the turn when the process dies under the command', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.override('goal', () => NO_RESPONSE)
+      const turn = say(h, 'fix the build')
+      turn.catch(() => undefined)
+      await waitFor(() => h.fake.commandsOfType('goal').length === 1, 2_000, 'goal command')
+      h.fake.crash(137)
+      await expect(turn).rejects.toMatchObject({ code: 'process-exit' })
+    })
+
+    it('shows a goal that changed during an ordinary turn as a note of that turn, and only logs one outside a turn', async () => {
+      const h = await create()
+      await h.start()
+      h.fake.emit({ type: 'goal_updated', goal: active() })
+      await sleep(20)
+      const { turn, promptId } = await openTurn(h)
+      h.fake.emit({ type: 'goal_updated', goal: active({ status: 'complete' }) })
+      h.fake.emit({ type: 'prompt_result', id: promptId, agentInvoked: true, status: 'completed', sessionSettled: true })
+      await turn
+      expect(thoughtLines(h)).toHaveLength(1)
+      expect(thoughtLines(h)[0]).toContain('complete')
+      expect(h.events.filter((event) => event.kind === 'notice')).toHaveLength(2)
+    })
+  })
+
+  describe('rewind command', () => {
+    const rewind = (h: Harness, args: string, signal: AbortSignal = new AbortController().signal) =>
+      h.transport.runCommand('rewind', args, signal)
+    const changed = (h: Harness) => h.events.filter((event) => event.kind === 'session_changed')
+    const rows = (text: string): string[] => text.split('\n').filter((line) => /^\| \d+ \|/.test(line))
+
+    async function started(): Promise<{ h: Harness; cwd: string }> {
+      const cwd = await tempDir('omp-rewind-cwd-')
+      const h = await create({ cwd })
+      await h.start()
+      return { h, cwd }
+    }
+
+    /** Two user messages and the file changes the agent made for them; the files are on disk as the agent left them. */
+    async function conversation(): Promise<{ h: Harness; a: string; b: string }> {
+      const { h, cwd } = await started()
+      const a = join(cwd, 'a.txt')
+      const b = join(cwd, 'b.txt')
+      await writeFile(a, 'two\n')
+      await writeFile(b, 'new\n')
+      h.fake.state.entries = [
+        entryUser('u1', null, 'first task'),
+        entryResult('r1', 'u1', 'c1', 'edit', { op: 'update', path: a, oldText: 'zero\n', newText: 'one\n' }),
+        entryUser('u2', 'r1', 'second task'),
+        entryResult('r2', 'u2', 'c2', 'edit', { op: 'update', path: a, oldText: 'one\n', newText: 'two\n' }),
+        entryResult('r3', 'r2', 'c3', 'edit', { op: 'create', path: b, newText: 'new\n' }),
+      ]
+      h.fake.state.leafId = 'r3'
+      return { h, a, b }
+    }
+
+    it('lists the user messages on the current path, newest last, from the session entries', async () => {
+      const { h } = await conversation()
+      // A branch that was left is not part of the conversation.
+      h.fake.state.entries?.push(entryUser('side', 'r1', 'a branch that was left'))
+      const result = await rewind(h, '')
+      expect(result.kind).toBe('success')
+      const listed = rows(result.text)
+      expect(listed).toHaveLength(2)
+      expect(listed[0]).toContain('first task')
+      expect(listed[1]).toContain('second task')
+      expect(h.fake.commandsOfType('get_entries')).toHaveLength(1)
+      expect(h.fake.commandsOfType('branch')).toHaveLength(0)
+    })
+
+    it('previews without changing anything, also while a turn runs', async () => {
+      const { h, a, b } = await conversation()
+      const { turn, promptId } = await openTurn(h)
+      const preview = await rewind(h, '2')
+      expect(preview.kind).toBe('success')
+      expect(preview.text).toContain('a.txt')
+      expect(preview.text).toContain('b.txt')
+      expect(await readFile(a, 'utf8')).toBe('two\n')
+      expect(existsSync(b)).toBe(true)
+      expect(h.fake.commandsOfType('branch')).toHaveLength(0)
+      h.fake.emit({ type: 'prompt_result', id: promptId, agentInvoked: true, status: 'completed', sessionSettled: true })
+      await turn
+    })
+
+    it('restores the files, then moves the conversation to a branch and tells the host the session it is in now', async () => {
+      const { h, a, b } = await conversation()
+      let filesWereBackWhenBranched = false
+      h.fake.state.onBranch = () => {
+        filesWereBackWhenBranched = !existsSync(b)
+      }
+      const result = await rewind(h, '2 confirm')
+      expect(result.kind).toBe('success')
+      expect(await readFile(a, 'utf8')).toBe('one\n')
+      expect(existsSync(b)).toBe(false)
+      expect(filesWereBackWhenBranched).toBe(true)
+      expect(h.fake.commandsOfType('branch')).toEqual([expect.objectContaining({ entryId: 'u2' })])
+      expect(changed(h)).toEqual([{ kind: 'session_changed', sessionId: 'fake-session-2', reason: 'rewind' }])
+      expect(h.transport.sessionId).toBe('fake-session-2')
+      expect(h.transport.sessionFilePath).toBe(h.fake.state.sessionFile)
+      // What the branch holds is what the next listing reads, and the next rewind undoes the older edit too.
+      expect(rows((await rewind(h, '')).text)).toHaveLength(1)
+      expect((await rewind(h, '1 confirm')).kind).toBe('success')
+      expect(await readFile(a, 'utf8')).toBe('zero\n')
+    })
+
+    it('restores only the files for `code` and only the conversation for `chat`', async () => {
+      const code = await conversation()
+      expect((await rewind(code.h, '2 code confirm')).kind).toBe('success')
+      expect(await readFile(code.a, 'utf8')).toBe('one\n')
+      expect(existsSync(code.b)).toBe(false)
+      expect(code.h.fake.commandsOfType('branch')).toHaveLength(0)
+      expect(changed(code.h)).toEqual([])
+      expect(code.h.transport.sessionId).toBe('fake-session-1')
+
+      const chat = await conversation()
+      expect((await rewind(chat.h, '2 chat confirm')).kind).toBe('success')
+      expect(await readFile(chat.a, 'utf8')).toBe('two\n')
+      expect(existsSync(chat.b)).toBe(true)
+      expect(chat.h.fake.commandsOfType('branch')).toHaveLength(1)
+      expect(changed(chat.h)).toHaveLength(1)
+    })
+
+    it('changes nothing while a turn runs', async () => {
+      const { h, a, b } = await conversation()
+      const { turn, promptId } = await openTurn(h)
+      expect((await rewind(h, '2 confirm')).kind).toBe('error')
+      expect(await readFile(a, 'utf8')).toBe('two\n')
+      expect(existsSync(b)).toBe(true)
+      expect(h.fake.commandsOfType('branch')).toHaveLength(0)
+      h.fake.emit({ type: 'prompt_result', id: promptId, agentInvoked: true, status: 'completed', sessionSettled: true })
+      await turn
+      expect((await rewind(h, '2 confirm')).kind).toBe('success')
+    })
+
+    it('leaves a file alone that something else changed since, still rolls the conversation back and names the file', async () => {
+      const { h, a, b } = await conversation()
+      await writeFile(a, 'edited by hand\n')
+      const result = await rewind(h, '2 confirm')
+      expect(result.kind).toBe('success')
+      expect(result.text).toContain('a.txt')
+      expect(await readFile(a, 'utf8')).toBe('edited by hand\n')
+      expect(existsSync(b)).toBe(false)
+      expect(h.fake.commandsOfType('branch')).toHaveLength(1)
+    })
+
+    it('never reads or writes a file outside the session directory, whatever a record says', async () => {
+      const { h } = await started()
+      const outside = join(await tempDir('omp-rewind-outside-'), 'x.txt')
+      await writeFile(outside, 'after\n')
+      h.fake.state.entries = [
+        entryUser('u1', null, 'go'),
+        entryResult('r1', 'u1', 'c1', 'edit', { op: 'update', path: outside, oldText: 'before\n', newText: 'after\n' }),
+      ]
+      h.fake.state.leafId = 'r1'
+      const result = await rewind(h, '1 code confirm')
+      expect(await readFile(outside, 'utf8')).toBe('after\n')
+      expect(result.text).toContain('outside')
+    })
+
+    it('reports a conversation that would not move, after the files already went back', async () => {
+      const { h, a } = await conversation()
+      h.fake.override('branch', () => ({ text: '', cancelled: true }))
+      const vetoed = await rewind(h, '2 confirm')
+      expect(vetoed.kind).toBe('error')
+      expect(vetoed.text).toContain('vetoed')
+      expect(changed(h)).toEqual([])
+      expect(h.transport.sessionId).toBe('fake-session-1')
+      expect(await readFile(a, 'utf8')).toBe('one\n')
+      h.fake.override('branch', () => {
+        throw new FakeRpcError('Invalid entry ID for branching')
+      })
+      const refused = await rewind(h, '2 chat confirm')
+      expect(refused).toMatchObject({ kind: 'error', text: expect.stringContaining('Invalid entry ID for branching') })
+      expect(changed(h)).toEqual([])
+    })
+
+    it('starts no prompt while the conversation is moving', async () => {
+      const { h } = await conversation()
+      h.fake.override('branch', () => NO_RESPONSE)
+      const run = rewind(h, '2 chat confirm')
+      await waitFor(() => h.fake.commandsOfType('branch').length === 1, 2_000, 'branch')
+      await expect(h.transport.prompt(text('hello'), new AbortController().signal)).rejects.toMatchObject({ code: 'busy' })
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(0)
+      h.fake.respond(h.fake.commandsOfType('branch')[0]?.id, 'branch', { text: '', cancelled: false })
+      expect((await run).kind).toBe('success')
+      h.fake.override('prompt', () => ({ agentInvoked: false }))
+      await h.transport.prompt(text('hello'), new AbortController().signal)
+      expect(h.fake.commandsOfType('prompt')).toHaveLength(1)
+    })
+
+    it('answers a command line that makes no sense, a cancelled command and a refused read without changing anything', async () => {
+      const { h } = await started()
+      expect((await rewind(h, 'confirm')).kind).toBe('error')
+      const aborted = new AbortController()
+      aborted.abort()
+      expect((await rewind(h, '', aborted.signal)).kind).toBe('error')
+      expect(h.fake.commandsOfType('get_entries')).toHaveLength(0)
+      h.fake.override('get_entries', () => {
+        throw new FakeRpcError('session not loaded')
+      })
+      expect(await rewind(h, '')).toMatchObject({ kind: 'error', text: expect.stringContaining('session not loaded') })
+    })
+
+    it('lets a lost process through instead of answering for it', async () => {
+      const { h } = await started()
+      h.fake.override('get_entries', () => NO_RESPONSE)
+      const run = rewind(h, '')
+      run.catch(() => undefined)
+      await waitFor(() => h.fake.commandsOfType('get_entries').length === 1, 2_000, 'get_entries')
+      h.fake.crash(1)
+      await expect(run).rejects.toMatchObject({ code: 'process-exit' })
     })
   })
 
@@ -2314,15 +4982,17 @@ describe.skipIf(!e2eEnabled)('OmpNativeTransport against the real omp binary', (
     expect(live.transport.agentInfo.version).toMatch(/^\d+\.\d+\.\d+/)
     await expectEventually(
       () =>
-        live
-          .updates()
-          .some(
-            (update) =>
-              update.sessionUpdate === 'available_commands_update' &&
-              update.availableCommands.some((command) => command.name === 'dsh-native-test-marker'),
-          ),
-      'the extension command in available_commands_update',
+        live.events.some(
+          (event) =>
+            event.kind === 'commands' && event.commands.some((command) => command.name === 'dsh-native-test-marker'),
+        ),
+      'the extension command in the commands event',
     )
+    // omp's catalogue plus the commands the transport serves is what the host registers; no ACP update carries it.
+    expect(live.transport.commands().map((command) => command.name)).toEqual(
+      expect.arrayContaining(['btw', 'new', 'clear', 'rewind', 'goal', 'compact', 'dsh-native-test-marker']),
+    )
+    expect(live.updates().some((update) => update.sessionUpdate === 'available_commands_update')).toBe(false)
   }, 60_000)
 
   it('reports the same controls as omp acp session/new for the same cwd (plan mode aside)', async () => {
@@ -2347,7 +5017,10 @@ describe.skipIf(!e2eEnabled)('OmpNativeTransport against the real omp binary', (
     const acpOptions = acp.configOptions.map((option) =>
       option.id === 'mode' ? { ...option, options: jsonObjects(option.options).filter((entry) => entry.value !== 'plan') } : option,
     )
-    expect(native.configOptions).toEqual(acpOptions)
+    // omp acp has no `/fast` and `/slow` toggles: the native controls add them next to its three options.
+    expect(jsonObjects(native.configOptions).filter((option) => option.id !== 'fast' && option.id !== 'slow')).toEqual(
+      acpOptions,
+    )
   }, 90_000)
 
   it('runs a tool-using turn: ACP-shaped tool_call/tool_call_update, reply text, per-turn usage and context', async () => {
@@ -2520,7 +5193,12 @@ describe.skipIf(!e2eEnabled)('OmpNativeTransport against the real omp binary', (
       sessionFiles.clear()
       expect(resumed, `no recent session in ${dir} could be resumed:\n${failures.join('\n')}`).toBeDefined()
       expect(resumed?.transport.sessionId).toBe(resumedId)
-      expect(resumed?.transport.controls().configOptions.map((option) => option.id)).toEqual(['mode', 'model', 'thinking'])
+      expect(
+        resumed?.transport
+          .controls()
+          .configOptions.map((option) => option.id)
+          .filter((id) => id !== 'fast' && id !== 'slow'),
+      ).toEqual(['mode', 'model', 'thinking'])
       expect(resumed?.transport.controls().modes?.currentModeId).toBe('default')
       expect(resumed?.controlValue('model')).toMatch(/.+\/.+/)
       expect(resumed?.transport.contextUsage()?.size).toBeGreaterThan(0)

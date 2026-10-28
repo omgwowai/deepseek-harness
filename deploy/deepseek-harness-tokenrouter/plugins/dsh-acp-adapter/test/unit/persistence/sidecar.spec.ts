@@ -43,6 +43,7 @@ import {
   acpOptionsSnapshotOf,
   createAcpSidecar,
   installAcpSidecar,
+  modeIntentBindingKey,
   toOptionsSnapshotRecord,
   type AcpBindingData,
   type AcpBindingRecord,
@@ -1682,6 +1683,117 @@ describe('pending member mode storage', () => {
     await store.writeModeIntent(id, intent)
     expect(await store.readModeIntent(id)).toEqual(intent)
     await expect(store.writeModeIntent(id, { ...intent, modeId: 'm'.repeat(513) })).rejects.toThrow(TypeError)
+  })
+})
+
+describe('pending option storage', () => {
+  it('adds storage to an existing database, keeps the last choice per option and clears only the exact choice', async () => {
+    const id = SessionId('option-migration')
+    const snapshot = acpOptionsSnapshotOf([], 'code', 'fp-1', TIME_BASE)
+    await store.writeOptionSnapshot(id, snapshot)
+    await store.dispose()
+    const old = rawDb()
+    old.exec('DROP TABLE option_intents')
+    old.close()
+    expect(await store.listOptionIntents(id)).toEqual([])
+    expect(await store.readOptionSnapshot(id)).toEqual(snapshot)
+    const earlier = { bindingKey: 'original', optionId: 'fast-mode', value: 'on' }
+    const latest = { bindingKey: 'original', optionId: 'fast-mode', value: 'off' }
+    await store.writeOptionIntent(id, earlier)
+    await store.writeOptionIntent(id, latest)
+    // A late completion of the earlier choice must not clear the newer one.
+    await store.clearOptionIntent(id, earlier)
+    await store.dispose()
+    expect(await store.listOptionIntents(id)).toEqual([latest])
+    await store.clearOptionIntent(id, latest)
+    expect(await store.listOptionIntents(id)).toEqual([])
+  })
+
+  it('lists the choices by option id, keeps their value types and isolates sessions', async () => {
+    const id = SessionId('option-types')
+    const zeta = { bindingKey: 'k', optionId: 'zeta', value: 'true' }
+    const alpha = { bindingKey: 'k', optionId: 'alpha', value: true }
+    const mid = { bindingKey: 'k', optionId: 'mid', value: false }
+    const empty = { bindingKey: 'k', optionId: 'empty', value: '' }
+    for (const intent of [zeta, alpha, mid, empty]) await store.writeOptionIntent(id, intent)
+    // The text "true" stays a string and a boolean stays a boolean.
+    expect(await store.listOptionIntents(id)).toEqual([alpha, empty, mid, zeta])
+    expect(await store.listOptionIntents(SessionId('another-session'))).toEqual([])
+    await store.clearOptionIntent(id, { ...alpha, value: 'true' })
+    expect(await store.listOptionIntents(id)).toHaveLength(4)
+    await store.clearOptionIntent(id, alpha)
+    expect(await store.listOptionIntents(id)).toEqual([empty, mid, zeta])
+  })
+
+  it('rejects malformed choices and skips malformed rows', async () => {
+    const id = SessionId('option-validation')
+    const valid = { bindingKey: 'original', optionId: 'fast-mode', value: 'on' }
+    for (const invalid of [
+      { ...valid, optionId: '' },
+      { ...valid, optionId: 'o'.repeat(ACP_CONFIG_IDENTIFIER_MAX + 1) },
+      { ...valid, bindingKey: '' },
+      { ...valid, bindingKey: 'k'.repeat(8193) },
+      { ...valid, value: 'v'.repeat(ACP_CONFIG_IDENTIFIER_MAX + 1) },
+      { ...valid, value: 1 as never },
+    ]) {
+      await expect(store.writeOptionIntent(id, invalid)).rejects.toThrow(TypeError)
+      await expect(store.clearOptionIntent(id, invalid)).rejects.toThrow(TypeError)
+    }
+    await expect(store.writeOptionIntent(SessionId('../escape'), valid)).rejects.toThrow(TypeError)
+    expect(await store.listOptionIntents(id)).toEqual([])
+
+    await store.writeOptionIntent(id, valid)
+    const raw = rawDb()
+    try {
+      const insert = raw.prepare('INSERT INTO option_intents VALUES (?, ?, ?, ?, ?)')
+      insert.run(id, 'unreadable', 'original', 'boolean', 'maybe')
+      expect(() => insert.run(id, 'unknown-type', 'original', 'number', '1')).toThrow()
+    } finally {
+      raw.close()
+    }
+    expect(await store.listOptionIntents(id)).toEqual([valid])
+    expect(warns.filter((message) => message.includes('malformed option intent'))).toHaveLength(1)
+  })
+
+  it('follows the session to the replacement binding of a directory fork, and only then', async () => {
+    const id = SessionId('option-fork')
+    const next = bindingData({
+      agentSessionId: 'forked-session',
+      canonicalCwd: '/tmp/checkout',
+      generation: 2,
+      bindingEpoch: 2,
+      establishedAt: TIME_BASE + 1,
+    })
+    await store.append(id, { kind: 'binding', data: BINDING_A })
+    await store.writeRecoveryState({
+      dshSessionId: id,
+      kind: 'outcome-unknown',
+      cause: 'fork-intent',
+      provider: BINDING_A.provider,
+      acpSessionId: BINDING_A.agentSessionId,
+      generation: BINDING_A.generation,
+      updatedAt: TIME_BASE,
+    })
+    const parentKey = modeIntentBindingKey(BINDING_A)
+    const elsewhere = { bindingKey: 'a-replaced-binding', optionId: 'auto_compact', value: false }
+    await store.writeModeIntent(id, { bindingKey: parentKey, modeId: 'plan' })
+    await store.writeOptionIntent(id, { bindingKey: parentKey, optionId: 'fast-mode', value: 'on' })
+    await store.writeOptionIntent(id, elsewhere)
+
+    // A fork that is refused moves nothing.
+    await expect(store.commitDirectoryFork(id, { ...BINDING_A, dshCommittedSeq: 9 }, next)).rejects.toThrow(
+      'parent changed',
+    )
+    expect(await store.readModeIntent(id)).toEqual({ bindingKey: parentKey, modeId: 'plan' })
+
+    await store.commitDirectoryFork(id, BINDING_A, next)
+    const forkKey = modeIntentBindingKey(next)
+    expect(forkKey).not.toBe(parentKey)
+    expect(await store.readModeIntent(id)).toEqual({ bindingKey: forkKey, modeId: 'plan' })
+    expect(await store.listOptionIntents(id)).toEqual([
+      elsewhere,
+      { bindingKey: forkKey, optionId: 'fast-mode', value: 'on' },
+    ])
   })
 })
 

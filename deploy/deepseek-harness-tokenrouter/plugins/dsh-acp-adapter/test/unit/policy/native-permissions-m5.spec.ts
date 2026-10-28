@@ -33,6 +33,34 @@ const option = (optionId: string, name: string, kind: acp.PermissionOption['kind
   name,
   kind,
 })
+
+const PLAN = '# Plan\n\n1. Bridge the form\n2. Cover it with tests'
+const CLAUDE_PLAN_OPTIONS = [
+  option('clear_context_accept_edits', 'Yes, clear context and auto-accept edits', 'allow_always'),
+  option('accept_edits', 'Yes, and auto-accept edits', 'allow_always'),
+  option('default', 'Yes, and manually approve edits', 'allow_once'),
+  option('plan', 'No, keep planning', 'reject_once'),
+]
+const CODEX_PLAN_OPTIONS = [
+  option('implement_plan', 'Yes, implement this plan', 'allow_once'),
+  option('revise_plan', 'No, and tell Codex what to do differently', 'reject_once'),
+]
+/** What Claude's ExitPlanMode and Codex's plan review send: kind `switch_mode`, the plan in the raw input. */
+const planApproval = (
+  options: acp.PermissionOption[],
+  toolCall: Partial<acp.RequestPermissionRequest['toolCall']> = {},
+): acp.RequestPermissionRequest => ({
+  sessionId: 'acp-session',
+  toolCall: {
+    toolCallId: 'plan-call',
+    title: 'Approve Plan',
+    kind: 'switch_mode',
+    status: 'pending',
+    rawInput: { plan: PLAN },
+    ...toolCall,
+  },
+  options,
+})
 function bridge(
   answer: string | undefined,
   custom?: string,
@@ -163,6 +191,247 @@ describe('native ACP permission bridge', () => {
     expect(reason).toContain('/workspace/private-report')
     expect(reason).toContain('"enabled": true')
     expect(ask).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      vendor: 'Claude',
+      title: 'Approve Plan',
+      options: CLAUDE_PLAN_OPTIONS,
+      choose: 'Yes, and auto-accept edits',
+      optionId: 'accept_edits',
+    },
+    {
+      vendor: 'Codex',
+      title: 'Implement this plan?',
+      options: CODEX_PLAN_OPTIONS,
+      choose: 'No, and tell Codex what to do differently',
+      optionId: 'revise_plan',
+    },
+  ])(
+    'asks a $vendor plan approval as a question with every option and the plan, never as a native approval',
+    async ({ title, options, choose, optionId }) => {
+      const approval = { request: vi.fn(async () => 'allowed-once' as const) }
+      const records: AcpPermissionAuditRecord[] = []
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async ({ questions }) => ({
+        answers: [{ id: questions[0]!.id, selected: [choose] }],
+      }))
+      const handler = createAcpNativePermissionHandler({
+        approval,
+        userQuestions: { ask },
+        getAgent: () => ({ id: 'live-agent' }),
+        audit: { append: async (record) => void records.push(record) },
+      })
+
+      await expect(handler(planApproval(options, { title }))).resolves.toEqual({
+        outcome: { outcome: 'selected', optionId },
+      })
+      expect(approval.request).not.toHaveBeenCalled()
+      expect(ask).toHaveBeenCalledOnce()
+      expect(ask.mock.calls[0]?.[0].questions).toEqual([
+        {
+          id: expect.stringMatching(/^acp-permission:/),
+          question: title,
+          detail: PLAN,
+          options: options.map((entry) => ({ label: entry.name })),
+        },
+      ])
+      expect(records.at(-1)?.data).toMatchObject({ outcome: 'selected', optionId, decisionVia: 'native-question' })
+    },
+  )
+
+  it('maps every option of a plan approval back to its exact id, whatever its kind', async () => {
+    for (const candidate of CLAUDE_PLAN_OPTIONS) {
+      const { handler } = bridge(candidate.name)
+      await expect(handler(planApproval(CLAUDE_PLAN_OPTIONS))).resolves.toEqual({
+        outcome: { outcome: 'selected', optionId: candidate.optionId },
+      })
+    }
+  })
+
+  it('shows the plan from the text of the tool call content when the raw input carries none', async () => {
+    const { handler, ask } = bridge('Yes, implement this plan')
+    await handler(
+      planApproval(CODEX_PLAN_OPTIONS, {
+        rawInput: {},
+        content: [
+          { type: 'content', content: { type: 'text', text: 'First step' } },
+          { type: 'diff', path: '/work/a.ts', oldText: 'a', newText: 'b' },
+          { type: 'content', content: { type: 'text', text: 'Second step' } },
+        ],
+      }),
+    )
+    expect(ask.mock.calls[0]?.[0].questions[0]?.detail).toBe('First step\n\nSecond step')
+  })
+
+  it('bounds the plan detail and shows control characters instead of letting them act', async () => {
+    const { handler, ask } = bridge('Yes, implement this plan')
+    await handler(planApproval(CODEX_PLAN_OPTIONS, { rawInput: { plan: `Step\r\n\u001b[31m${'x'.repeat(5_000)}` } }))
+    const detail = ask.mock.calls[0]?.[0].questions[0]?.detail ?? ''
+    expect(detail.startsWith('Step\n\\x1b[31mx')).toBe(true)
+    expect(detail).not.toContain('\u001b')
+    expect(detail).not.toContain('\r')
+    expect(detail).toHaveLength(4_097)
+    expect(detail.endsWith('…')).toBe(true)
+  })
+
+  it('titles an untitled plan approval with the generic request and omits a missing plan', async () => {
+    const { handler, ask } = bridge('Yes, implement this plan')
+    await handler(planApproval(CODEX_PLAN_OPTIONS, { title: null, rawInput: undefined }))
+    const question = ask.mock.calls[0]?.[0].questions[0]
+    expect(question?.question).toBe('The ACP Agent requests permission to perform a restricted operation.')
+    expect(question).not.toHaveProperty('detail')
+  })
+
+  it('cancels a plan approval for typed text or a skipped card, never approving natively or asking twice', async () => {
+    const approval = { request: vi.fn(async () => 'allowed-once' as const) }
+    for (const answer of [
+      { selected: [], custom: 'rewrite step 2' },
+      { selected: ['Yes, implement this plan'], custom: 'also add docs' },
+      { selected: [] },
+    ]) {
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async ({ questions }) => ({
+        answers: [{ id: questions[0]!.id, ...answer }],
+      }))
+      const handler = createAcpNativePermissionHandler({ approval, userQuestions: { ask }, getAgent: () => ({}) })
+      await expect(handler(planApproval(CODEX_PLAN_OPTIONS))).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+      expect(ask).toHaveBeenCalledOnce()
+    }
+    expect(approval.request).not.toHaveBeenCalled()
+  })
+
+  describe('a plan approval whose question card cannot be shown', () => {
+    // DSH rejects a native question from a session another live Agent owns, before the card exists.
+    const delegatedCaller = (): Error =>
+      Object.assign(new Error('human interaction is unavailable while the calling agent is owned by another'), {
+        code: 'DELEGATED_CALLER',
+      })
+    const vendors = [
+      { vendor: 'Claude', options: CLAUDE_PLAN_OPTIONS, allow: 'default', reject: 'plan' },
+      { vendor: 'Codex', options: CODEX_PLAN_OPTIONS, allow: 'implement_plan', reject: 'revise_plan' },
+    ]
+
+    it.each(
+      vendors.flatMap((entry) => (['absent', 'delegated'] as const).map((questions) => ({ ...entry, questions }))),
+    )(
+      'answers a $vendor plan approval through the native approval when the question service is $questions',
+      async ({ options, allow, reject, questions }) => {
+        for (const [verdict, expected] of [
+          ['allowed-once', { outcome: { outcome: 'selected', optionId: allow } }],
+          ['rejected', { outcome: { outcome: 'selected', optionId: reject } }],
+          ['cancelled', { outcome: { outcome: 'cancelled' } }],
+          ['unavailable', { outcome: { outcome: 'cancelled' } }],
+        ] as const) {
+          const records: AcpPermissionAuditRecord[] = []
+          const request = vi.fn<AcpNativeApprovalService['request']>(async () => verdict)
+          const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async () => {
+            throw delegatedCaller()
+          })
+          const handler = createAcpNativePermissionHandler({
+            approval: { request },
+            ...(questions === 'absent' ? {} : { userQuestions: { ask } }),
+            getAgent: () => ({ id: 'live-agent' }),
+            audit: { append: async (record) => void records.push(record) },
+          })
+
+          await expect(handler(planApproval(options))).resolves.toEqual(expected)
+          expect(request).toHaveBeenCalledOnce()
+          expect(request).toHaveBeenCalledWith(
+            expect.objectContaining({
+              callId: 'plan-call',
+              toolName: 'switch_mode',
+              reason: expect.stringContaining('Approve Plan'),
+            }),
+          )
+          // The card never reached the user, so the approval is the only answer: one request, one decision.
+          expect(ask).toHaveBeenCalledTimes(questions === 'absent' ? 0 : 1)
+          expect(records.map((record) => record.data.phase)).toEqual(['asked', 'decided'])
+          expect(records.at(-1)?.data).toMatchObject({ decisionVia: 'native-approval' })
+        }
+      },
+    )
+
+    it.each([
+      ['a plain failure', () => new Error('the card renderer crashed')],
+      ['another question service code', () => Object.assign(new Error('no live agent'), { code: 'CALLER_NOT_LIVE' })],
+      ['a message that only names the code', () => new Error('DELEGATED_CALLER')],
+    ])('does not hand a plan approval to the native approval after %s', async (_name, failure) => {
+      const request = vi.fn<AcpNativeApprovalService['request']>(async () => 'allowed-once')
+      const log = vi.fn<(message: string) => void>()
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async () => {
+        throw failure()
+      })
+      const handler = createAcpNativePermissionHandler({
+        approval: { request },
+        userQuestions: { ask },
+        getAgent: () => ({}),
+        log,
+      })
+
+      await expect(handler(planApproval(CODEX_PLAN_OPTIONS))).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+      expect(request).not.toHaveBeenCalled()
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('native permission question cancelled'))
+    })
+
+    it('does not fall back once the request was aborted', async () => {
+      const controller = new AbortController()
+      const request = vi.fn<AcpNativeApprovalService['request']>(async () => 'allowed-once')
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async () => {
+        controller.abort()
+        throw delegatedCaller()
+      })
+      const handler = createAcpNativePermissionHandler({
+        approval: { request },
+        userQuestions: { ask },
+        getAgent: () => ({}),
+      })
+
+      await expect(handler(planApproval(CODEX_PLAN_OPTIONS), controller.signal)).resolves.toEqual({
+        outcome: { outcome: 'cancelled' },
+      })
+      expect(request).not.toHaveBeenCalled()
+    })
+
+    it('cancels when the native approval is unavailable too, without asking the card a second time', async () => {
+      const records: AcpPermissionAuditRecord[] = []
+      const log = vi.fn<(message: string) => void>()
+      const request = vi.fn<AcpNativeApprovalService['request']>(async () => {
+        throw new Error('approval service offline')
+      })
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async () => {
+        throw delegatedCaller()
+      })
+      const handler = createAcpNativePermissionHandler({
+        approval: { request },
+        userQuestions: { ask },
+        getAgent: () => ({}),
+        log,
+        audit: { append: async (record) => void records.push(record) },
+      })
+
+      await expect(handler(planApproval(CODEX_PLAN_OPTIONS))).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+      expect(ask).toHaveBeenCalledOnce()
+      expect(request).toHaveBeenCalledOnce()
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('native approval unavailable'))
+      expect(records.map((record) => record.data.phase)).toEqual(['asked', 'decided'])
+      expect(records.at(-1)?.data).toMatchObject({ outcome: 'cancelled', decisionVia: 'native-approval' })
+    })
+
+    it('has nothing to map an approval onto without an allow-once option, so it cancels', async () => {
+      const request = vi.fn<AcpNativeApprovalService['request']>(async () => 'allowed-once')
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async () => {
+        throw delegatedCaller()
+      })
+      const handler = createAcpNativePermissionHandler({
+        approval: { request },
+        userQuestions: { ask },
+        getAgent: () => ({}),
+      })
+      const options = [option('go', 'Go', 'allow_always'), option('stop', 'Stop', 'reject_once')]
+
+      await expect(handler(planApproval(options))).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+      expect(request).not.toHaveBeenCalled()
+    })
   })
 
   it('routes the exact Antigravity interaction payload to DSH and returns the selected option id', async () => {

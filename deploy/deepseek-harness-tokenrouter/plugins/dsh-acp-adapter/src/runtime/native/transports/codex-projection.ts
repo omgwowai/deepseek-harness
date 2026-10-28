@@ -25,7 +25,7 @@
  */
 import type * as acp from '@agentclientprotocol/sdk'
 
-import { asRecord, readArray, readNumber, readString, readStringArray, type JsonRecord } from './codex-json.ts'
+import { asRecord, readArray, readNumber, readString, readStringArray, truncate, type JsonRecord } from './codex-json.ts'
 import type { NativeContextUsage, NativeTurnUsage } from './contract.ts'
 
 // ---------------------------------------------------------------------------
@@ -242,6 +242,8 @@ function singleAction(item: JsonRecord): JsonRecord | undefined {
 }
 
 function usesTerminal(item: JsonRecord): boolean {
+  // A command the user typed (`!cmd`) always shows its output, whatever it looks like.
+  if (item['source'] === 'userShell') return true
   const action = singleAction(item)
   return action === undefined || commandActionType(action) === 'unknown'
 }
@@ -285,7 +287,8 @@ function commandActionFacts(
 function commandStartFacts(item: JsonRecord, id: string): ToolFacts {
   const name = commandToolName(item['source'])
   const command = readString(item, 'command') ?? ''
-  const action = singleAction(item) ?? { type: 'unknown', command }
+  // A command the user typed (`!cmd`) is shown as typed, never reinterpreted as a read or a search.
+  const action = (item['source'] === 'userShell' ? undefined : singleAction(item)) ?? { type: 'unknown', command }
   const facts = commandActionFacts(id, item['status'], readString(item, 'cwd') ?? '', action, command)
   return name === undefined ? facts : { ...facts, name }
 }
@@ -1049,6 +1052,9 @@ export function elicitationPermissionToolCall(
   const mode = readString(params, 'mode')
   if (mode === 'url') {
     const message = readString(params, 'message')
+    const url = readString(params, 'url')
+    // The link is what the user decides about: it is shown whole, and clickable where the text is rendered as Markdown.
+    const readable = [message, url === undefined ? undefined : `<${url}>`].filter((part) => part !== undefined && part !== '').join('\n\n')
     return renderPermissionToolCall({
       toolCallId: `elicitation-${readString(params, 'elicitationId') ?? ''}`,
       report: 'update',
@@ -1056,7 +1062,7 @@ export function elicitationPermissionToolCall(
       status: 'pending',
       title: 'MCP server requests to open a URL',
       input: { serverName: params['serverName'], description: params['message'], url: params['url'] },
-      ...(message === undefined ? {} : { readableInput: message }),
+      ...(readable === '' ? {} : { readableInput: readable }),
     })
   }
   if (correlatedCallId !== undefined) {
@@ -1349,6 +1355,79 @@ function messageChunk(kind: 'agent_message_chunk' | 'agent_thought_chunk', text:
   return kind === 'agent_message_chunk'
     ? { sessionUpdate: 'agent_message_chunk', ...id, content }
     : { sessionUpdate: 'agent_thought_chunk', ...id, content }
+}
+
+/** A short note in the assistant's thought stream (a quiet notice of the app-server). */
+export function thoughtNote(text: string): acp.SessionUpdate {
+  return messageChunk('agent_thought_chunk', `${text}\n\n`)
+}
+
+const NOTE_LIMIT = 400
+
+const collapseWhitespace = (text: string): string => text.replace(/\s+/g, ' ').trim()
+
+function hookNote(run: JsonRecord | undefined): string | undefined {
+  const status = readString(run, 'status')
+  if (run === undefined || status === undefined || status === 'running') return undefined
+  const output = (readArray(run, 'entries') ?? []).flatMap((entry) => {
+    const text = collapseWhitespace(readString(asRecord(entry), 'text') ?? '')
+    // `context` entries feed the model; the TUI shows the others.
+    return text === '' || readString(asRecord(entry), 'kind') === 'context' ? [] : [text]
+  })
+  // A hook that ran quietly and succeeded is not worth a line.
+  if (status === 'completed' && output.length === 0) return undefined
+  const event = readString(run, 'eventName') ?? 'hook'
+  const headline =
+    status === 'failed'
+      ? `Hook failed (${event})`
+      : status === 'blocked'
+        ? `Blocked by hook (${event})`
+        : status === 'stopped'
+          ? `Hook stopped (${event})`
+          : `Hook (${event})`
+  const detail = output.length > 0 ? output.join(' · ') : collapseWhitespace(readString(run, 'statusMessage') ?? '')
+  return truncate(detail === '' ? headline : `${headline}: ${detail}`, NOTE_LIMIT)
+}
+
+/**
+ * One-line text for the notifications the TUI shows quietly: lifecycle hooks that failed, blocked or said something,
+ * deprecations, auto-review warnings, MCP servers that failed to start and MCP sign-ins that finished. `undefined`
+ * for everything else (and for the routine ones the TUI hides).
+ */
+export function codexNoticeText(method: string, params: JsonRecord): string | undefined {
+  switch (method) {
+    case 'hook/completed':
+      return hookNote(asRecord(params['run']))
+    case 'deprecationNotice': {
+      const summary = collapseWhitespace(readString(params, 'summary') ?? '')
+      const details = collapseWhitespace(readString(params, 'details') ?? '')
+      if (summary === '') return undefined
+      return truncate(details === '' ? `Deprecated: ${summary}` : `Deprecated: ${summary} — ${details}`, NOTE_LIMIT)
+    }
+    case 'guardianWarning': {
+      const message = collapseWhitespace(readString(params, 'message') ?? '')
+      // The TUI hides the reviews that approved.
+      if (message === '' || message.startsWith('Automatic approval review approved (')) return undefined
+      return truncate(`Auto-review warning: ${message}`, NOTE_LIMIT)
+    }
+    case 'mcpServer/startupStatus/updated': {
+      if (readString(params, 'status') !== 'failed') return undefined
+      const name = readString(params, 'name') ?? 'an MCP server'
+      if (readString(params, 'failureReason') === 'reauthenticationRequired') {
+        return `MCP server ${name} needs to be signed in again (/mcp login ${name}).`
+      }
+      const error = collapseWhitespace(readString(params, 'error') ?? '')
+      return truncate(error === '' ? `MCP server ${name} failed to start.` : `MCP server ${name} failed to start: ${error}`, NOTE_LIMIT)
+    }
+    case 'mcpServer/oauthLogin/completed': {
+      const name = readString(params, 'name') ?? 'the MCP server'
+      if (params['success'] === true) return `Signed in to ${name}.`
+      const error = collapseWhitespace(readString(params, 'error') ?? '')
+      return truncate(error === '' ? `Signing in to ${name} failed.` : `Signing in to ${name} failed: ${error}`, NOTE_LIMIT)
+    }
+    default:
+      return undefined
+  }
 }
 
 export interface CodexCompletedPlan {

@@ -136,10 +136,29 @@ function permissionDetail(tool: acp.RequestPermissionRequest['toolCall'], copy: 
   const summary = summarizeRawInputForAudit(tool.rawInput).summary
   return summary === '{}' ? undefined : `${copy.details}: ${safeText(summary)}`
 }
+/** A plan shown for approval is bounded like other question text, so an oversized plan cannot flood the card. */
+const PLAN_DETAIL_MAX = 4_096
+/**
+ * The plan a plan-approval request (Claude `ExitPlanMode`, Codex plan review) asks the user to approve: the
+ * `plan` of its raw input, else the text blocks of the tool call. Control characters are shown, never executed.
+ */
+function planDetail(tool: acp.RequestPermissionRequest['toolCall']): string | undefined {
+  const plan = recordValue(tool.rawInput)?.plan
+  const text =
+    typeof plan === 'string' && plan.trim() !== ''
+      ? plan
+      : (tool.content ?? [])
+          .flatMap((entry) => (entry.type === 'content' && entry.content.type === 'text' ? [entry.content.text] : []))
+          .join('\n\n')
+  const visible = visibleCommand(text.replace(/\r\n?/g, '\n')).trim()
+  if (visible === '') return undefined
+  return visible.length > PLAN_DETAIL_MAX ? `${visible.slice(0, PLAN_DETAIL_MAX)}…` : visible
+}
 function permissionQuestionDetail(
   tool: acp.RequestPermissionRequest['toolCall'],
   copy: PermissionCopy,
 ): string | undefined {
+  if (tool.kind === 'switch_mode') return planDetail(tool)
   if (tool.kind !== 'execute') return undefined
   const command = commandOf(tool)
   return command === undefined
@@ -268,14 +287,17 @@ export function createAcpNativePermissionHandler(
       nativeInteractionCall &&
       params.options.length > 0 &&
       params.options.every((option) => option.kind === 'allow_once')
-
-    if (
-      !nativeInteractionQuestion &&
-      deps.approval !== undefined &&
-      (allowOnce !== undefined || nativeInteractionCall)
-    ) {
+    // A plan approval (Claude ExitPlanMode, Codex plan review) offers more than allow or reject, and the user may
+    // pick any of its options, so it is asked as a question with every option rather than answered by the binary
+    // native approval.
+    const planReview = params.toolCall.kind === 'switch_mode'
+    // The binary native approval answers allow-once or reject-once only. Unlike a question it also serves a session
+    // another live Agent owns. It yields nothing when the approval service itself is unavailable.
+    const viaApproval = async (
+      service: AcpNativeApprovalService,
+    ): Promise<acp.RequestPermissionResponse | undefined> => {
       try {
-        const outcome = await deps.approval.request({
+        const outcome = await service.request({
           agent,
           toolName: params.toolCall.name ?? params.toolCall.kind ?? copy.acpTool,
           callId: params.toolCall.toolCallId,
@@ -295,19 +317,45 @@ export function createAcpNativePermissionHandler(
         return decide({ outcome: 'cancelled', note: outcome }, 'native-approval')
       } catch (error: unknown) {
         deps.log?.(`dsh-acp native approval unavailable: ${errorMessage(error)}`)
-        // Continue to the generic native question only when it is available;
-        // this preserves uncommon ACP option vocabularies without reviving a
-        // plugin-owned permission surface.
+        return undefined
       }
+    }
+    // A plan review whose question card cannot be shown (no question service, or DSH refusing a session another live
+    // Agent owns) is answered by that approval, as plan reviews were before they became questions: approval picks the
+    // plan's allow-once option and rejection its reject-once option, never an allow-always one.
+    const planApproval = planReview && allowOnce !== undefined ? deps.approval : undefined
+    const fallBackToApproval = async (): Promise<acp.RequestPermissionResponse | undefined> => {
+      if (planApproval === undefined) return undefined
+      return (
+        (await viaApproval(planApproval)) ??
+        decide({ outcome: 'cancelled', note: 'native-approval-unavailable' }, 'native-approval')
+      )
+    }
+
+    if (
+      !nativeInteractionQuestion &&
+      !planReview &&
+      deps.approval !== undefined &&
+      (allowOnce !== undefined || nativeInteractionCall)
+    ) {
+      const answered = await viaApproval(deps.approval)
+      if (answered !== undefined) return answered
+      // Continue to the generic native question only when it is available;
+      // this preserves uncommon ACP option vocabularies without reviving a
+      // plugin-owned permission surface.
     }
     if (nativeInteractionCall && !nativeInteractionQuestion)
       return decide({ outcome: 'cancelled', note: 'native-approval-unavailable' }, 'native-approval')
-    if (deps.userQuestions === undefined) return decide({ outcome: 'cancelled', note: 'question-service-unavailable' })
+    if (deps.userQuestions === undefined)
+      return (await fallBackToApproval()) ?? decide({ outcome: 'cancelled', note: 'question-service-unavailable' })
     const questionId = `acp-permission:${id}`
     const renderedLabels = optionLabels(params.options, copy)
     const labels = new Map(renderedLabels.map((label, index) => [label, params.options[index]!]))
+    let questionSettled = false
     try {
       const detail = permissionQuestionDetail(params.toolCall, copy)
+      // The Agent titles a plan review ("Approve Plan"); only an untitled one falls back to the generic request.
+      const planTitle = planReview ? safeText(params.toolCall.title ?? '') : ''
       const answer = await deps.userQuestions.ask({
         agent,
         questions: [
@@ -318,13 +366,16 @@ export function createAcpNativePermissionHandler(
             // breaks; the client renders only the fixed choices supplied here.
             question: nativeInteractionQuestion
               ? params.toolCall.title!
-              : buildPermissionReason(params, copy, { includeExecuteDetails: false }),
+              : planTitle !== ''
+                ? planTitle
+                : buildPermissionReason(params, copy, { includeExecuteDetails: false }),
             ...(detail === undefined ? {} : { detail }),
             options: renderedLabels.map((label) => ({ label })),
           },
         ],
         ...(signal === undefined ? {} : { signal }),
       })
+      questionSettled = true
       if (signal !== undefined && signal.aborted) return decide({ outcome: 'cancelled', note: 'cancelled' })
       const selected = answer.answers.find((item) => item.id === questionId)
       if (selected === undefined || selected.custom !== undefined || selected.selected.length !== 1)
@@ -336,6 +387,20 @@ export function createAcpNativePermissionHandler(
       if (option === undefined) return decide({ outcome: 'cancelled', note: 'invalid-option-id' })
       return decide({ outcome: 'selected', optionId: option.optionId, selectedOptionKind: option.kind })
     } catch (error: unknown) {
+      // DSH refuses a native question from a session another live Agent owns before any card exists. Only that
+      // rejection, with nothing answered and no abort, hands a plan review to the native approval: a question is
+      // never answered twice and no other failure is masked.
+      if (
+        !questionSettled &&
+        signal?.aborted !== true &&
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'DELEGATED_CALLER'
+      ) {
+        const answered = await fallBackToApproval()
+        if (answered !== undefined) return answered
+      }
       deps.log?.(`dsh-acp native permission question cancelled: ${errorMessage(error)}`)
       return decide({ outcome: 'cancelled', note: 'question-error' })
     }

@@ -39,7 +39,7 @@
 
 import os from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
-import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { Remote, RemoteError, TypertRemoteService, principalOf } from '@deepseek-ai/dsh-typert-protocol'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-api-remote-access'
 import type * as acp from '@agentclientprotocol/sdk'
@@ -95,6 +95,12 @@ export type { AcpAuditSummaryCode } from '../contract/remote.ts'
 
 /** `<command> --version` 尽力而为的短超时（毫秒）。 */
 export const DEFAULT_VERSION_PROBE_TIMEOUT_MS = 3_000
+
+/**
+ * A mode saved for the next prompt is a session-option write that has to wait for the Agent, so it takes the grants of
+ * both writes it stands for: the call that saves it and `setAgentSessionOption`, the change it will become.
+ */
+const DEFERRED_MODE_ACTIONS = ['dshAcp/setDraftAgentMode', 'dshAcp/setAgentSessionOption'] as const
 
 type AcpRemoteErrorCode = `dsh-acp/${AcpErrorCategory}`
 
@@ -1149,25 +1155,47 @@ export class AcpRemoteService extends TypertRemoteService {
   ): Promise<AcpAgentSessionSnapshotView | null> {
     if (typeof modeId !== 'string' || !modeId || modeId.length > ACP_CONFIG_IDENTIFIER_MAX)
       throw badRequest('Invalid Agent mode')
-    const adapter = await this.draftControlFor(sessionId, provider)
+    const adapter = await this.draftControlFor(sessionId, provider, 'write')
     if (adapter?.setDraftMode === undefined) throw badRequest('Agent modes are unavailable')
     return await preserveAcpFailure(() => adapter.setDraftMode!(sessionId, modeId))
   }
 
   /** The session's bound route wins; an unbound session uses the route its composer selected. */
-  private async draftControlFor(sessionId: string, provider: string): Promise<AcpAgentSessionControlLike | undefined> {
+  private async draftControlFor(
+    sessionId: string,
+    provider: string,
+    access: 'read' | 'write' = 'read',
+  ): Promise<AcpAgentSessionControlLike | undefined> {
     const changes = this.resolved.agentSessionChanges
-    if (
-      typeof sessionId !== 'string' ||
-      sessionId.length === 0 ||
-      sessionId.length > 256 ||
-      changes === null ||
-      !(await changes.canRead(sessionId))
-    )
+    if (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.length > 256 || changes === null)
+      throw acpRemoteFailure('user-rejected', 'ACP Agent session access is not authorized')
+    // A readable session is not a writable one: saving a mode asks for the caller's own grants first.
+    if (access === 'write') this.requireDeferredModeGrants(sessionId)
+    if (!(await changes.canRead(sessionId)))
       throw acpRemoteFailure('user-rejected', 'ACP Agent session access is not authorized')
     const bound = await this.resolved.backendFacts?.readBindingProvider(sessionId)
     const route = bound ?? (typeof provider === 'string' && provider.startsWith('acp-') ? provider : undefined)
     return route === undefined ? undefined : (this.resolved.agentSessionControl?.(route) ?? undefined)
+  }
+
+  /**
+   * The caller's own grants for a deferred mode write on the session. The Gateway decided the called endpoint's
+   * before dispatch; asking again here keeps the write from resting on the read gate or on how the Host is composed.
+   * The owner and in-process callers outside a Remote call are trusted; a Remote call without `remoteAccess` fails
+   * closed.
+   */
+  private requireDeferredModeGrants(sessionId: string): void {
+    const principal = principalOf(this.ctx.invocation)
+    if (principal === undefined) return
+    const access = this.ctx.get('remoteAccess')
+    const resources = [{ kind: 'session' as const, id: SessionId(sessionId) }]
+    if (
+      access === undefined ||
+      !('decide' in access) ||
+      typeof access.decide !== 'function' ||
+      !DEFERRED_MODE_ACTIONS.every((action) => access.decide({ principal, action, resources }).kind === 'allow')
+    )
+      throw acpRemoteFailure('user-rejected', 'ACP Agent session write access is not authorized')
   }
 
   @Remote

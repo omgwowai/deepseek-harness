@@ -17,7 +17,9 @@
  * - one prompt at a time; transport updates are fanned out to the prompt listener and the
  *   runtime's own `onSessionUpdate` hook exactly like the ACP connection fans out
  *   `session/update`;
- * - permission requests are bridged to the host approval service in ACP shape.
+ * - permission requests are bridged to the host approval service in ACP shape, and forms the
+ *   agent puts to the user (questions, dialogs, MCP elicitations) to the host's form
+ *   elicitation bridge, both only while a turn runs;
  *
  * Launch environment, working directory and process ownership come from the host
  * (`prepareLaunch`, the subprocess seam); this module never reads the host environment.
@@ -33,13 +35,17 @@ import {
   type AcpSessionRuntimeOptions,
 } from '../session/session-runtime.ts'
 import { prepareNativeLaunch, type NativeLaunch } from './launch.ts'
+import { staticNativeCommands } from './native-commands.ts'
 import { nativeSpawnFromSeam } from './native-spawn.ts'
 import { isModeOption, withNativeModeContract } from './session-modes.ts'
 import {
   NativeTransportError,
+  type NativeCommand,
+  type NativeCommandResult,
   type NativeContentBlock,
   type NativeContextUsage,
   type NativeControls,
+  type NativeElicitationRequest,
   type NativePermissionDecision,
   type NativePermissionRequest,
   type NativeProcess,
@@ -51,27 +57,47 @@ import {
   type NativeTurnUsage,
 } from './transports/contract.ts'
 
+/** What the host hears about the vendor conversation besides its turn updates. */
+export interface NativeSessionRuntimeHooks {
+  /** The vendor's command catalog changed; `commands` is the full new list. */
+  readonly onCommandsChanged?: ((commands: readonly NativeCommand[]) => void) | undefined
+  /**
+   * The vendor replaced the conversation (`/clear`, a new thread or session) or rolled it back where it stood
+   * (`rewind`): `acpSessionId` already answers with `sessionId`. After a replacement resuming the old id would bring
+   * back the context the user cleared; after a rewind `sessionId` is the id the conversation had before, and the
+   * messages the user rewound must not be taken for messages the agent still holds.
+   */
+  readonly onSessionChanged?: ((sessionId: string, reason: string) => void) | undefined
+}
+
 /** What a native runtime needs from the host; structurally the relevant part of `AcpSessionRuntimeOptions`. */
 export interface NativeSessionRuntimeOptions
-  extends Pick<
-    AcpSessionRuntimeOptions,
-    | 'config'
-    | 'cwd'
-    | 'subprocess'
-    | 'prepareLaunch'
-    | 'onSessionUpdate'
-    | 'onPermissionRequest'
-    | 'onPermissionCheck'
-    | 'cancelGraceMs'
-  > {
+  extends NativeSessionRuntimeHooks,
+    Pick<
+      AcpSessionRuntimeOptions,
+      | 'config'
+      | 'cwd'
+      | 'subprocess'
+      | 'prepareLaunch'
+      | 'onSessionUpdate'
+      | 'onPermissionRequest'
+      | 'onPermissionCheck'
+      | 'onElicitationRequest'
+      | 'cancelGraceMs'
+    > {
   /** Creates one fresh, unstarted transport. A transport that was started is never started again. */
   readonly createTransport: () => NativeTransport
   /** Host log sink for transport notices. */
   readonly log?: ((message: string) => void) | undefined
+  /** Upper bound of one side question or immediate command; the transport call is aborted when it passes. */
+  readonly sideCallTimeoutMs?: number | undefined
 }
 
 /** After a Stop the transport owns the interrupt ladder; the runtime only bounds a transport that never settles. */
 const CANCEL_BACKSTOP_MS = 60_000
+
+/** The longest a side question or an immediate command may take before the runtime aborts the transport call. */
+const SIDE_CALL_TIMEOUT_MS = 120_000
 
 /** The longest the runtime waits for a transport to end its process before the host terminates the tree. */
 const CLOSE_BACKSTOP_MS = 15_000
@@ -85,6 +111,15 @@ const PREVIEW_SESSION_ID = /^native-(?:omp|codex|claude)-[0-9a-f-]{36}$/i
 /** Whether an ACP binding names a session of the first native preview, whose ids no vendor ever issued. */
 export function isNativePreviewSessionId(sessionId: string): boolean {
   return PREVIEW_SESSION_ID.test(sessionId)
+}
+
+/**
+ * Whether a `session_changed` of this reason changes the conversation without changing its id: the vendor rolled the
+ * conversation back where it stood (`/rewind` in Claude Code and Codex). Every other replacement starts a session with
+ * an id of its own, so the id the runtime already holds is a repeat of an event it has heard, not a change.
+ */
+export function replacesSessionInPlace(reason: string): boolean {
+  return reason === 'rewind'
 }
 
 /** The `/mcp:<server>:<command> <args>` prompt form claude-agent-acp rewrites for Claude Code. */
@@ -243,6 +278,17 @@ async function raceAbort<T>(pending: Promise<T>, signal: AbortSignal | undefined
   }
 }
 
+const sideFailure = (text: string): NativeCommandResult => ({ kind: 'error', text })
+
+/** A transport's answer to a side call, checked at the boundary: whatever else it returned is a failure, not text. */
+function sideResult(value: unknown): NativeCommandResult {
+  if (typeof value === 'object' && value !== null && 'kind' in value && 'text' in value) {
+    const { kind, text } = value
+    if ((kind === 'success' || kind === 'error') && typeof text === 'string') return { kind, text }
+  }
+  return sideFailure('The agent answered in a form the host cannot read.')
+}
+
 /** The host-owned processes one transport spawned, and how many of them still run. */
 interface ProcessTracker {
   readonly agents: NativeProcess[]
@@ -280,6 +326,8 @@ export class NativeSessionRuntime {
   private promptClaimed = false
   private promptActive = false
   private promptAbort: AbortController | undefined
+  /** Permission requests and forms the user has not answered yet; steering waits for them like ACP does. */
+  private pendingQuestions = 0
   private promptSignal: AbortSignal | undefined
   private promptListener: ((notification: AcpSessionNotification) => void) | undefined
   private readonly toolSnapshots = new Map<string, acp.ToolCallUpdate>()
@@ -289,6 +337,10 @@ export class NativeSessionRuntime {
   private announcedMode: string | undefined
   private contextEvent: NativeContextUsage | undefined
   private listenerFailureLogged = false
+  /** The catalog the vendor announced last; only a transport without its own `commands()` needs it. */
+  private announcedCommands: readonly NativeCommand[] | undefined
+  /** Side questions and immediate commands in flight: they end with the transport, not with a turn. */
+  private readonly sideCalls = new Set<AbortController>()
 
   constructor(private readonly options: NativeSessionRuntimeOptions) {
     this.transport = options.createTransport()
@@ -351,7 +403,7 @@ export class NativeSessionRuntime {
 
   /** Steering is meaningful only inside a running turn. */
   get canSteer(): boolean {
-    return this.promptActive && this.attachedSessionId !== undefined
+    return this.promptActive && this.attachedSessionId !== undefined && this.pendingQuestions === 0
   }
 
   hasPendingHostCalls(): boolean {
@@ -520,6 +572,79 @@ export class NativeSessionRuntime {
     return await this.transport.steer(blocks, this.promptSignal)
   }
 
+  /**
+   * The slash commands of this agent: the transport's own catalog (its built-ins merged with what the vendor
+   * reported), else the last catalog the vendor announced, else the built-ins of its kind. A runtime that has not
+   * started yet still lists the built-ins, so a session can offer its commands before any agent process exists.
+   */
+  commands(): readonly NativeCommand[] {
+    try {
+      const own = this.transport.commands?.()
+      if (own !== undefined) return own
+    } catch {
+      /* a transport that cannot list its commands yet shows the built-ins */
+    }
+    return this.announcedCommands ?? staticNativeCommands(this.transport.kind)
+  }
+
+  /**
+   * Run one `immediate` vendor command outside any turn. A side call claims no prompt slot and touches neither the
+   * turn's listener, its tool snapshots nor the controls, so it may run while a prompt runs. It always answers with
+   * a result: a missing transport method, a session that is not attached and a failing call say so in `text`.
+   */
+  async runCommand(name: string, args: string, signal?: AbortSignal): Promise<NativeCommandResult> {
+    return await this.sideCall('commands that run outside a turn', signal, (transport, callSignal) =>
+      transport.runCommand?.(name, args, callSignal),
+    )
+  }
+
+  /** Answer a side question (`/btw`) from the current conversation without adding to it; see {@link runCommand}. */
+  async sideQuestion(question: string, signal?: AbortSignal): Promise<NativeCommandResult> {
+    return await this.sideCall('side questions', signal, (transport, callSignal) =>
+      transport.sideQuestion?.(question, callSignal),
+    )
+  }
+
+  /**
+   * One call into the transport that is not part of a turn. It ends with the caller's signal, the time limit or the
+   * runtime's close, whichever comes first, and a transport that ignores the signal is abandoned rather than awaited.
+   */
+  private async sideCall(
+    what: string,
+    signal: AbortSignal | undefined,
+    start: (transport: NativeTransport, signal: AbortSignal) => Promise<NativeCommandResult> | undefined,
+  ): Promise<NativeCommandResult> {
+    const transport = this.transport
+    if (this.attachedSessionId === undefined || this.transportClosed())
+      return sideFailure('The agent is not running in this session yet; send a message first.')
+    const lifetime = new AbortController()
+    this.sideCalls.add(lifetime)
+    const limit = this.options.sideCallTimeoutMs ?? SIDE_CALL_TIMEOUT_MS
+    let expired = false
+    const timer = setTimeout(() => {
+      expired = true
+      lifetime.abort(new Error('the side call timed out'))
+    }, limit)
+    timer.unref()
+    const callSignal = signal === undefined ? lifetime.signal : AbortSignal.any([signal, lifetime.signal])
+    try {
+      const pending = start(transport, callSignal)
+      if (pending === undefined) return sideFailure(`This agent (${transport.kind}) cannot run ${what}.`)
+      return sideResult(await raceAbort(pending, callSignal))
+    } catch (error) {
+      if (expired) {
+        const waited = limit % 1000 === 0 ? `${String(limit / 1000)} s` : `${String(limit)} ms`
+        return sideFailure(`The agent did not answer within ${waited}; the request was cancelled.`)
+      }
+      if (isAborted(signal)) return sideFailure('The request was cancelled.')
+      if (isAborted(lifetime.signal)) return sideFailure('The agent session ended before it answered.')
+      return sideFailure(error instanceof Error ? error.message : String(error))
+    } finally {
+      clearTimeout(timer)
+      this.sideCalls.delete(lifetime)
+    }
+  }
+
   /** Set one session control; writes are serialized and the snapshot reflects the change when the promise resolves. */
   async setConfigOption(configId: string, value: string | boolean, signal?: AbortSignal): Promise<void> {
     if (this.promptClaimed) throw new Error('ACP_CONFIG_CHANGE_DURING_PROMPT')
@@ -558,6 +683,9 @@ export class NativeSessionRuntime {
     if (this.closing !== undefined) return this.closing
     this.epoch += 1
     if (abortPrompt) this.promptAbort?.abort(new Error('ACP session runtime closed'))
+    // A side call belongs to the agent process that is going away: it ends with it, not after it.
+    for (const call of [...this.sideCalls]) call.abort(new Error('ACP session runtime closed'))
+    this.announcedCommands = undefined
     const transport = this.transport
     const tracker = this.tracker
     const startup = this.startup
@@ -669,6 +797,12 @@ export class NativeSessionRuntime {
         session: target,
         onEvent: (event) => this.handleEvent(transport, event),
         onPermission: (request, requestSignal) => this.answerPermission(transport, request, requestSignal),
+        ...(this.options.onElicitationRequest === undefined
+          ? {}
+          : {
+              onElicitation: (request: NativeElicitationRequest, requestSignal?: AbortSignal) =>
+                this.answerElicitation(transport, request, requestSignal),
+            }),
         log: this.options.log,
       })
       await raceAbort(started, signal)
@@ -751,6 +885,19 @@ export class NativeSessionRuntime {
         case 'notice':
           this.options.log?.(event.text)
           break
+        case 'commands':
+          this.announcedCommands = event.commands
+          this.options.onCommandsChanged?.(event.commands)
+          break
+        case 'session_changed':
+          // Only an attached session can be replaced; a resume that is still attaching reports its own id.
+          if (this.attachedSessionId === undefined || event.sessionId === '') break
+          // A replacement has an id of its own, so the held id is a repeat. A rewind rolls the conversation back in place
+          // and names the id it already holds: that is the change.
+          if (event.sessionId === this.attachedSessionId && !replacesSessionInPlace(event.reason)) break
+          this.attachedSessionId = event.sessionId
+          this.options.onSessionChanged?.(event.sessionId, event.reason)
+          break
       }
     } catch (error) {
       this.options.log?.(`native agent event could not be projected: ${error instanceof Error ? error.message : String(error)}`)
@@ -799,6 +946,7 @@ export class NativeSessionRuntime {
       toolCall: mergeToolCall(this.toolSnapshots.get(request.toolCall.toolCallId), request.toolCall),
       options: [...request.options],
     }
+    this.pendingQuestions += 1
     try {
       await this.options.onPermissionCheck?.({ reason: 'bridge-unavailable' }, params)
       const { outcome } = await raceAbort(Promise.resolve(handler(params, signal)), signal)
@@ -809,6 +957,53 @@ export class NativeSessionRuntime {
         : cancelled
     } catch {
       return cancelled
+    } finally {
+      this.pendingQuestions -= 1
+    }
+  }
+
+  /**
+   * Bridge a vendor form (question, dialog, MCP elicitation) to the host's form elicitation service. Like a
+   * permission request it exists only inside the running turn and ends with it; anything the host does not
+   * answer with a known action is cancelled, which every vendor treats as an abandoned form.
+   */
+  private async answerElicitation(
+    transport: NativeTransport,
+    request: NativeElicitationRequest,
+    requestSignal: AbortSignal | undefined,
+  ): Promise<acp.CreateElicitationResponse> {
+    const cancelled: acp.CreateElicitationResponse = { action: 'cancel' }
+    const handler = this.options.onElicitationRequest
+    const sessionId = this.attachedSessionId
+    const turnSignal = this.promptSignal
+    if (
+      transport !== this.transport ||
+      handler === undefined ||
+      sessionId === undefined ||
+      !this.promptActive ||
+      turnSignal === undefined
+    )
+      return cancelled
+    const signal = requestSignal === undefined ? turnSignal : AbortSignal.any([turnSignal, requestSignal])
+    if (signal.aborted) return cancelled
+    const params: acp.CreateElicitationRequest = {
+      mode: 'form',
+      sessionId,
+      message: request.message,
+      requestedSchema: request.requestedSchema,
+      ...(request.toolCallId ? { toolCallId: request.toolCallId } : {}),
+      ...(request._meta ? { _meta: request._meta } : {}),
+    }
+    this.pendingQuestions += 1
+    try {
+      const response = await raceAbort(Promise.resolve(handler(params, signal)), signal)
+      return response.action === 'accept' || response.action === 'decline' || response.action === 'cancel'
+        ? response
+        : cancelled
+    } catch {
+      return cancelled
+    } finally {
+      this.pendingQuestions -= 1
     }
   }
 }

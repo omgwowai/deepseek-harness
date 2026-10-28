@@ -47,6 +47,10 @@
  * - `member_model_selections` teammate 模型选择表：每个 DSH session 至多一行，
  *   记录最近选择及其 binding key；binding 变化由调用方决定是否重新解释，sidecar
  *   不主动清除该配置。
+ * - `option_intents` 运行中改动的非 mode 会话选项（Codex collaboration_mode、Claude fast mode
+ *   等），在下一次 prompt 前应用：主键 (dsh_session_id, option_id)，同一选项后写覆盖先写，
+ *   并记录所属 binding key；清除时只删与已确认值完全一致的行，较新的选择不受影响。保留
+ *   上下文的目录 fork 在同一事务内把待生效的 mode/option 选择迁到新 binding。
  * - `activity_journal` 外部 Agent 活动表：按 DSH session 隔离、以 activity_id
  *   append-only revision，activity_seq 只在首次出现时分配，revision_seq 为每次
  *   mutation 的连续游标；它是机器可读的执行活动面，和面向人的 audit envelope
@@ -269,8 +273,24 @@ export interface AcpModeIntent {
   readonly modeId: string
 }
 
-/** Binding key of a mode chosen before the session's first prompt; it attaches to the binding that prompt creates. */
-export const ACP_INITIAL_MODE_BINDING_KEY = 'initial'
+/**
+ * Binding key of a mode chosen before the session's first prompt. No binding exists yet, so the choice belongs to the
+ * ACP route the composer had selected: only that route's prompts show it and take it over (the binding the first one
+ * creates carries it out); any other route drops it unseen. A key that names no route is honoured by nobody.
+ */
+export function initialModeIntentBindingKey(provider: string): string {
+  return stableStringify(['initial', provider])
+}
+
+/**
+ * A non-mode Agent option chosen while a turn was running. Like a mode intent it belongs to one exact ACP
+ * binding and waits for the next prompt; the last choice per option wins.
+ */
+export interface AcpOptionIntent {
+  readonly bindingKey: string
+  readonly optionId: string
+  readonly value: string | boolean
+}
 
 /** A member's selected model stays binding-scoped and is retained after application. */
 export interface AcpMemberModelSelection {
@@ -280,6 +300,7 @@ export interface AcpMemberModelSelection {
 
 const ACP_MEMBER_MODEL_MAX = 512
 const ACP_MEMBER_BINDING_KEY_MAX = 8192
+const ACP_INTENT_BINDING_KEY_MAX = 8192
 
 export function modeIntentBindingKey(binding: AcpBindingData): string {
   return stableStringify([
@@ -675,6 +696,12 @@ export interface AcpSidecar {
   readModeIntent(sessionId: SessionId): Promise<AcpModeIntent | undefined>
   writeModeIntent(sessionId: SessionId, intent: AcpModeIntent): Promise<void>
   clearModeIntent(sessionId: SessionId, intent: AcpModeIntent): Promise<void>
+  /** Option choices made while a turn ran, ordered by option id; each belongs to one exact ACP binding. */
+  listOptionIntents(sessionId: SessionId): Promise<readonly AcpOptionIntent[]>
+  /** Last write wins per option id. */
+  writeOptionIntent(sessionId: SessionId, intent: AcpOptionIntent): Promise<void>
+  /** Delete exactly this choice; a newer choice for the same option survives. */
+  clearOptionIntent(sessionId: SessionId, intent: AcpOptionIntent): Promise<void>
   /** Persist the latest selected model for a teammate binding. */
   readMemberModelSelection(sessionId: SessionId): Promise<AcpMemberModelSelection | undefined>
   writeMemberModelSelection(sessionId: SessionId, selection: AcpMemberModelSelection): Promise<void>
@@ -723,6 +750,42 @@ function assertSafeSessionId(sessionId: string): void {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Validate an option intent and split its value into the stored (type, text) pair. */
+function encodeOptionIntent(intent: AcpOptionIntent): { readonly type: 'string' | 'boolean'; readonly text: string } {
+  if (
+    !isPlainObject(intent) ||
+    typeof intent.optionId !== 'string' ||
+    intent.optionId.length === 0 ||
+    intent.optionId.length > ACP_CONFIG_IDENTIFIER_MAX ||
+    typeof intent.bindingKey !== 'string' ||
+    intent.bindingKey.length === 0 ||
+    intent.bindingKey.length > ACP_INTENT_BINDING_KEY_MAX
+  )
+    throw new TypeError('Invalid ACP option intent')
+  const value: unknown = intent.value
+  if (typeof value === 'boolean') return { type: 'boolean', text: String(value) }
+  if (typeof value === 'string' && value.length <= ACP_CONFIG_IDENTIFIER_MAX) return { type: 'string', text: value }
+  throw new TypeError('Invalid ACP option intent')
+}
+
+function optionIntentOfRow(row: Record<string, unknown>): AcpOptionIntent | undefined {
+  const { option_id: optionId, binding_key: bindingKey, value_type: type, value: text } = row
+  if (
+    typeof optionId !== 'string' ||
+    optionId.length === 0 ||
+    optionId.length > ACP_CONFIG_IDENTIFIER_MAX ||
+    typeof bindingKey !== 'string' ||
+    bindingKey.length === 0 ||
+    bindingKey.length > ACP_INTENT_BINDING_KEY_MAX ||
+    typeof text !== 'string'
+  )
+    return undefined
+  if (type === 'boolean' && (text === 'true' || text === 'false'))
+    return { bindingKey, optionId, value: text === 'true' }
+  if (type === 'string' && text.length <= ACP_CONFIG_IDENTIFIER_MAX) return { bindingKey, optionId, value: text }
+  return undefined
 }
 
 function toRecoveryState(raw: unknown): AcpRecoveryState | undefined {
@@ -933,6 +996,14 @@ CREATE TABLE IF NOT EXISTS mode_intents (
   dsh_session_id TEXT PRIMARY KEY,
   binding_key TEXT NOT NULL,
   mode_id TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS option_intents (
+  dsh_session_id TEXT NOT NULL,
+  option_id TEXT NOT NULL,
+  binding_key TEXT NOT NULL,
+  value_type TEXT NOT NULL CHECK (value_type IN ('string', 'boolean')),
+  value TEXT NOT NULL,
+  PRIMARY KEY (dsh_session_id, option_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS member_model_selections (
   dsh_session_id TEXT PRIMARY KEY,
@@ -1447,8 +1518,10 @@ class SidecarStore implements AcpSidecar {
         transactionOpen = false
         return
       }
-      if (entry.kind === 'binding')
+      if (entry.kind === 'binding') {
         this.stmtUpsertBinding?.run(sessionId, entry.time, ids.acpProviderId ?? null, ids.acpSessionId ?? null, payload)
+        if (directoryForkParent !== undefined) this.carryIntentsToFork(db, sessionId, directoryForkParent, entry.data)
+      }
       db.exec('COMMIT')
       transactionOpen = false
     } catch (error: unknown) {
@@ -1461,6 +1534,30 @@ class SidecarStore implements AcpSidecar {
       }
       throw error
     }
+  }
+
+  /**
+   * A context-preserving directory fork continues the same conversation, so a choice still waiting for the
+   * next prompt follows it to the replacement binding (inside the fork's own transaction).
+   */
+  private carryIntentsToFork(
+    db: DatabaseSync,
+    sessionId: string,
+    parent: AcpBindingData,
+    replacement: AcpBindingData,
+  ): void {
+    const from = modeIntentBindingKey(parent)
+    const to = modeIntentBindingKey(replacement)
+    db.prepare('UPDATE mode_intents SET binding_key = ? WHERE dsh_session_id = ? AND binding_key = ?').run(
+      to,
+      sessionId,
+      from,
+    )
+    db.prepare('UPDATE option_intents SET binding_key = ? WHERE dsh_session_id = ? AND binding_key = ?').run(
+      to,
+      sessionId,
+      from,
+    )
   }
 
   /** 为一条非去重审计分配 seq 与无碰撞 record id。 */
@@ -2465,6 +2562,45 @@ class SidecarStore implements AcpSidecar {
     this.openIfExists()
       ?.prepare('DELETE FROM mode_intents WHERE dsh_session_id = ? AND binding_key = ? AND mode_id = ?')
       .run(sessionId, intent.bindingKey, intent.modeId)
+  }
+
+  async listOptionIntents(sessionId: SessionId): Promise<readonly AcpOptionIntent[]> {
+    assertSafeSessionId(sessionId)
+    const rows = this.openIfExists()
+      ?.prepare(
+        'SELECT option_id, binding_key, value_type, value FROM option_intents WHERE dsh_session_id = ? ORDER BY option_id ASC',
+      )
+      .all(sessionId) as Array<Record<string, unknown>> | undefined
+    const intents: AcpOptionIntent[] = []
+    for (const row of rows ?? []) {
+      const intent = optionIntentOfRow(row)
+      if (intent !== undefined) intents.push(intent)
+      else
+        this.warn(
+          `dsh-acp sidecar: malformed option intent row for session ${JSON.stringify(sessionId as string)}; ignoring it`,
+        )
+    }
+    return intents
+  }
+
+  async writeOptionIntent(sessionId: SessionId, intent: AcpOptionIntent): Promise<void> {
+    assertSafeSessionId(sessionId)
+    const stored = encodeOptionIntent(intent)
+    this.ensureDb()
+      .prepare(
+        'INSERT INTO option_intents (dsh_session_id, option_id, binding_key, value_type, value) VALUES (?, ?, ?, ?, ?) ON CONFLICT(dsh_session_id, option_id) DO UPDATE SET binding_key = excluded.binding_key, value_type = excluded.value_type, value = excluded.value',
+      )
+      .run(sessionId, intent.optionId, intent.bindingKey, stored.type, stored.text)
+  }
+
+  async clearOptionIntent(sessionId: SessionId, intent: AcpOptionIntent): Promise<void> {
+    assertSafeSessionId(sessionId)
+    const stored = encodeOptionIntent(intent)
+    this.openIfExists()
+      ?.prepare(
+        'DELETE FROM option_intents WHERE dsh_session_id = ? AND option_id = ? AND binding_key = ? AND value_type = ? AND value = ?',
+      )
+      .run(sessionId, intent.optionId, intent.bindingKey, stored.type, stored.text)
   }
 
   async readMemberModelSelection(sessionId: SessionId): Promise<AcpMemberModelSelection | undefined> {

@@ -9,9 +9,12 @@ import type * as acp from '@agentclientprotocol/sdk'
 import { NATIVE_MODE_CONTRACTS } from '../../../src/runtime/native/session-modes.ts'
 import {
   NativeTransportError,
+  type NativeCommand,
+  type NativeCommandResult,
   type NativeContentBlock,
   type NativeContextUsage,
   type NativeControls,
+  type NativeElicitationRequest,
   type NativePermissionDecision,
   type NativePermissionRequest,
   type NativePromptResult,
@@ -155,7 +158,14 @@ export class FakeNativeTransport implements NativeTransport {
   steerError: Error | undefined
   /** Runs before a control write is applied; lets a test hold a write open. */
   beforeSet: ((id: string, value: string | boolean) => Promise<void>) | undefined
+  /** Runs while the Agent starts, before its session exists; lets a test hold the start of a first prompt open. */
+  beforeStart: (() => Promise<void>) | undefined
   context: NativeContextUsage | undefined
+  /** The command catalog the transport reports; absent = the transport has no `commands()` of its own. */
+  commands?: () => readonly NativeCommand[]
+  /** The side channel: absent = the transport lacks the method, as one that cannot run commands outside a turn does. */
+  runCommand?: (name: string, args: string, signal: AbortSignal) => Promise<NativeCommandResult>
+  sideQuestion?: (question: string, signal: AbortSignal) => Promise<NativeCommandResult>
   private controlState: NativeControls
   private readonly newSessionId: string
   private readonly forkSessionId: string
@@ -172,6 +182,7 @@ export class FakeNativeTransport implements NativeTransport {
   async start(options: NativeTransportStartOptions): Promise<void> {
     this.calls.push(`start:${options.session.kind}`)
     this.startOptions = options
+    await this.beforeStart?.()
     if (this.spawnAtStart) options.spawn({ argv: options.argv, cwd: options.cwd, env: options.env })
     if (this.startError !== undefined) throw this.startError
     this.sessionId =
@@ -249,6 +260,12 @@ export class FakeNativeTransport implements NativeTransport {
     this.emit({ kind: 'controls', controls })
   }
 
+  /** The vendor replaces the conversation in place (`/clear`, `/new`): its session id changes and the host is told. */
+  replaceSession(sessionId: string, reason = 'clear'): void {
+    this.sessionId = sessionId
+    this.emit({ kind: 'session_changed', sessionId, reason })
+  }
+
   emit(event: NativeTransportEvent): void {
     this.startOptions?.onEvent(event)
   }
@@ -257,5 +274,16 @@ export class FakeNativeTransport implements NativeTransport {
     const start = this.startOptions
     if (start === undefined) throw new Error('the transport has not started')
     return await start.onPermission(request, signal)
+  }
+
+  /** Put a form to the host as a transport does; `startOptions.onElicitation` is absent without a question surface. */
+  async requestElicitation(
+    request: NativeElicitationRequest,
+    signal?: AbortSignal,
+  ): Promise<acp.CreateElicitationResponse> {
+    const start = this.startOptions
+    if (start === undefined) throw new Error('the transport has not started')
+    if (start.onElicitation === undefined) throw new Error('the host offered no elicitation handler')
+    return await start.onElicitation(request, signal)
   }
 }

@@ -2,7 +2,7 @@
 /// <reference types="node" />
 
 import { activityPresentation, type AcpActivityPresentation } from '../../domain/policy/activity-presentation.ts'
-import { ACP_ACTIVITY_RAW_MAX, ACP_INITIAL_MODE_BINDING_KEY, modeIntentBindingKey } from '../../persistence/sidecar.ts'
+import { ACP_ACTIVITY_RAW_MAX, initialModeIntentBindingKey, modeIntentBindingKey } from '../../persistence/sidecar.ts'
 import { teamModeChoices } from '../../contract/session-modes.ts'
 import { projectNativeAgentAccess } from './native-agent-access.ts'
 
@@ -29,8 +29,17 @@ import type { AcpProbeCacheEntry } from './llm-stub.ts'
 import type { AcpStubAgentConfig } from '../../domain/session/agent-config.ts'
 import type { SubprocessSeamResolution } from '../../runtime/process/subprocess.ts'
 import { NATIVE_MODE_CONTRACTS } from '../../runtime/native/session-modes.ts'
-import type { NativeTransportKind } from '../../runtime/native/transports/contract.ts'
-import { isNativePreviewSessionId } from '../../runtime/native/native-session-runtime.ts'
+import { staticNativeCommands } from '../../runtime/native/native-commands.ts'
+import type {
+  NativeCommand,
+  NativeCommandResult,
+  NativeTransportKind,
+} from '../../runtime/native/transports/contract.ts'
+import {
+  isNativePreviewSessionId,
+  replacesSessionInPlace,
+  type NativeSessionRuntimeHooks,
+} from '../../runtime/native/native-session-runtime.ts'
 import {
   AcpForkPreDispatchError,
   AcpSessionRefreshAbortedError,
@@ -46,7 +55,7 @@ import {
 } from '../../domain/session/launch-fingerprint.ts'
 import { prepareAgentLaunch, type AcpLaunchLineage } from './agent-launch.ts'
 import { buildAcpSpawnPlan } from '../../domain/policy/sandbox.ts'
-import { effectiveRuntimeOf } from '../../contract/agent-config.ts'
+import { acpRouteId, effectiveRuntimeOf } from '../../contract/agent-config.ts'
 import { reasoningRequestIsCurrent, sessionProtocolExtensions } from '../../domain/session/agent-compatibility.ts'
 import { DispatchLedger } from '../../runtime/session/dispatch-ledger.ts'
 import { StreamHandoff } from './stream-handoff.ts'
@@ -67,6 +76,7 @@ import type {
   AcpActivityStatus,
   AcpBindingData,
   AcpFileSystemAuditData,
+  AcpModeIntent,
   AcpRecoveryState,
   AcpSidecar,
 } from '../../persistence/sidecar.ts'
@@ -133,6 +143,32 @@ async function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Pro
     if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
   }
 }
+
+/** Why a side channel could not reach the vendor conversation; the message is meant for the user. */
+class SideChannelUnavailable extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SideChannelUnavailable'
+  }
+}
+
+/** Whatever was thrown, as text for the user: never a secret. */
+function failureText(error: unknown): string {
+  return redactSecretText(error instanceof Error ? error.message : String(error))
+}
+
+/**
+ * `lastUserAction` of the healthy recovery state written when the vendor changed its conversation by itself: it marks
+ * a binding the host adopted from the vendor, not one it created. `vendor-session-change` is a conversation that starts
+ * empty (`/clear`, a new thread): a vendor that has lost it after a restart has lost nothing. `vendor-session-replaced`
+ * is any other (a rewind keeps the messages before its point, a plan exit carries the plan): losing it is a loss like
+ * any other, so the session-lost gate stays.
+ */
+const VENDOR_SESSION_CHANGE_ACTION = 'vendor-session-change'
+const VENDOR_SESSION_REPLACED_ACTION = 'vendor-session-replaced'
+
+/** The reasons of a `session_changed` whose new conversation starts empty. */
+const EMPTY_CONVERSATION_REASONS: Readonly<Record<string, true>> = { clear: true, new: true }
 
 export type AcpLocalSettlementViewStatus = AcpLocalSettlementStatus | 'finishing-tools'
 
@@ -201,6 +237,7 @@ interface AgentSessionSnapshotView {
   readonly profileId: string
   readonly modeWritable?: boolean
   readonly pendingModeId?: string | null
+  readonly pendingOptions?: Readonly<Record<string, string | boolean>>
   readonly freshness: 'live' | 'stale'
   readonly editable: boolean
   readonly configOptions: readonly AgentSessionConfigOptionView[] | null
@@ -233,6 +270,31 @@ function nativeDraftModes(
 type AgentSessionOptionWrite =
   | { readonly kind: 'config'; readonly id: string; readonly value: string | boolean }
   | { readonly kind: 'mode'; readonly id: string }
+
+/** A mode control: the option named `mode`, or one the Agent files under the `mode` category. */
+function isModeConfigOption(option: { readonly id: string; readonly category?: string | null }): boolean {
+  return (
+    normalizeAcpConfigOptionKey(option.id) === 'mode' || normalizeAcpConfigOptionKey(option.category ?? '') === 'mode'
+  )
+}
+
+type SelectEntries = readonly (
+  { readonly value: string } | { readonly options: readonly { readonly value: string }[] }
+)[]
+
+/** Whether an option can be set to `value`: a boolean option takes booleans, a select one of its (grouped) values. */
+function optionAcceptsValue(
+  option: { readonly type: 'select'; readonly options: SelectEntries } | { readonly type: 'boolean' },
+  value: string | boolean,
+): boolean {
+  if (option.type === 'boolean') return typeof value === 'boolean'
+  return (
+    typeof value === 'string' &&
+    option.options.some((entry) =>
+      'options' in entry ? entry.options.some((item) => item.value === value) : entry.value === value,
+    )
+  )
+}
 
 /** Prove the child seed ends at the parent's durable ACP binding head. */
 function isLatestForkCut(
@@ -641,12 +703,47 @@ interface ProfileGeneration {
   }
 }
 
+/**
+ * The choices made once a turn is under way. DSH accepts a prompt, and the turn opens, the moment the Agent turns
+ * running: ahead of the step, its messages and the stream this adapter registers for them. From then on, even while
+ * the prompt is still being prepared, what the user chooses waits for the next turn: it is shown as pending and the
+ * prompt being prepared must not send it. Choosing the value the Agent has cancels a choice as before. Until the
+ * stream registers, the fence is held in `acceptedTurns` and the registration adopts it.
+ */
+interface TurnControlFence {
+  /** A mode was chosen, or cancelled, after the turn began. */
+  mode: boolean
+  /** Ids of the options chosen, or cancelled, after the turn began. */
+  readonly options: Set<string>
+  /**
+   * The mode chosen before the first prompt was sent, held while a choice made since then replaces it in the
+   * Sidecar: the turn under way still starts with it, and the later choice waits for the next turn.
+   */
+  initialMode?: AcpModeIntent | undefined
+}
+
+/** A turn DSH has accepted whose stream this adapter has not registered yet, with the fence of what was chosen. */
+interface AcceptedTurn {
+  readonly fence: TurnControlFence
+  /** The host session the turn belongs to: disposing it takes the fence along. */
+  readonly owner: object
+  /** Stops watching for the end of the turn. */
+  readonly off: (() => void) | undefined
+}
+
 interface HandoffOwner {
   stream: StreamHandoff
   generation: ProfileGeneration | undefined
   options: GenerateOptions
+  readonly fence: TurnControlFence
   off?: () => void
 }
+
+/**
+ * What the host hands a runtime factory: the ACP runtime options, plus the hooks only a native runtime calls (the
+ * ACP connection has no command catalog and never replaces its session on its own).
+ */
+export type AcpProfileRuntimeOptions = ConstructorParameters<typeof AcpSessionRuntime>[0] & NativeSessionRuntimeHooks
 
 export interface AcpProfileRuntime {
   /** Negotiate capabilities without creating session/new. */
@@ -707,6 +804,12 @@ export interface AcpProfileRuntime {
   /** ACP session-scoped writes. Implementations must confirm the resulting snapshot. */
   setConfigOption?(configId: string, value: string | boolean, signal?: AbortSignal): Promise<void>
   setMode?(modeId: string, signal?: AbortSignal): Promise<void>
+  /** The vendor's slash commands; only a native runtime has them (the ACP connection offers no catalog). */
+  commands?(): readonly NativeCommand[]
+  /** Run one immediate command outside any turn; answers with a result even when it fails. */
+  runCommand?(name: string, args: string, signal?: AbortSignal): Promise<NativeCommandResult>
+  /** Answer a side question without adding to the conversation; answers with a result even when it fails. */
+  sideQuestion?(question: string, signal?: AbortSignal): Promise<NativeCommandResult>
   prompt(
     content: acp.ContentBlock[],
     onUpdate: (notification: AcpSessionNotification) => void,
@@ -811,12 +914,24 @@ export class AcpProfileAdapter extends LlmAdapter {
     Set<{ readonly owner: object | undefined; readonly controller: AbortController }>
   >()
   private readonly handoffs = new Map<string, HandoffOwner>()
+  /** Per session: the fence of an accepted turn until its stream registers (or the turn ends without one). */
+  private readonly acceptedTurns = new Map<string, AcceptedTurn>()
   private readonly inMemoryRecoveryRequired = new Map<string, number>()
   private readonly inMemoryRecoveryStates = new Map<string, AcpRecoveryState>()
   private readonly sessionControlWrites = new Map<string, Promise<void>>()
   private readonly deliveredQwenContexts = new WeakMap<
     AcpProfileRuntime,
     { readonly sessionId?: string; readonly key: string }
+  >()
+  /** The host's command bridge, told when the vendor commands of a session change. */
+  private readonly nativeCommandListeners = new Set<(sessionId: string) => void>()
+  /**
+   * A vendor session a native runtime moved to on its own (`/clear`, `/new`) that the binding does not name yet. It is
+   * recorded at once when the session is idle, and when the turn it happened in settles otherwise.
+   */
+  private readonly vendorSessionChanges = new Map<
+    string,
+    { readonly runtime: AcpProfileRuntime; readonly agentSessionId: string; readonly reason: string }
   >()
 
   constructor(
@@ -827,9 +942,8 @@ export class AcpProfileAdapter extends LlmAdapter {
     ledgerStore: DispatchLedgerStore,
     private readonly probeFactory: (config: AcpStubAgentConfig) => ProfileGeneration['probe'] = (config) =>
       createNativeProfileProbe(profileId, subprocess, config),
-    private readonly runtimeFactory: (
-      options: ConstructorParameters<typeof AcpSessionRuntime>[0],
-    ) => AcpProfileRuntime = (options) => new AcpSessionRuntime(options),
+    private readonly runtimeFactory: (options: AcpProfileRuntimeOptions) => AcpProfileRuntime = (options) =>
+      new AcpSessionRuntime(options),
     private readonly sidecar?: AcpSidecar,
     private readonly attachments?: AcpAttachmentStore,
     private readonly resolveQuestions?: (dshSessionId: string) => AcpNativeQuestionBinding | undefined,
@@ -1207,8 +1321,12 @@ export class AcpProfileAdapter extends LlmAdapter {
     return await this.readAgentSessionSnapshotView(sessionId)
   }
 
-  private async readAgentSessionSnapshotView(sessionId: string): Promise<AgentSessionSnapshotView> {
-    const snapshot = await this.readAgentSessionSnapshot(sessionId)
+  /** `reported` is a snapshot the caller already holds; otherwise the Agent's current report is read. */
+  private async readAgentSessionSnapshotView(
+    sessionId: string,
+    reported?: AgentSessionSnapshotView,
+  ): Promise<AgentSessionSnapshotView> {
+    const snapshot = reported ?? (await this.readAgentSessionSnapshot(sessionId))
     const binding = await this.sidecar?.readLatestBinding(sessionId as never)
     const intent = await this.sidecar?.readModeIntent(sessionId as never)
     const profile = this.readConfig()
@@ -1220,7 +1338,16 @@ export class AcpProfileAdapter extends LlmAdapter {
       profile !== undefined &&
       acpLaunchFingerprintsCompatible(binding.binding.launchFingerprint, await this.launchFingerprint(profile)) &&
       (recovery === undefined || recovery.kind === 'healthy')
-    const pending = compatible && intent?.bindingKey === modeIntentBindingKey(binding.binding) ? intent.modeId : null
+    // A mode chosen before the first prompt is still waiting when the binding that will carry it out already exists.
+    const pending =
+      compatible &&
+      (intent?.bindingKey === modeIntentBindingKey(binding.binding) ||
+        intent?.bindingKey === initialModeIntentBindingKey(binding.binding.provider))
+        ? intent.modeId
+        : null
+    const pendingOptions = compatible
+      ? await this.pendingOptionsOf(sessionId, snapshot, modeIntentBindingKey(binding.binding))
+      : {}
     return {
       ...snapshot,
       modeWritable: compatible && (snapshot.freshness === 'stale' || snapshot.editable),
@@ -1231,7 +1358,30 @@ export class AcpProfileAdapter extends LlmAdapter {
         )
           ? pending
           : null,
+      pendingOptions,
     }
+  }
+
+  /** The option choices still waiting for the next turn that the reported Agent controls could take. */
+  private async pendingOptionsOf(
+    sessionId: string,
+    snapshot: AgentSessionSnapshotView,
+    bindingKey: string,
+  ): Promise<Record<string, string | boolean>> {
+    const pending: Record<string, string | boolean> = {}
+    for (const intent of (await this.sidecar?.listOptionIntents(sessionId as never)) ?? []) {
+      if (intent.bindingKey !== bindingKey) continue
+      const option = snapshot.configOptions?.find((candidate) => candidate.id === intent.optionId)
+      if (option === undefined || isAcpModelOrReasoningOption(option) || isModeConfigOption(option)) continue
+      // Only a live report can tell that the Agent already has the value or no longer offers it.
+      if (
+        snapshot.freshness === 'live' &&
+        (option.currentValue === intent.value || !optionAcceptsValue(option, intent.value))
+      )
+        continue
+      pending[intent.optionId] = intent.value
+    }
+    return pending
   }
 
   /** In-memory fail-closed fallback exposed through the existing recovery snapshot seam. */
@@ -1271,7 +1421,8 @@ export class AcpProfileAdapter extends LlmAdapter {
       const currentChoice = teamModeChoices(current).find((candidate) => candidate.id === modeId)
       if (!current.modeWritable || currentChoice === undefined)
         throw new LlmError('This member mode cannot be changed', 'ACP_SESSION_OPTIONS_READ_ONLY')
-      if (this.handoffs.has(sessionId))
+      // A member whose prompt DSH has accepted is running, even before its stream registers.
+      if (this.handoffs.has(sessionId) || this.turnOpen(sessionId))
         throw new LlmError('Member started running; retry after it settles', 'ACP_SESSION_OPTIONS_READ_ONLY')
       const binding = await this.sidecar!.readLatestBinding(sessionId as never)
       if (binding?.status !== 'ok' || binding.binding.provider !== `acp-${this.profileId}`)
@@ -1296,12 +1447,19 @@ export class AcpProfileAdapter extends LlmAdapter {
     return await this.agentSessionSnapshot(sessionId)
   }
 
-  private async applyMemberMode(sessionId: string, runtime: AcpProfileRuntime): Promise<void> {
-    const intent = await this.sidecar?.readModeIntent(sessionId as never)
+  private async applyMemberMode(
+    sessionId: string,
+    runtime: AcpProfileRuntime,
+    fence?: TurnControlFence,
+  ): Promise<void> {
+    // A mode chosen once the turn was under way is for the next turn; the turn itself keeps the mode it was sent with.
+    const intent = fence?.mode === true ? fence.initialMode : await this.sidecar?.readModeIntent(sessionId as never)
     if (intent === undefined) return
     const binding = await this.sidecar?.readLatestBinding(sessionId as never)
-    // A mode chosen before the first prompt attaches to the binding that prompt just created.
-    const initial = intent.bindingKey === ACP_INITIAL_MODE_BINDING_KEY
+    // A mode chosen before the first prompt belongs to the route selected then: the binding that route's prompt just
+    // created carries it out, and a choice made for any other route is dropped with the rest.
+    const initial =
+      binding?.status === 'ok' && intent.bindingKey === initialModeIntentBindingKey(binding.binding.provider)
     if (binding?.status !== 'ok' || (!initial && intent.bindingKey !== modeIntentBindingKey(binding.binding))) {
       await this.sidecar?.clearModeIntent(sessionId as never, intent)
       return
@@ -1340,52 +1498,169 @@ export class AcpProfileAdapter extends LlmAdapter {
     )
     // Consume only the confirmed choice. A later user selection must survive this completion.
     await this.sidecar?.clearModeIntent(sessionId as never, intent)
+    // The turn runs under it now: a later choice is compared with the mode the Agent has, as for any other.
+    if (fence?.initialMode === intent) fence.initialMode = undefined
     this.controlsChanged?.(sessionId)
+  }
+
+  /**
+   * Apply the option choices made before this turn began (the ones made after it waits for the next turn). A choice
+   * whose binding, option or value is gone is dropped and logged, and the turn goes on without it. A write the Agent
+   * rejects or does not confirm fails the turn before dispatch and stays pending. Only confirmed choices are cleared,
+   * so a newer choice for the same option survives.
+   */
+  private async applyPendingOptions(
+    sessionId: string,
+    runtime: AcpProfileRuntime,
+    fence: TurnControlFence,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const sidecar = this.sidecar
+    if (sidecar === undefined) return
+    const waiting = await sidecar.listOptionIntents(sessionId as never)
+    if (waiting.length === 0) return
+    const lookup = await sidecar.readLatestBinding(sessionId as never)
+    const bindingKey = lookup?.status === 'ok' ? modeIntentBindingKey(lookup.binding) : undefined
+    try {
+      // The sidecar lists the choices by option id, so the order is the same every time.
+      for (const intent of waiting) {
+        // Chosen once this turn was under way: it waits for the next one, whatever it is.
+        if (fence.options.has(intent.optionId)) continue
+        const drop = async (reason: string): Promise<void> => {
+          try {
+            this.log?.(`ACP dropped the pending option ${JSON.stringify(intent.optionId)}: ${reason}`)
+          } catch {
+            /* diagnostics are best effort */
+          }
+          await sidecar.clearOptionIntent(sessionId as never, intent)
+        }
+        if (intent.bindingKey !== bindingKey) {
+          await drop('its session binding changed')
+          continue
+        }
+        const option = runtime.configOptions?.find((candidate) => candidate.id === intent.optionId)
+        if (option === undefined || isAcpModelOrReasoningOption(option) || isModeConfigOption(option)) {
+          await drop('the Agent no longer offers the option')
+          continue
+        }
+        if (!optionAcceptsValue(option, intent.value)) {
+          await drop('the Agent no longer offers the value')
+          continue
+        }
+        if (option.currentValue !== intent.value) {
+          if (runtime.setConfigOption === undefined)
+            throw new LlmError('ACP runtime cannot change its session options', 'ACP_CONFIG_UNSUPPORTED')
+          try {
+            await runtime.setConfigOption(option.id, intent.value, signal)
+          } catch (error) {
+            throw new LlmError(
+              `ACP option "${option.id}" could not be applied: ${error instanceof Error ? error.message : String(error)}`,
+              'ACP_CONFIG_SYNC_FAILED',
+              { cause: error },
+            )
+          }
+          if (runtime.configOptions?.find((entry) => entry.id === option.id)?.currentValue !== intent.value)
+            throw new LlmError(`ACP agent did not confirm option "${option.id}"`, 'ACP_CONFIG_SYNC_FAILED')
+        }
+        await sidecar.clearOptionIntent(sessionId as never, intent)
+      }
+    } catch (error) {
+      // Choices confirmed before the failure are no longer pending.
+      try {
+        this.controlsChanged?.(sessionId)
+      } catch {
+        /* a failing subscriber must not hide the failure */
+      }
+      throw error
+    }
   }
 
   /**
    * Controls of a session before its first prompt: no Agent session exists yet, so the choices are the modes
    * this Agent advertised in its most recent session (for a native profile, only those the native route can
    * apply, or the native contract's own list when nothing usable was recorded), and the selection is saved and
-   * applied when the first prompt creates the session. A session that already has a binding reads its own controls.
+   * applied when the first prompt creates the session. The selection belongs to this adapter's route: another
+   * route's choice is neither shown nor kept as pending here. Once DSH has accepted the first prompt its turn keeps
+   * the mode it was sent with, and a choice made since is reported as pending for the next turn. A session that
+   * already has a binding reads its own controls.
    */
   async draftSessionSnapshot(sessionId: string): Promise<AgentSessionSnapshotView | null> {
     const bound = await this.sidecar?.readLatestBinding(sessionId as never)
     if (bound?.status === 'ok') return await this.agentSessionSnapshot(sessionId)
-    const last = await this.sidecar?.readLatestOptionSnapshotForProvider?.(`acp-${this.profileId}`)
+    return await this.readDraftMenu(sessionId)
+  }
+
+  /** The menu of a session without a binding; it waits for no lock, so a write holding the control lock may read it. */
+  private async readDraftMenu(sessionId: string): Promise<AgentSessionSnapshotView | null> {
+    const route = acpRouteId(this.profileId)
+    const last = await this.sidecar?.readLatestOptionSnapshotForProvider?.(route)
     const advertised = last?.modes?.availableModes ?? []
     const profile = this.readConfig()
     const nativeKind = profile === undefined ? undefined : this.nativeKindOf?.(profile)
     const modes = nativeKind === undefined ? advertised : nativeDraftModes(nativeKind, advertised)
     if (modes.length === 0) return null
     const intent = await this.sidecar?.readModeIntent(sessionId as never)
-    const chosen = intent?.bindingKey === ACP_INITIAL_MODE_BINDING_KEY ? intent.modeId : null
+    const chosen = intent?.bindingKey === initialModeIntentBindingKey(route) ? intent.modeId : null
+    const fence = this.heldTurnFence(sessionId)
+    const sent = fence?.mode === true
+    // Unchosen: the Agent starts in its own default, which only the live session can name.
+    const current = sent ? (fence.initialMode?.modeId ?? null) : chosen
     return {
       sessionId,
       profileId: this.profileId,
       freshness: 'stale',
       editable: false,
       modeWritable: true,
-      pendingModeId: null,
+      pendingModeId: sent && chosen !== current ? chosen : null,
       configOptions: null,
       modes,
-      // Unchosen: the Agent starts in its own default, which only the live session can name.
-      currentModeId: chosen,
+      currentModeId: current,
       contextUsage: null,
       note: null,
     }
   }
 
-  /** Choose the mode of a session: before its first prompt, or while its Agent is not connected. */
+  /**
+   * Choose the mode of a session: before its first prompt, or while its Agent is not connected. The choice belongs
+   * to this adapter's route. It is saved and applied before the next prompt is sent; what is chosen once DSH has
+   * accepted a prompt never reaches that turn, even before its stream is registered.
+   */
   async setDraftMode(sessionId: string, modeId: string): Promise<AgentSessionSnapshotView | null> {
     const bound = await this.sidecar?.readLatestBinding(sessionId as never)
-    if (bound?.status === 'ok') return await this.setTeamMemberMode(sessionId, modeId)
-    const draft = await this.draftSessionSnapshot(sessionId)
-    if (draft === null || !(draft.modes ?? []).some((mode) => mode.id === modeId))
-      throw new LlmError(`Agent mode "${modeId}" is not available`, 'ACP_CONFIG_UNSUPPORTED')
-    await this.sidecar!.writeModeIntent(sessionId as never, { bindingKey: ACP_INITIAL_MODE_BINDING_KEY, modeId })
-    this.controlsChanged?.(sessionId)
-    return await this.draftSessionSnapshot(sessionId)
+    if (bound?.status === 'ok') {
+      const runtime = this.runtimeForSession(sessionId)
+      // The session is under way, or its first turn has bound the Agent already: a choice is an ordinary one, for the
+      // turn after it.
+      if (
+        runtime !== undefined &&
+        (runtime.isBusy === true || this.handoffs.has(sessionId) || this.turnOpen(sessionId))
+      ) {
+        const choice = teamModeChoices(this.liveAgentSessionSnapshot(sessionId, runtime)).find(
+          (candidate) => candidate.id === modeId,
+        )
+        if (choice === undefined)
+          throw new LlmError(`Agent mode "${modeId}" is not available`, 'ACP_CONFIG_UNSUPPORTED')
+        return await this.setAgentSessionOption(sessionId, choice.write)
+      }
+      return await this.setTeamMemberMode(sessionId, modeId)
+    }
+    return await this.serializeSessionControlWrite(sessionId, async () => {
+      const draft = await this.readDraftMenu(sessionId)
+      if (draft === null || !(draft.modes ?? []).some((mode) => mode.id === modeId))
+        throw new LlmError(`Agent mode "${modeId}" is not available`, 'ACP_CONFIG_UNSUPPORTED')
+      const bindingKey = initialModeIntentBindingKey(acpRouteId(this.profileId))
+      // Once DSH has accepted the first prompt, its turn keeps the mode it was sent with and this choice is for the
+      // next one. Hold that mode before the choice replaces it, so the turn still starts with it.
+      const fence = this.turnFenceFor(sessionId)
+      if (fence !== undefined && !fence.mode) {
+        const sent = await this.sidecar!.readModeIntent(sessionId as never)
+        if (sent?.bindingKey === bindingKey) fence.initialMode = sent
+        fence.mode = true
+      }
+      await this.sidecar!.writeModeIntent(sessionId as never, { bindingKey, modeId })
+      this.controlsChanged?.(sessionId)
+      return await this.readDraftMenu(sessionId)
+    })
   }
 
   private async readAgentSessionSnapshot(sessionId: string): Promise<AgentSessionSnapshotView> {
@@ -1450,8 +1725,11 @@ export class AcpProfileAdapter extends LlmAdapter {
   async setAgentSessionOption(sessionId: string, request: AgentSessionOptionWrite): Promise<AgentSessionSnapshotView> {
     return await this.serializeSessionControlWrite(sessionId, async () => {
       const runtime = this.runtimeForSession(sessionId)
-      if (runtime === undefined || runtime.isBusy === true || this.handoffs.has(sessionId))
-        throw new LlmError('Agent session is not live or is currently running', 'ACP_SESSION_OPTIONS_READ_ONLY')
+      if (runtime === undefined) throw new LlmError('Agent session is not live', 'ACP_SESSION_OPTIONS_READ_ONLY')
+      // The Agent cannot be written while a turn runs or is handed off: the change waits for the next turn. The turn
+      // begins when DSH accepts the prompt, ahead of the stream this adapter registers for it.
+      if (runtime.isBusy === true || this.handoffs.has(sessionId) || this.turnOpen(sessionId))
+        return await this.queueSessionWrite(sessionId, runtime, request)
       await this.restoreCancelledRuntimeForControl(sessionId, runtime)
       if (this.runtimeForSession(sessionId) !== runtime || Boolean(runtime.isBusy))
         throw new LlmError(
@@ -1463,42 +1741,19 @@ export class AcpProfileAdapter extends LlmAdapter {
         selectionBeforeWrite === undefined ? undefined : await this.readBindingForUserMode(sessionId)
       if (selectionBeforeWrite !== undefined && selectionBindingBefore === undefined)
         throw new LlmError('The ACP session binding is unavailable for this mode change', 'ACP_BINDING_UNAVAILABLE')
-      if (request.kind === 'mode') {
-        if (runtime.setMode === undefined)
-          throw new LlmError('This Agent does not expose mode controls', 'ACP_CONFIG_UNSUPPORTED')
-        if (runtime.modes === undefined || !runtime.modes.availableModes.some((mode) => mode.id === request.id))
-          throw new LlmError(`Agent mode "${request.id}" is not available`, 'ACP_CONFIG_UNSUPPORTED')
-        await runtime.setMode(request.id)
-      } else {
-        const option = runtime.configOptions?.find((candidate) => candidate.id === request.id)
-        if (option === undefined || isAcpModelOrReasoningOption(option)) {
-          throw new LlmError(
-            'Model and reasoning controls are managed by the DSH model picker',
-            'ACP_CONFIG_UNSUPPORTED',
-          )
-        }
-        if (
-          option.type === 'select' &&
-          (typeof request.value !== 'string' || !this.selectValues(option).has(request.value))
-        )
-          throw new LlmError(`Agent option "${request.id}" does not allow that value`, 'ACP_CONFIG_UNSUPPORTED')
-        if (option.type === 'boolean' && typeof request.value !== 'boolean')
-          throw new LlmError(`Agent option "${request.id}" expects a boolean`, 'ACP_CONFIG_UNSUPPORTED')
-        if (runtime.setConfigOption === undefined)
-          throw new LlmError('This Agent does not expose session controls', 'ACP_CONFIG_UNSUPPORTED')
-        await runtime.setConfigOption(request.id, request.value)
-      }
+      await this.planSessionWrite(runtime, request).apply()
       if (
         request.kind === 'mode' ||
-        runtime.configOptions?.some(
-          (option) =>
-            option.id === request.id &&
-            (normalizeAcpConfigOptionKey(option.id) === 'mode' ||
-              normalizeAcpConfigOptionKey(option.category ?? '') === 'mode'),
-        )
+        runtime.configOptions?.some((option) => option.id === request.id && isModeConfigOption(option))
       ) {
         const intent = await this.sidecar?.readModeIntent(sessionId as never)
         if (intent !== undefined) await this.sidecar?.clearModeIntent(sessionId as never, intent)
+      } else {
+        // The immediate write supersedes a choice for this option that was still waiting for the next turn.
+        const waiting = (await this.sidecar?.listOptionIntents(sessionId as never))?.find(
+          (intent) => intent.optionId === request.id,
+        )
+        if (waiting !== undefined) await this.sidecar?.clearOptionIntent(sessionId as never, waiting)
       }
       await this.persistRuntimeSnapshot(sessionId, runtime)
       if (selectionBeforeWrite !== undefined) {
@@ -1516,18 +1771,101 @@ export class AcpProfileAdapter extends LlmAdapter {
     })
   }
 
+  /**
+   * Check a write against the live controls and prepare it. The checks are the same whether the Agent is written
+   * now or the change waits for the next turn, so a change accepted while a turn runs can still be applied later.
+   * `current` tells that the Agent already has the requested value.
+   */
+  private planSessionWrite(
+    runtime: AcpProfileRuntime,
+    request: AgentSessionOptionWrite,
+  ): { readonly current: boolean; readonly apply: () => Promise<void> } {
+    if (request.kind === 'mode') {
+      const setMode = runtime.setMode?.bind(runtime)
+      if (setMode === undefined)
+        throw new LlmError('This Agent does not expose mode controls', 'ACP_CONFIG_UNSUPPORTED')
+      if (runtime.modes === undefined || !runtime.modes.availableModes.some((mode) => mode.id === request.id))
+        throw new LlmError(`Agent mode "${request.id}" is not available`, 'ACP_CONFIG_UNSUPPORTED')
+      return {
+        current: (runtime.currentModeId ?? runtime.modes.currentModeId) === request.id,
+        apply: () => setMode(request.id),
+      }
+    }
+    const option = runtime.configOptions?.find((candidate) => candidate.id === request.id)
+    if (option === undefined || isAcpModelOrReasoningOption(option)) {
+      throw new LlmError('Model and reasoning controls are managed by the DSH model picker', 'ACP_CONFIG_UNSUPPORTED')
+    }
+    if (option.type === 'select' && !optionAcceptsValue(option, request.value))
+      throw new LlmError(`Agent option "${request.id}" does not allow that value`, 'ACP_CONFIG_UNSUPPORTED')
+    if (option.type === 'boolean' && !optionAcceptsValue(option, request.value))
+      throw new LlmError(`Agent option "${request.id}" expects a boolean`, 'ACP_CONFIG_UNSUPPORTED')
+    const setConfigOption = runtime.setConfigOption?.bind(runtime)
+    if (setConfigOption === undefined)
+      throw new LlmError('This Agent does not expose session controls', 'ACP_CONFIG_UNSUPPORTED')
+    return {
+      current: option.currentValue === request.value,
+      apply: () => setConfigOption(request.id, request.value),
+    }
+  }
+
+  /**
+   * While a turn runs, or is being prepared, the Agent cannot be written, so a change is validated like an immediate
+   * one and saved as a pending choice of the current binding; the next prompt applies it. Choosing the value the
+   * Agent already has cancels the pending choice for that control.
+   */
+  private async queueSessionWrite(
+    sessionId: string,
+    runtime: AcpProfileRuntime,
+    request: AgentSessionOptionWrite,
+  ): Promise<AgentSessionSnapshotView> {
+    const plan = this.planSessionWrite(runtime, request)
+    const sidecar = this.sidecar
+    const binding = sidecar === undefined ? undefined : await this.readBindingForUserMode(sessionId)
+    if (sidecar === undefined || binding === undefined)
+      throw new LlmError('The ACP session binding is unavailable for this change', 'ACP_BINDING_UNAVAILABLE')
+    const bindingKey = modeIntentBindingKey(binding)
+    // The turn is under way even if its stream is not registered yet: the choice belongs to the turn after it.
+    const fence = this.turnFenceFor(sessionId)
+    const mode = this.modeSelectionForRequest(runtime, request)
+    if (mode !== undefined) {
+      const requested = mode.kind === 'legacy' ? mode.id : String(mode.value)
+      const waiting = await sidecar.readModeIntent(sessionId as never)
+      if (fence !== undefined && !fence.mode) {
+        // The first mode choice since the turn began. A mode chosen before the first prompt was sent is that turn's
+        // own: it still starts the turn it was chosen for, and this choice waits for the next one.
+        if (waiting?.bindingKey === initialModeIntentBindingKey(binding.provider)) fence.initialMode = waiting
+        fence.mode = true
+      }
+      // Compared with the mode the turn runs under: the one it was sent with, else the one the Agent has.
+      const unchanged = fence?.initialMode === undefined ? plan.current : fence.initialMode.modeId === requested
+      if (unchanged) {
+        if (waiting !== undefined) await sidecar.clearModeIntent(sessionId as never, waiting)
+      } else await sidecar.writeModeIntent(sessionId as never, { bindingKey, modeId: requested })
+    } else if (request.kind === 'config') {
+      fence?.options.add(request.id)
+      if (plan.current) {
+        const waiting = (await sidecar.listOptionIntents(sessionId as never)).find(
+          (intent) => intent.optionId === request.id,
+        )
+        if (waiting !== undefined) await sidecar.clearOptionIntent(sessionId as never, waiting)
+      } else
+        await sidecar.writeOptionIntent(sessionId as never, {
+          bindingKey,
+          optionId: request.id,
+          value: request.value,
+        })
+    }
+    this.controlsChanged?.(sessionId)
+    return await this.readAgentSessionSnapshotView(sessionId, this.liveAgentSessionSnapshot(sessionId, runtime))
+  }
+
   private modeSelectionForRequest(
     runtime: AcpProfileRuntime,
     request: AgentSessionOptionWrite,
   ): UserModeChoice | undefined {
     if (request.kind === 'mode') return { kind: 'legacy', id: request.id }
     const option = runtime.configOptions?.find((candidate) => candidate.id === request.id)
-    if (
-      option === undefined ||
-      (normalizeAcpConfigOptionKey(option.id) !== 'mode' &&
-        normalizeAcpConfigOptionKey(option.category ?? '') !== 'mode')
-    )
-      return undefined
+    if (option === undefined || !isModeConfigOption(option)) return undefined
     if (typeof request.value !== 'string') return undefined
     return { kind: 'config', id: request.id, value: request.value }
   }
@@ -1712,6 +2050,67 @@ export class AcpProfileAdapter extends LlmAdapter {
       signal.throwIfAborted()
     } finally {
       if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /**
+   * Whether DSH has accepted a prompt for this session and its turn has not ended. The Agent turns `running`, and
+   * the turn opens, the moment waking input is delivered: ahead of the step, its messages and the request that
+   * reaches this adapter's stream. It is what the user's Stop button shows, so what the user chooses from then on
+   * belongs to the turn after it.
+   */
+  private turnOpen(sessionId: string): boolean {
+    return this.sessionOf(sessionId)?.facts.turnOpen === true
+  }
+
+  /** The fence of the turn under way, if its stream registered or a choice was made since: never creates one. */
+  private heldTurnFence(sessionId: string): TurnControlFence | undefined {
+    const registered = this.handoffs.get(sessionId)
+    if (registered !== undefined) return registered.fence
+    return this.turnOpen(sessionId) ? this.acceptedTurns.get(sessionId)?.fence : undefined
+  }
+
+  /**
+   * The fence a control write falls under: the registered stream's, else the one the accepted turn holds until its
+   * stream registers. A write outside any turn has none.
+   */
+  private turnFenceFor(sessionId: string): TurnControlFence | undefined {
+    const registered = this.handoffs.get(sessionId)
+    if (registered !== undefined) return registered.fence
+    const session = this.sessionOf(sessionId)
+    if (session?.facts.turnOpen !== true) return undefined
+    const held = this.acceptedTurns.get(sessionId)
+    if (held !== undefined) return held.fence
+    const fence: TurnControlFence = { mode: false, options: new Set() }
+    // A turn that ends without ever registering a stream here (cancelled, or served by another route) takes it along.
+    const off = session.watchTurnEnd?.(() => this.releaseAcceptedTurn(sessionId, fence))
+    this.acceptedTurns.set(sessionId, { fence, owner: session.identity ?? session, off })
+    return fence
+  }
+
+  /** The registering stream takes over the fence of the accepted turn it serves, with every choice made since. */
+  private adoptAcceptedTurn(sessionId: string): TurnControlFence | undefined {
+    const held = this.acceptedTurns.get(sessionId)
+    if (held === undefined) return undefined
+    this.forgetAcceptedTurn(sessionId, held)
+    return held.fence
+  }
+
+  private releaseAcceptedTurn(sessionId: string, fence: TurnControlFence): void {
+    const held = this.acceptedTurns.get(sessionId)
+    if (held?.fence === fence) this.forgetAcceptedTurn(sessionId, held)
+  }
+
+  private forgetAcceptedTurn(sessionId: string, held: AcceptedTurn): void {
+    this.acceptedTurns.delete(sessionId)
+    try {
+      held.off?.()
+    } catch {
+      try {
+        this.log?.('ACP accepted-turn listener cleanup failed')
+      } catch {
+        /* listener cleanup diagnostics must not block adoption */
+      }
     }
   }
 
@@ -2079,7 +2478,6 @@ export class AcpProfileAdapter extends LlmAdapter {
       }
       if (owner === undefined) {
         const stream = new StreamHandoff()
-        owner = { stream, generation, options }
         const indices = new Map<number, number>()
         for (const chunk of carry) {
           if (chunk.type === 'finish') {
@@ -2094,7 +2492,11 @@ export class AcpProfileAdapter extends LlmAdapter {
             yield { ...chunk, index: indices.get(chunk.index)! }
           } else yield chunk
         }
-        stream.attach(self.executionStream(options, generation, stream, indices.size))
+        // DSH accepted this prompt before the stream was registered. Whatever the user chose since is already fenced
+        // in the turn's fence, which this registration adopts rather than replaces.
+        const fence: TurnControlFence = self.adoptAcceptedTurn(key) ?? { mode: false, options: new Set() }
+        owner = { stream, generation, options, fence }
+        stream.attach(self.executionStream(options, generation, stream, fence, indices.size))
         self.handoffs.set(key, owner)
         const captured = owner
         const cleanup = async (abandonSettlementWait = false): Promise<void> => {
@@ -2161,6 +2563,7 @@ export class AcpProfileAdapter extends LlmAdapter {
     options: GenerateOptions,
     generation: ProfileGeneration | undefined,
     handoff: StreamHandoff,
+    fence: TurnControlFence,
     contentOffset = 0,
   ): AsyncIterable<StreamChunk> {
     const self = this
@@ -2171,6 +2574,18 @@ export class AcpProfileAdapter extends LlmAdapter {
       const sessionKey = String(options.sessionId ?? '')
       if (sessionKey.length === 0) throw new LlmError('ACP requires a DSH session id', 'ACP_SESSION_UNAVAILABLE')
       await self.waitForSessionControlWrite(sessionKey, options.signal)
+      // The vendor may have replaced its session since the last turn settled (a `/clear` in a turn that then failed, a
+      // late `/new`). The binding names the session this prompt resumes, so it moves first, or the prompt would revive
+      // the conversation the user cleared.
+      try {
+        await self.applyVendorSessionChange(sessionKey, 'always')
+      } catch (error: unknown) {
+        throw new LlmError(
+          `ACP could not record the change of the agent's conversation; no prompt was sent (${failureText(error)})`,
+          'ACP_BINDING_PERSIST_FAILED',
+          { cause: error },
+        )
+      }
       if (self.sidecar === undefined)
         throw new LlmError(
           'ACP sidecar is unavailable; the Agent binding cannot be made durable',
@@ -2327,9 +2742,7 @@ export class AcpProfileAdapter extends LlmAdapter {
         // A rebind request is a durable, explicit instruction to establish a
         // new blank ACP session on the next turn while retaining the old binding
         // as audit history. This also survives a host restart between clicks.
-        const priorBindingForRebind = forceBlank
-          ? await self.sidecar?.readLatestBinding(sessionKey as never)
-          : undefined
+        let priorBindingForRebind = forceBlank ? await self.sidecar?.readLatestBinding(sessionKey as never) : undefined
         const existingBinding = forceBlank ? undefined : await self.sidecar?.readLatestBinding(sessionKey as never)
         if (existingBinding?.status === 'outdated') {
           await self.blockRecovery(sessionKey, {
@@ -2514,22 +2927,55 @@ export class AcpProfileAdapter extends LlmAdapter {
             const detail = `ACP session restore failed: ${error instanceof Error ? error.message : String(error)}`
             const missing = /(?:session[_ -]?)?(?:not[ -]?found|unknown[_ -]?session)|does not exist/i.test(detail)
             const capability = /does not advertise|cannot restore/i.test(detail)
-            await self.blockRecovery(
-              sessionKey,
-              {
-                kind: missing ? 'session-lost' : capability ? 'reconciliation-required' : 'reconnect-required',
-                cause: missing ? 'id-not-found' : capability ? 'capability-missing' : 'load-failed',
-                detail,
-              },
-              binding,
-              missing ? 'ACP_SESSION_NOT_FOUND' : capability ? 'ACP_RECONCILIATION_REQUIRED' : 'ACP_RECONNECT_REQUIRED',
-            )
+            if (
+              missing &&
+              binding.committedPromptOrdinal === 0 &&
+              persistedRecovery?.kind === 'healthy' &&
+              persistedRecovery.lastUserAction === VENDOR_SESSION_CHANGE_ACTION &&
+              persistedRecovery.acpSessionId === binding.agentSessionId &&
+              persistedRecovery.generation === binding.generation
+            ) {
+              // The binding is the one the host wrote when the vendor replaced its conversation by an empty one
+              // (`/clear`, a new thread), and no prompt has reached it since. Claude, Codex and Oh My Pi write their
+              // session file with the first message, so after a restart the vendor may not know the id, and nothing is
+              // lost with it. Continue as the blank rebind the user would have asked for: a new vendor session as the
+              // next binding generation, anchored on this one. Any other binding that is gone stays gated: one that
+              // was never prompted, or a replacement that kept messages (a rewind), the vendor lost something the
+              // user may still want.
+              runtime = self.runtimeFactory(self.runtimeOptionsFor(sessionKey, profile, runtimeCwd))
+              self.runtimes.set(runtimeKey, runtime)
+              if (session !== undefined) self.runtimeOwners.set(runtime, session.identity ?? session)
+              self.nextGenerations.set(sessionKey, binding.generation + 1)
+              self.confirmedUserModes.delete(sessionKey)
+              self.log?.(
+                `dsh-acp: ${sessionKey} Agent session ${binding.agentSessionId} was replaced, never prompted and is gone; continuing in a new session`,
+              )
+              forceBlank = true
+              priorBindingForRebind = existingBinding
+              binding = undefined
+            } else {
+              await self.blockRecovery(
+                sessionKey,
+                {
+                  kind: missing ? 'session-lost' : capability ? 'reconciliation-required' : 'reconnect-required',
+                  cause: missing ? 'id-not-found' : capability ? 'capability-missing' : 'load-failed',
+                  detail,
+                },
+                binding,
+                missing
+                  ? 'ACP_SESSION_NOT_FOUND'
+                  : capability
+                    ? 'ACP_RECONCILIATION_REQUIRED'
+                    : 'ACP_RECONNECT_REQUIRED',
+              )
+            }
           }
           // Sessions established by an older adapter build may not yet carry
           // the display-only Native Agent Access facts. Idempotently migrate
           // them after the exact ACP binding has been restored.
-          projectNativeAgentAccess(session)
-        } else {
+          if (binding !== undefined) projectNativeAgentAccess(session)
+        }
+        if (binding === undefined) {
           let forkOutcome: 'inherited' | 'blank' | undefined
           let forkReason: AcpSessionForkReason | undefined
           let forkParentSessionId: string | undefined
@@ -2743,7 +3189,19 @@ export class AcpProfileAdapter extends LlmAdapter {
           // output and typed failure before any independently admitted input.
           if (!pendingAutomaticFailure) {
             await self.convergeConfig(runtime, options)
-            await self.applyMemberMode(sessionKey, runtime)
+            // One critical section per prompt: a dock write lands entirely before it (a cancel then keeps the choice
+            // from being sent) or entirely after it (and is judged against what it left the Agent with).
+            await self.serializeSessionControlWrite(sessionKey, async () => {
+              await self.applyMemberMode(sessionKey, runtime, fence)
+              try {
+                await self.applyPendingOptions(sessionKey, runtime, fence, options.signal)
+              } catch (error) {
+                // Nothing was dispatched and the choices stay pending. Keep the live controls so the user can
+                // change or cancel them instead of retrying behind a stale menu.
+                retainHealthyRuntimeAfterNotDispatched = true
+                throw error
+              }
+            })
           }
           if (restoreSavedMode && !pendingAutomaticFailure) {
             // A mode is restored only after the same-bound session was loaded.
@@ -2758,7 +3216,8 @@ export class AcpProfileAdapter extends LlmAdapter {
           }
           await self.persistRuntimeSnapshot(sessionKey, runtime)
         } catch (error: unknown) {
-          if (!restoreSavedMode) await self.releaseRuntime(runtimeKey, runtime)
+          if (!restoreSavedMode && !retainHealthyRuntimeAfterNotDispatched)
+            await self.releaseRuntime(runtimeKey, runtime)
           if (error instanceof LlmError) throw error
           throw new LlmError(
             `ACP session configuration could not be applied: ${error instanceof Error ? error.message : String(error)}`,
@@ -3500,6 +3959,10 @@ export class AcpProfileAdapter extends LlmAdapter {
               : await settleKnownRemoteTerminalAndWait()
             stopWatchingDirectory?.()
             let continuationBinding = committedBinding
+            // The vendor replaced its conversation during this turn (`/clear`): the turn settled against the session it
+            // ran in, and the binding follows to the new one now. The replay marker of this turn names that session.
+            if (changedWorkingDirectory === undefined && committedBinding !== undefined)
+              continuationBinding = (await self.followVendorSession(sessionKey)) ?? continuationBinding
             if (
               changedWorkingDirectory !== undefined &&
               options.signal?.aborted === true &&
@@ -4146,8 +4609,307 @@ const hasSuccessfulToolResult =
     }
   }
 
+  // The vendor's commands, side questions and the sessions a vendor replaces on its own are the host's side channel to
+  // a native runtime: none of them is a turn, so none claims the prompt slot or writes the DSH log.
+
+  /**
+   * The slash commands of one session: the live runtime's catalog, else the built-in table of the profile's native
+   * kind, so a session with no agent process yet (not started, or restarted) still offers them. A profile that is
+   * not a native one has none.
+   */
+  nativeCommands(sessionId: string): readonly NativeCommand[] {
+    const live = this.runtimeForSession(sessionId)?.commands?.()
+    if (live !== undefined) return live
+    const profile = this.readConfig()
+    const kind = profile === undefined ? undefined : this.nativeKindOf?.(profile)
+    return kind === undefined ? [] : staticNativeCommands(kind)
+  }
+
+  /** Be told when the commands of a session changed; the listener asks `nativeCommands()` again. */
+  watchNativeCommands(listener: (sessionId: string) => void): () => void {
+    this.nativeCommandListeners.add(listener)
+    return () => {
+      this.nativeCommandListeners.delete(listener)
+    }
+  }
+
+  private notifyNativeCommands(sessionId: string): void {
+    for (const listener of [...this.nativeCommandListeners]) {
+      try {
+        listener(sessionId)
+      } catch {
+        /* a failing subscriber must not break the runtime event it hears */
+      }
+    }
+  }
+
+  /**
+   * Run one `immediate` vendor command of a session. It needs the agent attached to the session's vendor conversation
+   * (a saved session is reconnected first); a command that replaces that conversation (`/new`) or rolls it back
+   * (`/rewind`) moves the binding before the answer is returned. Expected failures are results, never exceptions.
+   */
+  async runNativeCommand(
+    sessionId: string,
+    name: string,
+    args: string,
+    signal: AbortSignal,
+  ): Promise<NativeCommandResult> {
+    const result = await this.sideChannel(
+      sessionId,
+      signal,
+      (runtime, callSignal) => runtime.runCommand?.(name, args, callSignal),
+      `This agent does not run /${name} outside a turn.`,
+    )
+    try {
+      await this.applyVendorSessionChange(sessionId, 'idle')
+    } catch (error: unknown) {
+      return {
+        kind: 'error',
+        text: `${result.text}\n\nThe change of the agent's conversation could not be recorded for this session (${failureText(error)}); it is retried with your next message.`,
+      }
+    }
+    return result
+  }
+
+  /**
+   * Answer a side question (`/btw`) from the conversation the session's agent holds, without adding to it. It may run
+   * while a turn runs. Expected failures are results, never exceptions.
+   */
+  async sideQuestion(sessionId: string, question: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    return await this.sideChannel(
+      sessionId,
+      signal,
+      (runtime, callSignal) => runtime.sideQuestion?.(question, callSignal),
+      'This agent cannot answer side questions.',
+    )
+  }
+
+  /**
+   * `setAgentSessionOption` for a session whose agent may not be running: a saved session is reconnected first, as
+   * its next prompt would, and while a turn runs the choice waits for the next one. Throws a message for the user
+   * when the agent cannot be reached.
+   */
+  async setNativeSessionOption(
+    sessionId: string,
+    request: AgentSessionOptionWrite,
+    signal: AbortSignal,
+  ): Promise<AgentSessionSnapshotView> {
+    const wait = this.sideChannelSignal(sessionId, signal)
+    try {
+      await this.attachedRuntime(sessionId, wait.signal)
+    } finally {
+      wait.dispose()
+    }
+    return await this.setAgentSessionOption(sessionId, request)
+  }
+
+  /** A signal that also ends with the adapter and with the disposal of the session the call belongs to. */
+  private sideChannelSignal(
+    sessionId: string,
+    signal: AbortSignal,
+  ): { readonly signal: AbortSignal; readonly dispose: () => void } {
+    const session = this.sessionOf(sessionId)
+    return this.settlementWaitSignal(
+      sessionId,
+      session === undefined ? undefined : (session.identity ?? session),
+      signal,
+    )
+  }
+
+  private async sideChannel(
+    sessionId: string,
+    signal: AbortSignal,
+    call: (runtime: AcpProfileRuntime, signal: AbortSignal) => Promise<NativeCommandResult> | undefined,
+    unsupported: string,
+  ): Promise<NativeCommandResult> {
+    const wait = this.sideChannelSignal(sessionId, signal)
+    try {
+      const runtime = await this.attachedRuntime(sessionId, wait.signal)
+      const answer = call(runtime, wait.signal)
+      return answer === undefined ? { kind: 'error', text: unsupported } : await answer
+    } catch (error: unknown) {
+      return { kind: 'error', text: wait.signal.aborted ? 'The request was cancelled.' : failureText(error) }
+    } finally {
+      wait.dispose()
+    }
+  }
+
+  /**
+   * The runtime a side call may use: attached to the vendor conversation this session is bound to. A running prompt
+   * proves the agent is attached; otherwise the saved session is brought back the way the next prompt would, so a
+   * command on a session restored after a restart works before anything is sent. A side channel that cannot reach
+   * the agent only says so: it never writes recovery state, and it keeps no runtime it created in vain.
+   */
+  private async attachedRuntime(sessionId: string, signal: AbortSignal): Promise<AcpProfileRuntime> {
+    const sidecar = this.sidecar
+    if (sidecar === undefined)
+      throw new SideChannelUnavailable('The record of the agent conversation is unavailable (no ACP sidecar).')
+    // A vendor session change no turn got to record must reach the binding before it is compared with the runtime.
+    await this.applyVendorSessionChange(sessionId, 'idle')
+    signal.throwIfAborted()
+    const lookup = await sidecar.readLatestBinding(sessionId as never)
+    signal.throwIfAborted()
+    if (lookup?.status !== 'ok')
+      throw new SideChannelUnavailable('There is no agent conversation in this session yet. Send a message first.')
+    const binding = lookup.binding
+    if (binding.provider !== acpRouteId(this.profileId) || binding.profileId !== this.profileId)
+      throw new SideChannelUnavailable('This session belongs to another agent.')
+    const session = this.sessionOf(sessionId)
+    const profile = snapshotProfile(this.readConfig())
+    if (session === undefined || profile === undefined)
+      throw new SideChannelUnavailable('The agent profile or the session is no longer available.')
+    const owner = session.identity ?? session
+    const runtimeKey = `${sessionId}:${profileLaunchIdentityHash(this.profileId, profile)}`
+    const existing = this.runtimeForSession(sessionId)
+    if (existing !== undefined && this.runtimes.get(runtimeKey) !== existing)
+      throw new SideChannelUnavailable(
+        'The agent profile changed while this session was active; restore it or start a new session.',
+      )
+    if (existing !== undefined && this.runtimeOwners.get(existing) !== owner)
+      throw new SideChannelUnavailable('The session changed under this request; try again.')
+    if (existing?.isBusy === true) return existing
+    const recovery = this.recoveryStateFallback(sessionId) ?? (await sidecar.readRecoveryState(sessionId as never))
+    if (recovery !== undefined && recovery.kind !== 'healthy')
+      throw new SideChannelUnavailable(
+        'This session needs recovery before the agent can be reached; use the recovery panel first.',
+      )
+    const cwd = this.canonicalCwd(session.workingDirectory)
+    if (
+      binding.canonicalCwd !== cwd ||
+      !acpLaunchFingerprintsCompatible(binding.launchFingerprint, await this.launchFingerprint(profile))
+    )
+      throw new SideChannelUnavailable(
+        'The working directory or the launch settings changed since this session started; restore them or start a new session.',
+      )
+    if (!this.subprocess.ok) throw new SideChannelUnavailable(this.subprocess.message)
+    const created = existing === undefined
+    const runtime = existing ?? this.runtimeFactory(this.runtimeOptionsFor(sessionId, profile, cwd))
+    if (created) {
+      this.runtimes.set(runtimeKey, runtime)
+      this.runtimeOwners.set(runtime, owner)
+    }
+    this.runtimeBindings.set(runtime, binding)
+    try {
+      if (typeof runtime.restore !== 'function') throw new Error('this agent cannot be reconnected')
+      await runtime.restore(binding, signal)
+      if (this.runtimeForSession(sessionId) !== runtime)
+        throw new Error('the session was closed while the agent reconnected')
+    } catch (error: unknown) {
+      // A prompt that started meanwhile owns the runtime now; otherwise nothing keeps a runtime that never attached.
+      if (created && !this.sessionBusy(sessionId, runtime)) await this.releaseRuntime(runtimeKey, runtime)
+      throw new SideChannelUnavailable(`The agent could not be reconnected: ${failureText(error)}`)
+    }
+    if (created) this.controlsChanged?.(sessionId)
+    return runtime
+  }
+
+  /** Whether DSH is running a turn of this session, or has accepted one whose stream is not registered yet. */
+  private sessionBusy(
+    sessionId: string,
+    runtime: AcpProfileRuntime | undefined = this.runtimeForSession(sessionId),
+  ): boolean {
+    return runtime?.isBusy === true || this.handoffs.has(sessionId) || this.turnOpen(sessionId)
+  }
+
+  /** A native runtime announced that the vendor replaced its conversation or rolled it back (`session_changed`). */
+  private vendorSessionChanged(sessionId: string, agentSessionId: string, reason: string): void {
+    const runtime = this.runtimeForSession(sessionId)
+    if (runtime === undefined || this.sidecar === undefined) return
+    this.vendorSessionChanges.set(sessionId, { runtime, agentSessionId, reason })
+    // During a turn the binding stays on the session the turn settles against; the end of the turn moves it.
+    if (this.sessionBusy(sessionId, runtime)) return
+    void this.applyVendorSessionChange(sessionId, 'idle').catch((error: unknown) => {
+      this.log?.(`ACP could not record the new vendor session of ${sessionId}: ${failureText(error)}`)
+    })
+  }
+
+  /**
+   * Move the saved binding to the conversation a runtime announced. The vendor conversation was replaced, so this is
+   * the blank rebind of that session: the next generation, the new vendor id, no committed prompts, and the history
+   * the agent can know starts after the DSH log head. A restart then resumes the new session, never the cleared one.
+   * A rewind rolls the conversation back where it stood (Claude Code, Codex) and names the id the binding already has;
+   * the rebind is the same. The agent forgot messages the DSH log still holds, so nothing (a branch of the DSH session,
+   * a replay check) may assume it still has them, and the generation tells the conversation before the rewind from the
+   * one after it. `idle` leaves the change for the end of the turn when one is running. A session in recovery keeps its
+   * binding: recovery owns it. Changes that cannot be applied any more (the runtime went away, the vendor moved on
+   * again) are dropped. Throws when the binding could not be written; the change is then retried.
+   */
+  private async applyVendorSessionChange(
+    sessionId: string,
+    when: 'idle' | 'always',
+  ): Promise<AcpBindingData | undefined> {
+    if (!this.vendorSessionChanges.has(sessionId)) return undefined
+    const sidecar = this.sidecar
+    if (sidecar === undefined) return undefined
+    return await this.serializeSessionControlWrite(sessionId, async () => {
+      const change = this.vendorSessionChanges.get(sessionId)
+      if (change === undefined) return undefined
+      if (when === 'idle' && this.sessionBusy(sessionId, change.runtime)) return undefined
+      const settled = (binding?: AcpBindingData): AcpBindingData | undefined => {
+        if (this.vendorSessionChanges.get(sessionId) === change) this.vendorSessionChanges.delete(sessionId)
+        return binding
+      }
+      if (this.runtimeForSession(sessionId) !== change.runtime || change.runtime.acpSessionId !== change.agentSessionId)
+        return settled()
+      const lookup = await sidecar.readLatestBinding(sessionId as never)
+      // Without a binding the first prompt binds whatever session the runtime holds by then.
+      if (lookup?.status !== 'ok') return settled()
+      const binding = lookup.binding
+      if (binding.provider !== acpRouteId(this.profileId) || binding.profileId !== this.profileId) return settled()
+      // The binding already names the session the agent holds, unless the agent rolled that session back in place.
+      if (binding.agentSessionId === change.agentSessionId && !replacesSessionInPlace(change.reason))
+        return settled(binding)
+      const recovery = this.recoveryStateFallback(sessionId) ?? (await sidecar.readRecoveryState(sessionId as never))
+      if (recovery !== undefined && recovery.kind !== 'healthy') {
+        this.log?.(`ACP left the binding of ${sessionId} alone: its recovery state is ${recovery.kind}`)
+        return settled()
+      }
+      const head = Math.max((this.sessionOf(sessionId)?.seq ?? 0) - 1, binding.dshCommittedSeq)
+      const next: AcpBindingData = {
+        ...binding,
+        agentSessionId: change.agentSessionId,
+        capabilityHash: acpCanonicalHash16(change.runtime.agentCapabilities ?? {}),
+        generation: binding.generation + 1,
+        bindingEpoch: binding.bindingEpoch + 1,
+        committedPromptOrdinal: 0,
+        historyBaseSeq: head,
+        establishedAt: Math.max(Date.now(), binding.establishedAt),
+        dshCommittedSeq: head,
+      }
+      await sidecar.append(sessionId as never, { kind: 'binding', data: next })
+      this.runtimeBindings.set(change.runtime, next)
+      await sidecar.writeRecoveryState({
+        dshSessionId: sessionId,
+        kind: 'healthy',
+        provider: next.provider,
+        acpSessionId: next.agentSessionId,
+        generation: next.generation,
+        lastUserAction:
+          EMPTY_CONVERSATION_REASONS[change.reason] === true
+            ? VENDOR_SESSION_CHANGE_ACTION
+            : VENDOR_SESSION_REPLACED_ACTION,
+        updatedAt: Date.now(),
+      })
+      settled()
+      this.controlsChanged?.(sessionId)
+      return next
+    })
+  }
+
+  /** The end of a turn that may have replaced the vendor session: the settled turn stays settled whatever happens here. */
+  private async followVendorSession(sessionId: string): Promise<AcpBindingData | undefined> {
+    try {
+      return await this.applyVendorSessionChange(sessionId, 'always')
+    } catch (error: unknown) {
+      this.log?.(`ACP could not record the new vendor session of ${sessionId}: ${failureText(error)}`)
+      return undefined
+    }
+  }
+
   /** Explicitly discard only ACP-side continuity; DSH history is untouched. */
   async rebindBlank(sessionId: string): Promise<void> {
+    // The user abandons the agent's conversation: a session the agent moved to on its own is abandoned with it.
+    this.vendorSessionChanges.delete(sessionId)
     this.assertNoQuarantinedHostCalls(sessionId, true)
     if (this.sidecar === undefined)
       throw new LlmError(
@@ -4316,8 +5078,10 @@ const hasSuccessfulToolResult =
       }
     }
     this.handoffs.clear()
+    for (const [key, held] of [...this.acceptedTurns]) this.forgetAcceptedTurn(key, held)
     this.inMemoryRecoveryRequired.clear()
     this.confirmedUserModes.clear()
+    this.vendorSessionChanges.clear()
     this.admittedToolSchemas.clear()
     this.admittedToolSchemaOwners.clear()
     const keys = [...this.runtimes.keys()]
@@ -4350,11 +5114,16 @@ const hasSuccessfulToolResult =
   private async releaseRuntime(key: string, runtime: AcpProfileRuntime): Promise<void> {
     // An old asynchronous failure must not evict a replacement with the same key.
     if (this.runtimes.get(key) !== runtime) return
+    // The agent is about to go away together with what it knows of the session it moved to: record that first.
+    await this.followVendorSession(key.slice(0, key.lastIndexOf(':')))
     await this.preservePendingAgentTurnFailure(key, runtime)
     if (this.runtimes.get(key) !== runtime) return
     if (this.hostRoot !== undefined)
       retainHostExecutionOwner(this.hostRoot, key.slice(0, key.lastIndexOf(':')), runtime)
     this.runtimes.delete(key)
+    const releasedSession = key.slice(0, key.lastIndexOf(':'))
+    if (this.vendorSessionChanges.get(releasedSession)?.runtime === runtime)
+      this.vendorSessionChanges.delete(releasedSession)
     this.controlsChanged?.(key.slice(0, key.lastIndexOf(':')))
     await runtime.close().catch(() => undefined)
   }
@@ -4467,6 +5236,8 @@ const hasSuccessfulToolResult =
     }
     await this.closeSessionRuntime(session.id, owner)
     if (this.confirmedUserModes.get(session.id)?.owner === owner) this.confirmedUserModes.delete(session.id)
+    const held = this.acceptedTurns.get(session.id)
+    if (held?.owner === owner) this.forgetAcceptedTurn(session.id, held)
     if (this.admittedToolSchemaOwners.get(session.id) === owner) {
       this.admittedToolSchemaOwners.delete(session.id)
       this.admittedToolSchemas.delete(session.id)
@@ -4550,11 +5321,7 @@ const hasSuccessfulToolResult =
   }
 
   /** Build one immutable native launch/capability surface for every lifecycle path. */
-  private runtimeOptionsFor(
-    sessionId: string,
-    profile: AcpStubAgentConfig,
-    cwd: string,
-  ): ConstructorParameters<typeof AcpSessionRuntime>[0] {
+  private runtimeOptionsFor(sessionId: string, profile: AcpStubAgentConfig, cwd: string): AcpProfileRuntimeOptions {
     if (!this.subprocess.ok) throw new LlmError(this.subprocess.message, 'ACP_SPAWN_FAILURE')
     const processSeam = this.subprocess.seam
     const runtime = effectiveRuntimeOf(this.profileId, profile)
@@ -4608,6 +5375,8 @@ const hasSuccessfulToolResult =
       diagnosticDshSessionId: sessionId,
       ...(runtime === 'codebuddy' ? { refreshSessionAfterCancelledPrompt: true } : {}),
       onHostSettlementChanged: () => this.controlsChanged?.(sessionId),
+      onCommandsChanged: () => this.notifyNativeCommands(sessionId),
+      onSessionChanged: (agentSessionId, reason) => this.vendorSessionChanged(sessionId, agentSessionId, reason),
       ...sessionProtocolExtensions(runtime),
       ...(this.mcpKey === undefined
         ? {}

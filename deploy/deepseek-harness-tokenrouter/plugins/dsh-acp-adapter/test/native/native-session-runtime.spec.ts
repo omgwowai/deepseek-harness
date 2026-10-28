@@ -13,8 +13,11 @@ import {
 import { NATIVE_MODE_CONTRACTS, codexModeSettings, withNativeModeContract } from '../../src/runtime/native/session-modes.ts'
 import type { AcpSubprocessSpawnSpec, SubprocessSeam } from '../../src/runtime/process/subprocess.ts'
 import { AcpForkPreDispatchError } from '../../src/runtime/session/session-runtime.ts'
+import { staticNativeCommands } from '../../src/runtime/native/native-commands.ts'
 import {
   NativeTransportError,
+  type NativeCommand,
+  type NativeCommandResult,
   type NativeControls,
   type NativePromptResult,
 } from '../../src/runtime/native/transports/contract.ts'
@@ -125,6 +128,21 @@ function openTurn(transport: FakeNativeTransport): {
     return await finished.promise
   }
   return { started: started.promise, finish: (result = { stopReason: 'end_turn' }) => finished.resolve(result) }
+}
+
+/** Run `work` against the transport while a turn is open, then let the turn end. */
+async function duringTurn<T>(harness: Harness, work: (transport: FakeNativeTransport) => Promise<T>): Promise<T> {
+  await harness.runtime.start()
+  const transport = first(harness)
+  const turn = openTurn(transport)
+  const prompting = harness.runtime.prompt(text('work'), () => undefined)
+  await turn.started
+  try {
+    return await work(transport)
+  } finally {
+    turn.finish()
+    await prompting
+  }
 }
 
 const updateKinds = (notifications: readonly AcpSessionNotification[]): string[] =>
@@ -1196,23 +1214,6 @@ describe('NativeSessionRuntime permissions', () => {
     })
   }
 
-  async function duringTurn<T>(
-    harness: Harness,
-    work: (transport: FakeNativeTransport) => Promise<T>,
-  ): Promise<T> {
-    await harness.runtime.start()
-    const transport = first(harness)
-    const turn = openTurn(transport)
-    const prompting = harness.runtime.prompt(text('work'), () => undefined)
-    await turn.started
-    try {
-      return await work(transport)
-    } finally {
-      turn.finish()
-      await prompting
-    }
-  }
-
   it('forwards the request in ACP shape and answers exactly what the user chose', async () => {
     const onPermissionRequest = approving({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
     const onPermissionCheck = vi.fn(async () => undefined)
@@ -1314,6 +1315,187 @@ describe('NativeSessionRuntime permissions', () => {
     stop.abort()
     await prompting
     expect(heard[0]?.update).toEqual(messageChunk('{"cancelled":true}'))
+  })
+
+  it('cannot steer while a permission request waits for the user', async () => {
+    const answer = Promise.withResolvers<acp.RequestPermissionResponse>()
+    const onPermissionRequest = vi.fn(
+      async (_params: acp.RequestPermissionRequest, _signal?: AbortSignal) => await answer.promise,
+    )
+    const harness = build({}, { onPermissionRequest })
+    await duringTurn(harness, async (transport) => {
+      expect(harness.runtime.canSteer).toBe(true)
+      const pending = transport.requestPermission(request)
+      await vi.waitFor(() => expect(onPermissionRequest).toHaveBeenCalledTimes(1))
+      expect(harness.runtime.canSteer).toBe(false)
+      expect(await harness.runtime.steer(text('meanwhile'))).toBe('promptRequired')
+      expect(transport.steers).toEqual([])
+      answer.resolve({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
+      expect(await pending).toEqual({ optionId: 'allow-once' })
+      expect(harness.runtime.canSteer).toBe(true)
+    })
+  })
+})
+
+describe('NativeSessionRuntime forms', () => {
+  const requestedSchema: acp.ElicitationSchema = {
+    type: 'object',
+    properties: {
+      question_0: {
+        type: 'string',
+        title: 'Library',
+        oneOf: [
+          { const: 'React', title: 'React' },
+          { const: 'Vue', title: 'Vue' },
+        ],
+      },
+    },
+  }
+  const form = { message: 'Which library should we use?', requestedSchema }
+  const abandoned = { action: 'cancel' }
+
+  function asking(response: acp.CreateElicitationResponse | Error | 'hang') {
+    return vi.fn(async (_params: acp.CreateElicitationRequest, _signal?: AbortSignal) => {
+      if (response === 'hang') return await new Promise<never>(() => undefined)
+      if (response instanceof Error) throw response
+      return response
+    })
+  }
+
+  it('forwards the form with the session and answers exactly what the user filled in', async () => {
+    const answer: acp.CreateElicitationResponse = { action: 'accept', content: { question_0: 'Vue' } }
+    const onElicitationRequest = asking(answer)
+    const harness = build({}, { onElicitationRequest })
+    const response = await duringTurn(harness, (transport) =>
+      transport.requestElicitation({ ...form, toolCallId: 'call-1', _meta: { codex: { autoResolutionMs: null } } }),
+    )
+    expect(response).toEqual(answer)
+    expect(onElicitationRequest).toHaveBeenCalledTimes(1)
+    expect(onElicitationRequest.mock.calls[0]?.[0]).toEqual({
+      mode: 'form',
+      sessionId: 'omp-session-new',
+      message: 'Which library should we use?',
+      requestedSchema,
+      toolCallId: 'call-1',
+      _meta: { codex: { autoResolutionMs: null } },
+    })
+    expect(onElicitationRequest.mock.calls[0]?.[1]).toBeInstanceOf(AbortSignal)
+  })
+
+  it('leaves out the tool call and the meta the vendor did not give', async () => {
+    const onElicitationRequest = asking({ action: 'decline' })
+    const harness = build({}, { onElicitationRequest })
+    await duringTurn(harness, (transport) => transport.requestElicitation({ ...form, toolCallId: undefined }))
+    expect(Object.keys(onElicitationRequest.mock.calls[0]?.[0] ?? {}).sort()).toEqual([
+      'message',
+      'mode',
+      'requestedSchema',
+      'sessionId',
+    ])
+  })
+
+  it('passes accept, decline and cancel through and cancels anything it cannot trust', async () => {
+    const accepted: acp.CreateElicitationResponse = { action: 'accept', content: { question_0: 'Vue' } }
+    const cases: [acp.CreateElicitationResponse | Error, unknown][] = [
+      [accepted, accepted],
+      [{ action: 'decline' }, { action: 'decline' }],
+      [{ action: 'cancel' }, abandoned],
+      [{ action: '_future' }, abandoned],
+      [new Error('question service down'), abandoned],
+    ]
+    for (const [response, expected] of cases) {
+      const harness = build({}, { onElicitationRequest: asking(response) })
+      const answer = await duringTurn(harness, async (transport) => {
+        const settled = await transport.requestElicitation(form)
+        // A settled form releases steering again, whatever it ended with.
+        expect(harness.runtime.canSteer).toBe(true)
+        return settled
+      })
+      expect(answer).toEqual(expected)
+    }
+  })
+
+  it('cancels outside a turn and from a transport that is no longer the current one', async () => {
+    const onElicitationRequest = asking({ action: 'accept', content: { question_0: 'Vue' } })
+    const harness = build({}, { onElicitationRequest })
+    await harness.runtime.start()
+    const retired = first(harness)
+    expect(await retired.requestElicitation(form)).toEqual(abandoned)
+    await harness.runtime.close()
+    await harness.runtime.start()
+    const turn = openTurn(harness.transports[1]!)
+    const prompting = harness.runtime.prompt(text('work'), () => undefined)
+    await turn.started
+    expect(await retired.requestElicitation(form)).toEqual(abandoned)
+    turn.finish()
+    await prompting
+    expect(onElicitationRequest).not.toHaveBeenCalled()
+  })
+
+  it('cancels a pending form with the host call when the turn is stopped', async () => {
+    const onElicitationRequest = asking('hang')
+    const harness = build({}, { onElicitationRequest })
+    await harness.runtime.start()
+    const transport = first(harness)
+    transport.promptScript = async (context) => {
+      const response = await transport.requestElicitation(form)
+      context.update(messageChunk(JSON.stringify(response)))
+      return { stopReason: 'end_turn' }
+    }
+    const stop = new AbortController()
+    const heard: AcpSessionNotification[] = []
+    const prompting = harness.runtime.prompt(text('work'), (notification) => heard.push(notification), stop.signal)
+    await vi.waitFor(() => expect(onElicitationRequest).toHaveBeenCalledTimes(1))
+    const hostSignal = onElicitationRequest.mock.calls[0]?.[1]
+    expect(hostSignal?.aborted).toBe(false)
+    stop.abort()
+    await prompting
+    expect(hostSignal?.aborted).toBe(true)
+    expect(heard[0]?.update).toEqual(messageChunk('{"action":"cancel"}'))
+    expect(harness.runtime.canSteer).toBe(false)
+  })
+
+  it('abandons a pending form when the vendor withdraws it', async () => {
+    const onElicitationRequest = asking('hang')
+    const harness = build({}, { onElicitationRequest })
+    const withdrawn = new AbortController()
+    const response = await duringTurn(harness, async (transport) => {
+      const pending = transport.requestElicitation(form, withdrawn.signal)
+      await vi.waitFor(() => expect(onElicitationRequest).toHaveBeenCalledTimes(1))
+      withdrawn.abort()
+      return await pending
+    })
+    expect(response).toEqual(abandoned)
+    expect(onElicitationRequest.mock.calls[0]?.[1]?.aborted).toBe(true)
+  })
+
+  it('offers the transport a form handler only when the host has a question surface', async () => {
+    const bare = build()
+    await bare.runtime.start()
+    expect(Object.hasOwn(first(bare).startOptions ?? {}, 'onElicitation')).toBe(false)
+    expect(first(bare).startOptions?.onElicitation).toBeUndefined()
+    const hosted = build({}, { onElicitationRequest: asking({ action: 'cancel' }) })
+    await hosted.runtime.start()
+    expect(first(hosted).startOptions?.onElicitation).toBeTypeOf('function')
+  })
+
+  it('cannot steer while a form waits for the user', async () => {
+    const answer = Promise.withResolvers<acp.CreateElicitationResponse>()
+    const onElicitationRequest = vi.fn(
+      async (_params: acp.CreateElicitationRequest, _signal?: AbortSignal) => await answer.promise,
+    )
+    const harness = build({}, { onElicitationRequest })
+    await duringTurn(harness, async (transport) => {
+      expect(harness.runtime.canSteer).toBe(true)
+      const pending = transport.requestElicitation(form)
+      await vi.waitFor(() => expect(onElicitationRequest).toHaveBeenCalledTimes(1))
+      expect(harness.runtime.canSteer).toBe(false)
+      expect(await harness.runtime.steer(text('meanwhile'))).toBe('promptRequired')
+      expect(transport.steers).toEqual([])
+      answer.resolve({ action: 'decline' })
+      expect(await pending).toEqual({ action: 'decline' })
+      expect(harness.runtime.canSteer).toBe(true)
+    })
   })
 })
 
@@ -1421,5 +1603,236 @@ describe('native launch argv', () => {
         prepareLaunch: async () => ({ argv: [], env: {}, spawnPlan: { argv: [], env: {} } }),
       }),
     ).rejects.toThrow('has no command')
+  })
+})
+
+describe('NativeSessionRuntime commands, side channel and session changes', () => {
+  const ok = (value: string): NativeCommandResult => ({ kind: 'success', text: value })
+  const review: NativeCommand = { name: 'review', description: 'Review the changes', dispatch: 'prompt' }
+
+  async function started(init: FakeTransportInit = {}, overrides: Partial<NativeSessionRuntimeOptions> = {}) {
+    const harness = build(init, overrides)
+    await harness.runtime.start()
+    return { harness, transport: first(harness) }
+  }
+
+  /** A transport call that never ends on its own, whatever it is told; `given()` is the signal it was handed. */
+  function neverEnds(): { readonly call: (...args: unknown[]) => Promise<never>; given(): AbortSignal | undefined } {
+    let given: AbortSignal | undefined
+    return {
+      call: (...args) => {
+        given = args.at(-1) as AbortSignal
+        return new Promise<never>(() => undefined)
+      },
+      given: () => given,
+    }
+  }
+
+  describe('the command catalog', () => {
+    it('lists the built-ins of its kind until the agent runs, then what the transport reports', async () => {
+      const { harness, transport } = await started({ kind: 'claude' })
+      expect(harness.runtime.commands()).toBe(staticNativeCommands('claude'))
+      const catalog = [review]
+      transport.commands = () => catalog
+      expect(harness.runtime.commands()).toBe(catalog)
+    })
+
+    it('tells the host when the vendor announces a catalog, also while the agent is still starting', async () => {
+      const changed = vi.fn()
+      const harness = build({}, { onCommandsChanged: changed }, (transport) => {
+        transport.beforeStart = async () => {
+          transport.emit({ kind: 'commands', commands: [review] })
+        }
+      })
+      await harness.runtime.start()
+      expect(changed).toHaveBeenCalledExactlyOnceWith([review])
+      // A transport without a list of its own is read through what it announced; a closed agent announced nothing.
+      expect(harness.runtime.commands()).toEqual([review])
+      await harness.runtime.close()
+      expect(harness.runtime.commands()).toBe(staticNativeCommands('omp'))
+    })
+  })
+
+  describe('side questions and immediate commands', () => {
+    it('answer while a prompt runs and take nothing from the turn', async () => {
+      const { harness, transport } = await started()
+      transport.sideQuestion = async (question) => ok(`re: ${question}`)
+      const turn = openTurn(transport)
+      const updates: string[] = []
+      const prompting = harness.runtime.prompt(text('work'), (notification) =>
+        updates.push(notification.update.sessionUpdate),
+      )
+      await turn.started
+
+      expect(await harness.runtime.sideQuestion('why?')).toEqual(ok('re: why?'))
+
+      // The turn still holds the prompt slot and can still be steered; the side call announced nothing to it.
+      expect(harness.runtime.isBusy).toBe(true)
+      expect(harness.runtime.canSteer).toBe(true)
+      await expect(harness.runtime.prompt(text('again'), () => undefined)).rejects.toThrow('ACP_PROMPT_ALREADY_ACTIVE')
+      expect(await harness.runtime.steer(text('more'))).toBe('injected')
+      turn.finish()
+      await expect(prompting).resolves.toMatchObject({ stopReason: 'end_turn' })
+      expect(updates).toEqual([])
+      expect(harness.notifications).toEqual([])
+    })
+
+    it('never claim the prompt slot: a turn can start and end while one is open', async () => {
+      const { harness, transport } = await started()
+      const held = Promise.withResolvers<NativeCommandResult>()
+      transport.runCommand = vi.fn(async () => await held.promise)
+      const running = harness.runtime.runCommand('status', 'verbose')
+      expect(transport.runCommand).toHaveBeenCalledWith('status', 'verbose', expect.any(AbortSignal))
+      expect(harness.runtime.isBusy).toBe(false)
+
+      await expect(harness.runtime.prompt(text('meanwhile'), () => undefined)).resolves.toMatchObject({
+        stopReason: 'end_turn',
+      })
+      held.resolve(ok('status text'))
+      await expect(running).resolves.toEqual(ok('status text'))
+    })
+
+    it('answer with an error result for every way the call cannot be made', async () => {
+      // No agent session yet: the transport is not even started on its behalf.
+      const cold = build()
+      const asked = await cold.runtime.sideQuestion('anyone there?')
+      expect(asked).toMatchObject({ kind: 'error', text: expect.stringMatching(/send a message first/i) })
+      expect(first(cold).calls).toEqual([])
+
+      // The transport does not offer the method.
+      const plain = await started()
+      expect(await plain.harness.runtime.sideQuestion('q')).toMatchObject({
+        kind: 'error',
+        text: expect.stringContaining('omp'),
+      })
+      expect(await plain.harness.runtime.runCommand('status', '')).toMatchObject({ kind: 'error' })
+
+      // The process behind the session is gone: the call is not made.
+      const gone = await started()
+      gone.transport.sideQuestion = vi.fn(async () => ok('too late'))
+      gone.transport.closed = true
+      expect(await gone.harness.runtime.sideQuestion('q')).toMatchObject({ kind: 'error' })
+      expect(gone.transport.sideQuestion).not.toHaveBeenCalled()
+
+      // The transport fails, or answers with something that is no result.
+      const failing = await started()
+      failing.transport.sideQuestion = async () => {
+        throw new Error('the agent process was lost')
+      }
+      expect(await failing.harness.runtime.sideQuestion('q')).toEqual({
+        kind: 'error',
+        text: 'the agent process was lost',
+      })
+      failing.transport.sideQuestion = async () => ({ text: 'no kind' }) as unknown as NativeCommandResult
+      expect(await failing.harness.runtime.sideQuestion('q')).toMatchObject({ kind: 'error' })
+    })
+
+    it('end with the caller signal even when the transport ignores it', async () => {
+      const { harness, transport } = await started()
+      const stuck = neverEnds()
+      transport.sideQuestion = stuck.call
+      const controller = new AbortController()
+      const asked = harness.runtime.sideQuestion('q', controller.signal)
+      controller.abort()
+      await expect(asked).resolves.toMatchObject({ kind: 'error', text: expect.stringMatching(/cancel/i) })
+      expect(stuck.given()?.aborted).toBe(true)
+    })
+
+    it('end at their time limit and tell the transport to stop', async () => {
+      const { harness, transport } = await started({}, { sideCallTimeoutMs: 20 })
+      const stuck = neverEnds()
+      transport.runCommand = stuck.call
+      await expect(harness.runtime.runCommand('mcp', '')).resolves.toMatchObject({
+        kind: 'error',
+        text: expect.stringContaining('did not answer'),
+      })
+      expect(stuck.given()?.aborted).toBe(true)
+    })
+
+    it('end when the runtime closes', async () => {
+      const { harness, transport } = await started()
+      const stuck = neverEnds()
+      transport.sideQuestion = stuck.call
+      const asked = harness.runtime.sideQuestion('q')
+      await harness.runtime.close()
+      await expect(asked).resolves.toMatchObject({ kind: 'error', text: expect.stringMatching(/ended/i) })
+      expect(stuck.given()?.aborted).toBe(true)
+    })
+  })
+
+  describe('a conversation the vendor replaced', () => {
+    it('is followed: the runtime answers to the new session and the host is told', async () => {
+      const changed = vi.fn()
+      const { harness, transport } = await started({}, { onSessionChanged: changed })
+      const attachedBefore = harness.runtime.acpSessionId
+
+      transport.replaceSession('omp-session-2', 'clear')
+      expect(attachedBefore).toBe('omp-session-new')
+      expect(harness.runtime.acpSessionId).toBe('omp-session-2')
+      expect(changed).toHaveBeenCalledExactlyOnceWith('omp-session-2', 'clear')
+      // What the agent reports from then on is addressed to the session it is in, and the binding names it.
+      transport.emit({ kind: 'update', update: messageChunk('hello') })
+      expect(harness.notifications.at(-1)?.sessionId).toBe('omp-session-2')
+      expect(await harness.runtime.restore({ agentSessionId: 'omp-session-2' })).toBe('reused')
+      // Hearing the id it already holds again is no change.
+      transport.replaceSession('omp-session-2', 'clear')
+      expect(changed).toHaveBeenCalledTimes(1)
+    })
+
+    it('is followed in the middle of a turn without disturbing it', async () => {
+      const changed = vi.fn()
+      const { harness, transport } = await started({}, { onSessionChanged: changed })
+      transport.promptScript = async (context) => {
+        context.update(messageChunk('before'))
+        transport.replaceSession('omp-session-2', 'clear')
+        context.update(messageChunk('after'))
+        return { stopReason: 'end_turn' }
+      }
+      const seen: string[] = []
+      await harness.runtime.prompt(text('/clear'), (notification) => seen.push(notification.sessionId))
+      expect(seen).toEqual(['omp-session-new', 'omp-session-2'])
+      expect(changed).toHaveBeenCalledExactlyOnceWith('omp-session-2', 'clear')
+      expect(harness.runtime.acpSessionId).toBe('omp-session-2')
+    })
+
+    it('is followed when a rewind rolls it back where it stood, however often it names the session it holds', async () => {
+      const changed = vi.fn()
+      const { harness, transport } = await started({}, { onSessionChanged: changed })
+
+      transport.replaceSession('omp-session-new', 'rewind')
+      transport.replaceSession('omp-session-new', 'rewind')
+
+      // Every rewind is a change of its own: the agent forgot more each time.
+      expect(changed.mock.calls).toEqual([
+        ['omp-session-new', 'rewind'],
+        ['omp-session-new', 'rewind'],
+      ])
+      // The agent is still in the session it was in: what it reports is addressed to it, and the binding names it.
+      expect(harness.runtime.acpSessionId).toBe('omp-session-new')
+      transport.emit({ kind: 'update', update: messageChunk('hello') })
+      expect(harness.notifications.at(-1)?.sessionId).toBe('omp-session-new')
+    })
+
+    it.each(['clear', 'new', 'plan_mode_exit'])(
+      'takes the session it holds, named again with the reason %s, for a repeat and not for a change',
+      async (reason) => {
+        const changed = vi.fn()
+        const { transport } = await started({}, { onSessionChanged: changed })
+        transport.replaceSession('omp-session-new', reason)
+        expect(changed).not.toHaveBeenCalled()
+      },
+    )
+
+    it('is not announced by a resume that reports its own session while it attaches', async () => {
+      const changed = vi.fn()
+      const harness = build({}, { onSessionChanged: changed }, (transport) => {
+        transport.beforeStart = async () => {
+          transport.emit({ kind: 'session_changed', sessionId: 'someone-else', reason: 'startup' })
+        }
+      })
+      await harness.runtime.restore({ agentSessionId: 'vendor-1' })
+      expect(harness.runtime.acpSessionId).toBe('vendor-1')
+      expect(changed).not.toHaveBeenCalled()
+    })
   })
 })

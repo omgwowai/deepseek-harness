@@ -37,6 +37,7 @@ const sidecar = {
   append: async () => undefined,
   readLatestBinding: async () => undefined,
   readModeIntent: async () => undefined,
+  listOptionIntents: async () => [],
   readRecoveryState: async () => undefined,
   writeRecoveryState: async () => undefined,
   writeOptionSnapshot: async (_sessionId: unknown, snapshot: unknown) => {
@@ -446,5 +447,49 @@ describe('ACP M6a session configuration convergence', () => {
     expect(calls).toEqual([['model', 'target-model']])
     expect(promptCount.value).toBe(0)
     expect(ledger.records).toEqual([])
+  })
+
+  it('applies an effort changed in the picker during a running turn before the next prompt', async () => {
+    const calls: Array<[string, string | boolean]> = []
+    const promptCount = { value: 0 }
+    const initial = options().map((option) =>
+      option.type === 'select' && option.id === 'model' ? { ...option, currentValue: 'target-model' } : option,
+    )
+    const runtime = runtimeFor(calls, initial, promptCount)
+    const prompt = runtime.prompt.bind(runtime)
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    // The first turn stays open while the picker moves; the calls are recorded in the order they happen.
+    runtime.prompt = async (...args) => {
+      calls.push(['prompt', String(promptCount.value + 1)])
+      if (promptCount.value === 0) {
+        entered.resolve()
+        await release.promise
+      }
+      return await prompt(...args)
+    }
+    const adapter = new AcpProfileAdapter(
+      'test',
+      () => profile,
+      seam(),
+      () => session(),
+      new Ledger(),
+      undefined,
+      () => runtime,
+      sidecar,
+    )
+    const first = drain(adapter.stream(request('session-picker', { reasoningEffort: ReasoningEffortId('low') })))
+    await entered.promise
+    expect(calls).toEqual([['prompt', '1']])
+    release.resolve()
+    await first
+
+    await drain(adapter.stream(request('session-picker', { reasoningEffort: ReasoningEffortId('high') })))
+    expect(calls).toEqual([
+      ['prompt', '1'],
+      ['thinking', 'high'],
+      ['prompt', '2'],
+    ])
+    expect(promptCount.value).toBe(2)
   })
 })

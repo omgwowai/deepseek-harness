@@ -103,6 +103,8 @@ describe('client contribution', () => {
         expect.objectContaining({ key: 'acp-activity' }),
         expect.objectContaining({ key: 'acp-inline-activity' }),
         expect.objectContaining({ id: 'dsh-acp-agent-control' }),
+        expect.objectContaining({ name: 'conversation.chat.commandview', key: 'btw' }),
+        expect.objectContaining({ name: 'conversation.chat.commandview', key: 'status' }),
       ]),
     )
     expect(injections).not.toContainEqual(expect.objectContaining({ name: 'settings.section' }))

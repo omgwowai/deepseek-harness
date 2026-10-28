@@ -15,7 +15,16 @@
  *   - tool calls, plans, reasoning and messages are projected with codex-acp's
  *     renderers (see `codex-projection.ts`);
  *   - approvals reach the host as ACP permission requests with codex-acp's
- *     options and are answered with its decision table (`codex-approvals.ts`).
+ *     options and are answered with its decision table (`codex-approvals.ts`);
+ *     questions (`item/tool/requestUserInput`, MCP forms) reach it as the form
+ *     elicitation codex-acp sends, through `onElicitation`;
+ *   - the app-server has no slash-command layer, so the commands of the Codex
+ *     TUI that DSH carries are implemented here (`codex-commands.ts` lists them):
+ *     prompt commands run as turns, immediate ones (`runCommand`, `/status`,
+ *     `/mcp`, `/diff`, `/new`, …) answer without one, and `/side` = `/btw`
+ *     (`sideQuestion`) asks an ephemeral fork of the thread while the main turn
+ *     keeps running. Notifications and requests are routed by `threadId`: the
+ *     main thread projects, a side fork is collected, anything else is declined.
  *
  * Launch: `start()` receives the launcher argv (`CODEX_PATH`: the profile's
  * `codex-launch.mjs`, which adds the TokenRouter provider and the plan tool, or
@@ -28,15 +37,24 @@
  * `.scratch/dsh-native-agents-20261026/codex-claude-protocol/probe`).
  */
 import { randomUUID } from 'node:crypto'
+import { isAbsolute, relative } from 'node:path'
 import { createInterface, type Interface } from 'node:readline'
 import type * as acp from '@agentclientprotocol/sdk'
 
 import {
   answerCodexServerRequest,
+  declinedCodexServerAnswer,
+  describeCodexServerRequest,
   fallbackCodexServerAnswer,
   type CodexApprovalHost,
   type CodexServerRequestAnswer,
 } from './codex-approvals.ts'
+import {
+  CODEX_NATIVE_COMMANDS,
+  canonicalCodexCommand,
+  isUnsupportedCodexCommand,
+  unsupportedCodexCommandMessage,
+} from './codex-commands.ts'
 import {
   CODEX_COLLABORATION_CONFIG_ID,
   CODEX_EFFORT_CONFIG_ID,
@@ -51,22 +69,72 @@ import {
   type CodexCollaborationMode,
   type CodexModelInfo,
 } from './codex-controls.ts'
-import { asRecord, messageOf, readArray, readString, truncate, type JsonRecord } from './codex-json.ts'
+import {
+  GOAL_USAGE,
+  formatGoal,
+  formatGoalChange,
+  goalFailure,
+  goalLineArgs,
+  goalNote,
+  goalStatusLabel,
+  parseGoal,
+  parseGoalArgs,
+  type CodexGoal,
+  type GoalRequest,
+} from './codex-goal.ts'
+import {
+  diffCommand,
+  fetchSkills,
+  hooksCommand,
+  mcpCommand,
+  psCommand,
+  stopCommand,
+  type CodexRequest,
+} from './codex-immediate.ts'
+import { asRecord, messageOf, readNumber, readString, readStringArray, truncate, type JsonRecord } from './codex-json.ts'
 import {
   CodexProjection,
   CodexTokenAccounting,
+  codexNoticeText,
   planReviewToolCall,
   readableServiceErrorMessage,
   renderToolCall,
+  thoughtNote,
   type CodexProjectionSink,
 } from './codex-projection.ts'
+import { INIT_PROMPT, SIDE_BOUNDARY_PROMPT, SIDE_DEVELOPER_INSTRUCTIONS } from './codex-prompts.ts'
+import { formatRateLimits, formatSkills, formatThreadUsage, type CodexSkill } from './codex-reports.ts'
+import {
+  applyRestore,
+  checkpointsOf,
+  fileChangesOf,
+  findCheckpoint,
+  nodeRestoreIo,
+  parseRewindArgs,
+  parseTurnPage,
+  planRestore,
+  renderCheckpoints,
+  renderRewindPreview,
+  renderRewindResult,
+  type CodexCheckpoint,
+  type CodexTurn,
+  type RestorePlan,
+} from './codex-rewind.ts'
+import {
+  CodexSideRun,
+  SIDE_ALREADY_RUNNING_MESSAGE,
+  SIDE_REVIEW_RUNNING_MESSAGE,
+  SIDE_USAGE_MESSAGE,
+  sideCommandResult,
+  sideStartFailure,
+} from './codex-side.ts'
 import {
   NativeTransportError,
+  type NativeCommand,
+  type NativeCommandResult,
   type NativeContentBlock,
   type NativeContextUsage,
   type NativeControls,
-  type NativePermissionDecision,
-  type NativePermissionRequest,
   type NativeProcess,
   type NativePromptResult,
   type NativeTransport,
@@ -89,7 +157,13 @@ const TURN_ID_WAIT_MS = 2_000
 const ABORT_SETTLE_FALLBACK_MS = 30_000
 /** A compaction that starts no turn is over after this long. */
 const COMPACTION_START_GRACE_MS = 5_000
-const SKILLS_TIMEOUT_MS = 10_000
+/** `account/rateLimits/read` and the other optional lookups of `/status` never hold the card up for long. */
+const STATUS_LOOKUP_TIMEOUT_MS = 10_000
+const SKILLS_WRITE_TIMEOUT_MS = 10_000
+/** A side question that has not been answered by now is abandoned. */
+const SIDE_RUN_TIMEOUT_MS = 10 * 60_000
+/** Interrupting and closing a side thread are courtesies to the server; they never hold the answer up for long. */
+const SIDE_CLEANUP_TIMEOUT_MS = 5_000
 const CLOSE_GRACE_MS = 2_000
 const CLOSE_TERMINATE_MS = 1_000
 const STDERR_LIMIT = 8_192
@@ -98,6 +172,21 @@ const STDERR_SETTLE_MS = 250
 const DETAIL_LIMIT = 2_000
 /** codex-acp retries a cancel that raced the turn becoming interruptible. */
 const NO_ACTIVE_TURN_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const
+/**
+ * An active goal makes the app-server start the next turn by itself, within milliseconds of the end of the last one. A prompt that waits for
+ * it gives up after this long.
+ */
+const GOAL_CONTINUATION_GRACE_MS = 3_000
+/** A turn the app-server started for a goal while no prompt is open to show it is stopped (and the goal paused) after this long. */
+const UNATTENDED_TURN_GRACE_MS = 1_500
+/** A prompt follows a goal for this long at most; then the goal is paused. */
+const GOAL_HOLD_CAP_MS = 12 * 60 * 60_000
+/** Ends of turns nobody followed yet that are remembered for a prompt to pick up. */
+const ORPHAN_COMPLETIONS_KEPT = 16
+/** `thread/turns/list` page sizes: the cheap summary view, and the full view whose pages carry every tool output. */
+const TURN_PAGE_LIMIT = 100
+const FULL_TURN_PAGE_LIMIT = 20
+const MAX_TURN_PAGES = 200
 
 // ---------------------------------------------------------------------------
 // JSON-RPC errors and their classification
@@ -261,6 +350,13 @@ interface ThreadAttachment {
   readonly serviceTier: string | undefined
   readonly modelProvider: string | undefined
   readonly collaborationMode: CodexCollaborationMode | undefined
+  /** What `/status` shows about the thread. */
+  readonly threadName: string | undefined
+  readonly forkedFromId: string | undefined
+  /** The instruction files (AGENTS.md, …) the thread loaded. */
+  readonly instructionSources: readonly string[]
+  /** The directories the thread works in besides its own: the places `/rewind` may restore files in. */
+  readonly runtimeWorkspaceRoots: readonly string[]
 }
 
 function parseThreadAttachment(response: unknown, expectedId?: string): ThreadAttachment {
@@ -281,6 +377,10 @@ function parseThreadAttachment(response: unknown, expectedId?: string): ThreadAt
     serviceTier: readString(record, 'serviceTier'),
     modelProvider: readString(record, 'modelProvider') ?? readString(thread, 'modelProvider'),
     collaborationMode: parseCodexCollaborationMode(asRecord(record?.['collaborationMode'])?.['mode']),
+    threadName: readString(thread, 'name'),
+    forkedFromId: readString(thread, 'forkedFromId'),
+    instructionSources: readStringArray(record, 'instructionSources'),
+    runtimeWorkspaceRoots: readStringArray(record, 'runtimeWorkspaceRoots'),
   }
 }
 
@@ -288,7 +388,17 @@ function parseThreadAttachment(response: unknown, expectedId?: string): ThreadAt
 // Turn bookkeeping
 // ---------------------------------------------------------------------------
 
+/** What a run is: a user turn, or the turn one of the commands starts. */
+type TurnKind = 'turn' | 'review' | 'compact' | 'shell' | 'goal'
+
+/** How the user's `!cmd` ended, as the `userShell` item of its turn reported it. */
+interface ShellOutcome {
+  exitCode: number | undefined
+  status: string | undefined
+}
+
 interface TurnRun {
+  readonly kind: TurnKind
   turnId: string | undefined
   /** The user's abort signal fired. */
   aborted: boolean
@@ -303,6 +413,8 @@ interface TurnRun {
   readonly completions: Map<string, JsonRecord>
   readonly identified: PromiseWithResolvers<string | undefined>
   readonly completion: PromiseWithResolvers<JsonRecord | undefined>
+  /** Filled while the turn of a `!cmd` runs. */
+  readonly shell: ShellOutcome | undefined
   abortTimer: NodeJS.Timeout | undefined
 }
 
@@ -312,13 +424,15 @@ interface TurnOutcome {
   readonly failure: NativeTransportError | undefined
   /** An error message already reached the transcript. */
   readonly errorShown: boolean
+  readonly shell: ShellOutcome | undefined
 }
 
-function newRun(): TurnRun {
+function newRun(kind: TurnKind): TurnRun {
   const completion = Promise.withResolvers<JsonRecord | undefined>()
   // A run can fail before anything awaits it (the process exits while `turn/start` is pending).
   completion.promise.catch(() => undefined)
   return {
+    kind,
     turnId: undefined,
     aborted: false,
     interruptRequested: false,
@@ -329,6 +443,7 @@ function newRun(): TurnRun {
     completions: new Map(),
     identified: Promise.withResolvers<string | undefined>(),
     completion,
+    shell: kind === 'shell' ? { exitCode: undefined, status: undefined } : undefined,
     abortTimer: undefined,
   }
 }
@@ -345,22 +460,6 @@ interface PendingServerRequest {
   readonly controller: AbortController
 }
 
-/** Commands the transport implements itself (codex-acp built-ins that map onto one app-server call). */
-const COMMANDS: readonly acp.AvailableCommand[] = [
-  { name: 'plan', description: 'Turn plan mode on.', input: null },
-  { name: 'skills', description: 'List available skills.', input: null },
-  { name: 'status', description: 'Display session configuration and token usage.', input: null },
-  {
-    name: 'review',
-    description: 'Review uncommitted changes, or review with custom instructions.',
-    input: { hint: 'optional review instructions' },
-  },
-  { name: 'review-branch', description: 'Review changes relative to a base branch.', input: { hint: 'branch name' } },
-  { name: 'review-commit', description: 'Review a specific commit.', input: { hint: 'commit sha' } },
-  { name: 'compact', description: 'Summarize conversation to avoid hitting the context limit.', input: null },
-  { name: 'rename', description: 'Rename the current session.', input: { hint: 'new name' } },
-]
-
 function parseSlashCommand(content: readonly NativeContentBlock[]): { readonly name: string; readonly rest: string } | undefined {
   const first = content[0]
   if (first === undefined || first.type !== 'text') return undefined
@@ -373,12 +472,66 @@ function parseSlashCommand(content: readonly NativeContentBlock[]): { readonly n
   return { name: name.toLowerCase(), rest: commandText.slice(name.length).trim() }
 }
 
+/**
+ * `!cmd`, the shell escape: the host sends a lone user text that starts with `!` bare, and the rest is a command for
+ * the user's shell (`''` for a bare `!`). `undefined` for any other prompt.
+ */
+function parseShellEscape(content: readonly NativeContentBlock[]): string | undefined {
+  const [first] = content
+  if (content.length !== 1 || first?.type !== 'text' || !first.text.startsWith('!')) return undefined
+  return first.text.slice(1).trim()
+}
+
 function codexUserInput(content: readonly NativeContentBlock[]): JsonRecord[] {
   return content.map((block) =>
     block.type === 'text'
       ? { type: 'text', text: block.text, text_elements: [] }
       : { type: 'image', url: `data:${block.mimeType};base64,${block.data}` },
   )
+}
+
+/** The user input of a command that replaces its own text (`/init`, a skill): `text` instead of the first block, the rest as sent. */
+function inputReplacingCommand(content: readonly NativeContentBlock[], text: string): JsonRecord[] {
+  return codexUserInput([{ type: 'text', text }, ...content.slice(1)])
+}
+
+/** What a slash command made of a prompt: an answer, or the user input the turn is started with instead of the typed line. */
+type CommandOutcome = NativePromptResult | { readonly input: JsonRecord[] }
+
+/** The hidden message that opens a side fork, as `thread/inject_items` takes it (a Responses API message item). */
+const SIDE_BOUNDARY_ITEM = {
+  type: 'message',
+  role: 'user',
+  content: [{ type: 'input_text', text: SIDE_BOUNDARY_PROMPT }],
+} as const
+
+const SIDE_CANCELLED: NativeCommandResult = { kind: 'error', text: 'The side question was cancelled.' }
+
+/** How a `!cmd` that did not succeed ended; a success needs no words, its command row says it. */
+function shellEndNote(shell: ShellOutcome | undefined): string | undefined {
+  if (shell === undefined) return undefined
+  if (shell.exitCode !== undefined) return shell.exitCode === 0 ? undefined : `Exit code ${String(shell.exitCode)}`
+  if (shell.status === 'failed') return 'The command failed.'
+  if (shell.status === 'declined') return 'The command was not run.'
+  return undefined
+}
+
+/** A path as `/status` shows it: relative to the session directory when inside it. */
+function shownPath(cwd: string, path: string): string {
+  const shown = relative(cwd, path)
+  return shown === '' || shown.startsWith('..') || isAbsolute(shown) ? path : shown
+}
+
+/** The outcome of a held prompt that followed no turn at all (a goal that was set and never ran). */
+function noTurn(signal: AbortSignal): TurnOutcome {
+  return { stopReason: signal.aborted ? 'cancelled' : 'end_turn', turn: undefined, failure: undefined, errorShown: false, shell: undefined }
+}
+
+/** Whether the answer to a server request cancels the turn that asked (a refusal that lets the turn go on does not). */
+function cancelsTurn(answer: CodexServerRequestAnswer): boolean {
+  if (!('result' in answer)) return false
+  const decision = asRecord(answer.result)?.['decision']
+  return decision === 'cancel' || decision === 'abort'
 }
 
 function sourceDescription(code: number | null, signal: string | null): string {
@@ -419,9 +572,32 @@ class CodexAppServerTransport implements NativeTransport {
   /** The thread id a resume asked for: the only one notifications can be attributed to before the response. */
   private resumeTarget: string | undefined
   private accountText = 'not logged in'
+  private chatgptAccount = false
+  private launch: CodexLaunch | undefined
+  /** The thread response of the attached thread: what `/status` and a side fork need to know about it. */
+  private attached: ThreadAttachment | undefined
+  private threadName: string | undefined
+  /** Threads the app-server runs for this conversation's sub-agents: their requests are the user's to answer. */
+  private readonly subAgentThreads = new Set<string>()
+  private skills: readonly CodexSkill[] | undefined
+  private commandList: readonly NativeCommand[] = CODEX_NATIVE_COMMANDS
+  private announcedCommands = ''
+  /** The goal of the thread as the app-server last reported it; `undefined`: none, or none reported yet. */
+  private goal: CodexGoal | undefined
+  /** A `/goal` command is changing the goal and says so itself, so the notification that follows needs no note. */
+  private goalCommandRunning = false
+  /** Turns the app-server started by itself (it continues an active goal), each with the timer that stops it if no prompt takes it over. */
+  private readonly serverTurns = new Map<string, NodeJS.Timeout>()
+  /** How the turns nobody followed yet ended, until a prompt takes them over. */
+  private readonly orphanCompletions = new Map<string, JsonRecord>()
+  /** Ends the wait of a held prompt for the next turn of its goal. */
+  private serverTurnWaiter: (() => void) | undefined
 
   private run: TurnRun | undefined
   private busy = false
+  private sideRun: CodexSideRun | undefined
+  /** A `/new` or `/clear` is replacing the thread. */
+  private switching = false
   private readonly openToolCalls = new Set<string>()
 
   private readonly sink: CodexProjectionSink = {
@@ -435,14 +611,16 @@ class CodexAppServerTransport implements NativeTransport {
     },
   }
 
-  private readonly approvalHost: CodexApprovalHost = {
+  /** What answering a server request needs; `start()` adds `elicit` when the host has a question surface. */
+  private approvalHost: CodexApprovalHost = {
     context: {
       commandStarted: (itemId) => this.projection?.commandStarted(itemId) ?? false,
       commandName: (itemId) => this.projection?.commandName(itemId),
       fileChange: (itemId) => this.projection?.fileChange(itemId),
       popPendingMcpApproval: (serverName) => this.projection?.popPendingMcpApproval(serverName),
     },
-    ask: (request, signal) => this.askPermission(request, signal),
+    ask: (request, signal) =>
+      this.askHost('onPermission', this.options?.onPermission, request, signal, { cancelled: true }),
     update: (update) => {
       this.sink.update(update)
     },
@@ -452,6 +630,9 @@ class CodexAppServerTransport implements NativeTransport {
       this.log(message)
     },
   }
+
+  /** `request`, as the helpers of `codex-immediate.ts` take it. */
+  private readonly rpc: CodexRequest = (method, params, timeoutMs) => this.request(method, params, timeoutMs)
 
   get sessionId(): string | undefined {
     return this.threadId
@@ -503,6 +684,14 @@ class CodexAppServerTransport implements NativeTransport {
   private async startInternal(options: NativeTransportStartOptions): Promise<void> {
     if (this.closing) throw new NativeTransportError('Codex transport is closed', 'closed')
     this.options = options
+    const onElicitation = options.onElicitation
+    if (onElicitation !== undefined) {
+      this.approvalHost = {
+        ...this.approvalHost,
+        elicit: (request, signal) =>
+          this.askHost('onElicitation', onElicitation, request, signal, { action: 'cancel' }),
+      }
+    }
     try {
       const launch = codexLaunch(options)
       this.spawnProcess(options, launch.argv)
@@ -582,6 +771,7 @@ class CodexAppServerTransport implements NativeTransport {
     this.openToolCalls.clear()
     const run = this.run
     if (run !== undefined) this.failRun(run, error)
+    this.sideRun?.fail(error)
     if (!this.closing) this.log(`${error.message}${error.detail === undefined ? '' : `\n${error.detail}`}`)
   }
 
@@ -639,6 +829,9 @@ class CodexAppServerTransport implements NativeTransport {
         break
     }
     this.threadId = attachment.threadId
+    this.launch = launch
+    this.attached = attachment
+    this.threadName = attachment.threadName
     const models = await this.fetchModels()
     if (target.kind === 'new' && models.length === 0) {
       throw new NativeTransportError('Codex did not return any models', 'no-models')
@@ -654,6 +847,8 @@ class CodexAppServerTransport implements NativeTransport {
     })
     const provider = attachment.modelProvider ?? launch.modelProvider
     await this.readAccount(provider)
+    // A thread that was resumed may carry a goal the app-server pursues; a prompt has to know it to follow the turns the goal starts.
+    if (target.kind !== 'new') await this.loadGoal(attachment.threadId)
     this.log(
       `codex: thread ${attachment.threadId} ready (model ${selection.model}, effort ${selection.effort}, provider ${provider ?? 'default'})`,
     )
@@ -670,6 +865,7 @@ class CodexAppServerTransport implements NativeTransport {
       const account = asRecord(asRecord(response)?.['account'])
       const type = readString(account, 'type')
       this.summaryDisabled = type === 'apiKey'
+      this.chatgptAccount = type === 'chatgpt'
       switch (type) {
         case undefined:
           this.accountText = 'not logged in'
@@ -902,10 +1098,14 @@ class CodexAppServerTransport implements NativeTransport {
 
   private async handleServerRequest(id: string | number, method: string, params: unknown): Promise<void> {
     if (this.closing) return
+    if (this.refuseForeignRequest(id, method, params)) return
     const controller = new AbortController()
     this.pendingServerRequests.set(id, { method, controller })
     try {
-      this.sendAnswer(id, await answerCodexServerRequest(method, params, this.approvalHost, controller.signal))
+      const answer = await answerCodexServerRequest(method, params, this.approvalHost, controller.signal)
+      // Cancelling the turn from an approval stops a goal too, as in the TUI: the app-server would carry on with it otherwise.
+      if (cancelsTurn(answer)) await this.pauseGoal('an approval was cancelled')
+      this.sendAnswer(id, answer)
     } catch (error: unknown) {
       this.log(`codex: failed to answer server request ${method}: ${messageOf(error)}`)
       this.sendAnswer(id, fallbackCodexServerAnswer(method))
@@ -914,23 +1114,55 @@ class CodexAppServerTransport implements NativeTransport {
     }
   }
 
-  private askPermission(request: NativePermissionRequest, signal: AbortSignal): Promise<NativePermissionDecision> {
-    const handler = this.options?.onPermission
-    if (handler === undefined || signal.aborted) return Promise.resolve({ cancelled: true })
-    const { promise, resolve } = Promise.withResolvers<NativePermissionDecision>()
+  /**
+   * A request is the user's to answer only when its thread is this conversation or one of its sub-agents. The fork of a
+   * side question has nobody to ask (a side question cannot approve anything) and any other thread is not known: both
+   * are declined on the spot, which refuses the action without ending the turn that asked. Returns whether it did.
+   */
+  private refuseForeignRequest(id: string | number, method: string, params: unknown): boolean {
+    const record = asRecord(params)
+    const target = readString(record, 'threadId') ?? readString(record, 'conversationId')
+    const scope = this.threadId ?? this.resumeTarget
+    if (target === undefined || scope === undefined || target === scope || this.subAgentThreads.has(target)) return false
+    const side = this.sideRun
+    if (side !== undefined && target === side.threadId) {
+      side.decline(describeCodexServerRequest(method, params))
+    } else {
+      this.log(`codex: declining ${method} of the unknown thread ${target}`)
+    }
+    this.sendAnswer(id, declinedCodexServerAnswer(method))
+    return true
+  }
+
+  /**
+   * Put one request to a host handler. The answer is `cancelled` when there is no handler, when `signal` aborts
+   * first and when the handler throws or rejects, so the app-server is never left waiting.
+   */
+  private askHost<Req, Answer>(
+    name: string,
+    handler: ((request: Req, signal: AbortSignal) => Promise<Answer>) | undefined,
+    request: Req,
+    signal: AbortSignal,
+    cancelled: NoInfer<Answer>,
+  ): Promise<Answer> {
+    const { promise, resolve } = Promise.withResolvers<Answer>()
+    if (handler === undefined || signal.aborted) {
+      resolve(cancelled)
+      return promise
+    }
     let settled = false
-    const finish = (decision: NativePermissionDecision): void => {
+    const finish = (answer: Answer): void => {
       if (settled) return
       settled = true
       signal.removeEventListener('abort', onAbort)
-      resolve(decision)
+      resolve(answer)
     }
     const onAbort = (): void => {
-      finish({ cancelled: true })
+      finish(cancelled)
     }
     const onFailure = (error: unknown): void => {
-      this.log(`codex: onPermission handler failed: ${messageOf(error)}`)
-      finish({ cancelled: true })
+      this.log(`codex: ${name} handler failed: ${messageOf(error)}`)
+      finish(cancelled)
     }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
@@ -950,18 +1182,29 @@ class CodexAppServerTransport implements NativeTransport {
   private handleNotification(method: string, rawParams: unknown): void {
     if (this.closing) return
     const params = asRecord(rawParams) ?? {}
-    if (method === 'thread/started') return
+    if (method === 'thread/started') {
+      this.noteStartedThread(params)
+      return
+    }
     const threadId = readString(params, 'threadId') ?? readString(params, 'conversationId')
     // Until the session id is known only a resumed thread can be told apart; everything else waits.
     const scope = this.threadId ?? this.resumeTarget
     if (scope === undefined) return
-    // Sub-agent threads share the connection; only this conversation maps to the host surface.
-    if (threadId !== undefined && threadId !== scope) return
+    if (threadId !== undefined && threadId !== scope) {
+      // The fork of a side question is collected for its answer. Sub-agent threads share the connection, but only
+      // this conversation maps to the host surface.
+      const side = this.sideRun
+      if (side !== undefined && threadId === side.threadId) side.handle(method, params)
+      return
+    }
     switch (method) {
       case 'turn/started': {
         const turnId = readString(asRecord(params['turn']), 'id')
         const run = this.run
-        if (turnId !== undefined && run !== undefined && run.turnId === undefined) this.identifyRun(run, turnId)
+        if (turnId === undefined) return
+        if (run !== undefined && run.turnId === undefined) this.identifyRun(run, turnId)
+        // Any other turn was started by the app-server itself: it continues an active goal.
+        else if (run?.turnId !== turnId) this.serverTurnStarted(turnId)
         return
       }
       case 'turn/completed': {
@@ -970,9 +1213,18 @@ class CodexAppServerTransport implements NativeTransport {
         const turn = asRecord(params['turn'])
         const turnId = readString(turn, 'id')
         const run = this.run
-        if (run !== undefined && turn !== undefined && turnId !== undefined) this.completeRun(run, turnId, turn)
+        if (turn === undefined || turnId === undefined) return
+        if (run !== undefined) this.completeRun(run, turnId, turn)
+        // The end of a turn nobody follows yet waits for whoever takes it over.
+        if (run?.turnId !== turnId) this.keepCompletion(turnId, turn)
         return
       }
+      case 'thread/goal/updated':
+        this.applyGoal(parseGoal(params['goal']))
+        return
+      case 'thread/goal/cleared':
+        this.applyGoal(undefined)
+        return
       case 'error':
         this.handleErrorNotification(params)
         return
@@ -985,9 +1237,54 @@ class CodexAppServerTransport implements NativeTransport {
         pending.controller.abort()
         return
       }
+      case 'item/completed':
+        this.noteShellItem(params)
+        this.projection?.handle(method, params)
+        return
+      case 'thread/name/updated':
+        this.threadName = readString(params, 'threadName')?.trim() || undefined
+        this.projection?.handle(method, params)
+        return
+      case 'skills/changed':
+        this.refreshSkills(true)
+        return
+      case 'hook/completed':
+      case 'deprecationNotice':
+      case 'guardianWarning':
+      case 'mcpServer/startupStatus/updated':
+      case 'mcpServer/oauthLogin/completed': {
+        const text = codexNoticeText(method, params)
+        if (text !== undefined) this.note(text)
+        return
+      }
       default:
         this.projection?.handle(method, params)
     }
+  }
+
+  /** The threads of this conversation's sub-agents (`parentThreadId` set) are the user's to answer for. */
+  private noteStartedThread(params: JsonRecord): void {
+    const thread = asRecord(params['thread'])
+    const id = readString(thread, 'id')
+    const parent = readString(thread, 'parentThreadId')
+    const scope = this.threadId ?? this.resumeTarget
+    if (id === undefined || parent === undefined || scope === undefined) return
+    if (parent === scope || this.subAgentThreads.has(parent)) this.subAgentThreads.add(id)
+  }
+
+  /** The outcome of the user's `!cmd`, from the `userShell` item of its turn. */
+  private noteShellItem(params: JsonRecord): void {
+    const shell = this.run?.shell
+    const item = asRecord(params['item'])
+    if (shell === undefined || readString(item, 'type') !== 'commandExecution' || readString(item, 'source') !== 'userShell') return
+    shell.exitCode = readNumber(item, 'exitCode')
+    shell.status = readString(item, 'status')
+  }
+
+  /** A quiet notice of the app-server: a thought note inside the running turn, else a line for the host log. */
+  private note(text: string): void {
+    if (this.busy) this.sink.update(thoughtNote(text))
+    else this.emit({ kind: 'notice', text })
   }
 
   private handleErrorNotification(params: JsonRecord): void {
@@ -1055,6 +1352,7 @@ class CodexAppServerTransport implements NativeTransport {
     run.aborted = true
     this.abortServerRequests()
     if (run.interruptRequested) return
+    void this.pauseGoal('the prompt was stopped')
     run.interruptRequested = true
     run.abortTimer = setTimeout(() => {
       this.log('codex: the turn did not settle after the interrupt; reporting it cancelled')
@@ -1089,8 +1387,8 @@ class CodexAppServerTransport implements NativeTransport {
    * carry the turn id; otherwise `turn/started` does), and the run settles with
    * the matching `turn/completed`.
    */
-  private async runTurn(start: () => Promise<unknown>, signal: AbortSignal): Promise<TurnOutcome> {
-    const run = newRun()
+  private async runTurn(start: () => Promise<unknown>, signal: AbortSignal, kind: TurnKind = 'turn'): Promise<TurnOutcome> {
+    const run = newRun(kind)
     this.run = run
     const onAbort = (): void => {
       this.requestInterrupt(run)
@@ -1106,10 +1404,11 @@ class CodexAppServerTransport implements NativeTransport {
         turn,
         failure: run.failure,
         errorShown: run.errorShown,
+        shell: run.shell,
       }
     } catch (error: unknown) {
       if (signal.aborted && this.exitError === undefined) {
-        return { stopReason: 'cancelled', turn: undefined, failure: undefined, errorShown: false }
+        return { stopReason: 'cancelled', turn: undefined, failure: undefined, errorShown: false, shell: run.shell }
       }
       throw error
     } finally {
@@ -1197,12 +1496,9 @@ class CodexAppServerTransport implements NativeTransport {
   }
 
   async prompt(content: readonly NativeContentBlock[], signal: AbortSignal): Promise<NativePromptResult> {
-    if (this.closing) throw new NativeTransportError('Codex transport is closed', 'closed')
-    if (this.exitError !== undefined) throw this.exitError
-    if (this.threadId === undefined || this.controlsState === undefined) {
-      throw new NativeTransportError('Codex transport was not started', 'not-started')
-    }
+    this.requireUsable()
     if (this.busy) throw new NativeTransportError('A Codex prompt is already in progress', 'busy')
+    if (this.switching) throw new NativeTransportError('The Codex conversation is being changed', 'busy')
     if (content.length === 0) throw new NativeTransportError('prompt content must not be empty', 'empty-prompt')
     if (signal.aborted) return { stopReason: 'cancelled' }
     this.busy = true
@@ -1216,23 +1512,27 @@ class CodexAppServerTransport implements NativeTransport {
   private async promptInternal(content: readonly NativeContentBlock[], signal: AbortSignal): Promise<NativePromptResult> {
     const state = this.requireState()
     const tokens = this.requireTokens()
+    const shell = parseShellEscape(content)
+    if (shell !== undefined) return await this.shellEscape(shell, signal)
+    let commandInput: JsonRecord[] | undefined
     const command = parseSlashCommand(content)
     if (command !== undefined) {
-      const handled = await this.tryCommand(command, signal)
-      if (handled !== undefined) return handled
+      const handled = await this.tryCommand(command, content, signal)
+      if (handled !== undefined && !('input' in handled)) return handled
+      commandInput = handled?.input
     }
     if (!state.imageInput && content.some((block) => block.type === 'image')) {
       throw new NativeTransportError('The current model does not support image input', 'image-unsupported')
     }
-    const input = codexUserInput(content)
+    const input = commandInput ?? codexUserInput(content)
     tokens.beginPrompt()
-    let outcome = await this.runTurn(() => this.startTurn(input), signal)
+    let outcome = await this.runTurn(() => this.startTurn(this.requireThreadId(), input), signal)
     this.throwOnFailure(outcome)
     if (outcome.stopReason === 'end_turn' && readString(outcome.turn, 'status') === 'completed') {
       outcome = (await this.implementApprovedPlan(signal)) ?? outcome
       this.throwOnFailure(outcome)
     }
-    return this.promptResult(outcome)
+    return this.promptResult(await this.followGoal(outcome, signal))
   }
 
   private requireTokens(): CodexTokenAccounting {
@@ -1260,10 +1560,9 @@ class CodexAppServerTransport implements NativeTransport {
     return usage === undefined ? { stopReason: outcome.stopReason } : { stopReason: outcome.stopReason, usage }
   }
 
-  private startTurn(input: readonly JsonRecord[]): Promise<unknown> {
+  /** `turn/start` on `threadId` with the settings of the controls; `extra` adds request fields. */
+  private startTurn(threadId: string, input: readonly JsonRecord[], extra: JsonRecord = {}): Promise<unknown> {
     const state = this.requireState()
-    const threadId = this.threadId
-    if (threadId === undefined) throw new NativeTransportError('Codex transport was not started', 'not-started')
     return this.request(
       'turn/start',
       {
@@ -1276,6 +1575,7 @@ class CodexAppServerTransport implements NativeTransport {
         effort: state.effort,
         model: state.modelId,
         serviceTier: state.serviceTier,
+        ...extra,
       },
       REQUEST_TIMEOUT_MS,
     ).catch((error: unknown) => {
@@ -1309,7 +1609,7 @@ class CodexAppServerTransport implements NativeTransport {
       status: 'pending',
       rawInput: { plan: plan.text },
     })
-    const decision = await this.askPermission(
+    const decision = await this.approvalHost.ask(
       {
         toolCall,
         options: [
@@ -1332,7 +1632,7 @@ class CodexAppServerTransport implements NativeTransport {
     await this.applyCollaborationMode('default')
     this.emit({ kind: 'controls', controls: state.snapshot() })
     const next = await this.runTurn(
-      () => this.startTurn(codexUserInput([{ type: 'text', text: 'Implement the approved plan.' }])),
+      () => this.startTurn(this.requireThreadId(), codexUserInput([{ type: 'text', text: 'Implement the approved plan.' }])),
       signal,
     )
     return next
@@ -1340,36 +1640,69 @@ class CodexAppServerTransport implements NativeTransport {
 
   // -- slash commands ---------------------------------------------------------------
 
+  /** The built-in commands plus the enabled skills Codex offers (a `commands` event announces every change). */
+  commands(): readonly NativeCommand[] {
+    return this.commandList
+  }
+
+  /**
+   * A slash command typed as a prompt: a turn of its own, an answer without a model, or (`/init`, a skill) the text
+   * the model receives instead of the command line. A name nothing owns goes to the model as typed.
+   */
   private async tryCommand(
     command: { readonly name: string; readonly rest: string },
+    content: readonly NativeContentBlock[],
     signal: AbortSignal,
-  ): Promise<NativePromptResult | undefined> {
+  ): Promise<CommandOutcome | undefined> {
     const state = this.requireState()
     const threadId = this.threadId
     if (threadId === undefined) return undefined
-    switch (command.name) {
+    const name = canonicalCodexCommand(command.name)
+    switch (name) {
       case 'plan': {
         if (command.rest.length > 0) return this.commandMessage('Command "/plan" requires no arguments.')
-        await this.applyCollaborationMode(state.collaborationMode === 'plan' ? 'default' : 'plan')
+        const next = state.collaborationMode === 'plan' ? 'default' : 'plan'
+        await this.applyCollaborationMode(next)
         this.emit({ kind: 'controls', controls: state.snapshot() })
-        return { stopReason: 'end_turn' }
+        return this.commandMessage(
+          next === 'plan' ? 'Plan mode is on: Codex plans before it changes anything. `/plan` turns it off again.' : 'Plan mode is off.',
+        )
       }
       case 'status':
-        return this.commandMessage(this.statusMessage(threadId))
-      case 'skills': {
-        const lines = (await this.listSkills()).map((skill) =>
-          skill.description === '' ? `- ${skill.name}` : `- ${skill.name}: ${skill.description}`,
-        )
-        return this.commandMessage(lines.length > 0 ? ['Available skills:', ...lines].join('\n') : 'No skills configured.')
-      }
+      case 'skills':
+      case 'mcp':
+      case 'ps':
+      case 'stop':
+      case 'hooks':
+      case 'diff':
+        return this.commandMessage((await this.runCommand(name, command.rest, signal)).text)
+      case 'rewind':
+        // Rolling the conversation back cannot happen inside a prompt (it is the prompt that is running); DSH runs it as a command.
+        if (parseRewindArgs(command.rest).action === 'apply') {
+          return this.commandMessage('`/rewind … confirm` rolls the conversation back, so it runs as a command rather than as a message.')
+        }
+        return this.commandMessage((await this.runCommand(name, command.rest, signal)).text)
+      case 'new':
+      case 'clear':
+        // They replace the conversation, which a running prompt must not see; DSH runs them as commands (`runCommand`).
+        return this.commandMessage(`\`/${name}\` starts a new Codex conversation, so it runs as a command rather than as a message.`)
+      case 'side':
+        return this.commandMessage((await this.sideQuestion(command.rest, signal)).text)
+      case 'goal':
+        return await this.goalCommand(command.rest, signal)
       case 'compact':
-        return await this.commandTurn(
-          async () => {
-            await this.request('thread/compact/start', { threadId }, REQUEST_TIMEOUT_MS)
-            return undefined
-          },
-          signal,
-          true,
+        return this.promptResult(
+          await this.followGoal(
+            await this.commandTurn(
+              async () => {
+                await this.request('thread/compact/start', { threadId }, REQUEST_TIMEOUT_MS)
+                return undefined
+              },
+              signal,
+              'compact',
+            ),
+            signal,
+          ),
         )
       case 'review':
         return await this.reviewCommand(
@@ -1382,31 +1715,26 @@ class CodexAppServerTransport implements NativeTransport {
       case 'review-commit':
         if (command.rest.length === 0) return this.commandMessage('Command "/review-commit" requires commit sha.')
         return await this.reviewCommand({ type: 'commit', sha: command.rest, title: null }, signal)
-      case 'rename':
+      case 'rename': {
         if (command.rest.length === 0) return this.commandMessage('Command "/rename" requires new name.')
         await this.request('thread/name/set', { threadId, name: command.rest }, REQUEST_TIMEOUT_MS)
-        return { stopReason: 'end_turn' }
+        this.threadName = command.rest
+        return this.commandMessage(`Renamed the Codex thread to "${command.rest}".`)
+      }
+      case 'init':
+        if (command.rest.length > 0) return this.commandMessage('Command "/init" requires no arguments.')
+        // The TUI submits the shipped prompt as an ordinary user message.
+        return { input: inputReplacingCommand(content, INIT_PROMPT) }
       default:
-        return undefined
+        break
     }
-  }
-
-  /** codex-acp `buildStatusMessage`; rate limits are not queried, which the gateway setups do not report anyway. */
-  private statusMessage(threadId: string): string {
-    const state = this.requireState()
-    const [tokenUsage, contextWindow] = this.requireTokens().statusLines()
-    return [
-      `**Model:** ${state.modelId}[${state.effort}]`,
-      `**Directory:** ${this.options?.cwd ?? ''}`,
-      `**Approval:** ${state.mode.settings.approvalPolicy}`,
-      `**Sandbox:** ${state.mode.settings.sandboxMode}`,
-      `**Account:** ${this.accountText}`,
-      `**Session:** \`${threadId}\``,
-      '',
-      `**Token usage:** ${tokenUsage}`,
-      `**Context window:** ${contextWindow}`,
-      '**Limits:** data not available yet',
-    ].join('  \n')
+    // The rest of the TUI's commands have no meaning here; typing one must not cost a model turn.
+    if (isUnsupportedCodexCommand(command.name)) return this.commandMessage(unsupportedCodexCommandMessage(command.name))
+    const skill = await this.skillNamed(command.name)
+    if (skill === undefined) return undefined
+    // A skill is invoked by `$name` in the text plus the structured item that names its file.
+    const text = command.rest === '' ? `$${skill.name}` : `$${skill.name} ${command.rest}`
+    return { input: [...inputReplacingCommand(content, text), { type: 'skill', name: skill.name, path: skill.path }] }
   }
 
   private commandMessage(text: string): NativePromptResult {
@@ -1414,45 +1742,881 @@ class CodexAppServerTransport implements NativeTransport {
     return { stopReason: 'end_turn' }
   }
 
-  private reviewCommand(target: JsonRecord, signal: AbortSignal): Promise<NativePromptResult> {
-    const threadId = this.threadId
-    if (threadId === undefined) throw new NativeTransportError('Codex transport was not started', 'not-started')
-    return this.commandTurn(() => this.request('review/start', { threadId, target, delivery: 'inline' }, REQUEST_TIMEOUT_MS), signal, false)
+  private async reviewCommand(target: JsonRecord, signal: AbortSignal): Promise<NativePromptResult> {
+    const threadId = this.requireThreadId()
+    return this.promptResult(
+      await this.followGoal(
+        await this.commandTurn(() => this.request('review/start', { threadId, target, delivery: 'inline' }, REQUEST_TIMEOUT_MS), signal, 'review'),
+        signal,
+      ),
+    )
   }
 
-  /** A command that runs as its own turn (review, compaction); usage is counted like a prompt's. */
+  /** A command that runs as its own turn (review, compaction, `!cmd`); usage is counted like a prompt's. */
   private async commandTurn(
     start: () => Promise<unknown>,
     signal: AbortSignal,
-    mayStartNoTurn: boolean,
-  ): Promise<NativePromptResult> {
+    kind: 'review' | 'compact' | 'shell',
+  ): Promise<TurnOutcome> {
     this.requireTokens().beginPrompt()
-    const outcome = await this.runTurn(async () => {
-      const response = await start()
-      if (mayStartNoTurn) {
+    const outcome = await this.runTurn(
+      async () => {
+        const response = await start()
         const run = this.run
-        if (run !== undefined) {
-          // A compaction answers before its turn exists; if none ever starts there is nothing to wait for.
+        if (run !== undefined && (kind === 'compact' || kind === 'shell')) {
+          // A compaction answers before its turn exists, and a shell command that joins a running turn starts none:
+          // if no turn ever starts there is nothing to wait for.
           const timer = setTimeout(() => {
             if (run.turnId === undefined && !run.finished) run.completion.resolve({ status: 'completed' })
           }, COMPACTION_START_GRACE_MS)
           timer.unref()
         }
-      }
-      return response
-    }, signal)
+        return response
+      },
+      signal,
+      kind,
+    )
     this.throwOnFailure(outcome)
-    return this.promptResult(outcome)
+    return outcome
+  }
+
+  /**
+   * `!cmd`: Codex runs the user's shell command as a turn of its own, without a model call and outside the sandbox (as
+   * in the TUI, where the user typed it). The output is projected like any command's.
+   */
+  private async shellEscape(command: string, signal: AbortSignal): Promise<NativePromptResult> {
+    if (command === '') return this.commandMessage('Prefix a command with ! to run it locally. Example: !ls')
+    const threadId = this.requireThreadId()
+    const outcome = await this.commandTurn(
+      () => this.request('thread/shellCommand', { threadId, command }, REQUEST_TIMEOUT_MS),
+      signal,
+      'shell',
+    )
+    // A command that failed has no successful tool result to show: say how it ended.
+    const note = outcome.stopReason === 'end_turn' ? shellEndNote(outcome.shell) : undefined
+    if (note !== undefined) this.sink.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: note } })
+    return this.promptResult(await this.followGoal(outcome, signal))
+  }
+
+  // -- goals --------------------------------------------------------------------------
+
+  /** Whether the thread has a goal the app-server pursues: it starts the next turn by itself as soon as one ends. */
+  private goalActive(): boolean {
+    return this.goal?.status === 'active'
+  }
+
+  /**
+   * The goal as the app-server reports it. A new objective or status is told in one line (inside the turn that runs), unless a `/goal`
+   * command is making the change and says so itself; a goal that is no longer pursued ends the wait of a held prompt.
+   */
+  private applyGoal(goal: CodexGoal | undefined): void {
+    const text = goalNote(this.goal, goal)
+    this.goal = goal
+    if (text !== undefined && !this.goalCommandRunning) this.note(text)
+    if (!this.goalActive()) this.wakeServerTurnWaiter()
+  }
+
+  private async fetchGoal(threadId: string): Promise<CodexGoal | undefined> {
+    return parseGoal(asRecord(await this.request('thread/goal/get', { threadId }, REQUEST_TIMEOUT_MS))?.['goal'])
+  }
+
+  private async readGoal(threadId: string): Promise<CodexGoal | undefined> {
+    const goal = await this.fetchGoal(threadId)
+    this.applyGoal(goal)
+    return goal
+  }
+
+  /** The goal the thread already has when this transport meets it (no note: it is not news); a failure leaves it unknown. */
+  private async loadGoal(threadId: string): Promise<void> {
+    try {
+      this.goal = await this.fetchGoal(threadId)
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      this.log(`codex: thread/goal/get failed: ${messageOf(error)}`)
+    }
+  }
+
+  private async writeGoal(threadId: string, fields: { readonly objective?: string; readonly status: 'active' | 'paused' }): Promise<CodexGoal> {
+    const response = await this.request('thread/goal/set', { threadId, origin: 'user', ...fields }, REQUEST_TIMEOUT_MS)
+    const goal = parseGoal(asRecord(response)?.['goal'])
+    if (goal === undefined) throw new NativeTransportError('Codex did not return the goal', 'protocol-error')
+    this.applyGoal(goal)
+    return goal
+  }
+
+  /** What a `/goal` request did, in words, and whether it set the app-server pursuing the goal (which then runs turns by itself). */
+  private async goalRequest(
+    request: Exclude<GoalRequest, { readonly action: 'usage' }>,
+    threadId: string,
+  ): Promise<{ readonly text: string; readonly starts: boolean }> {
+    switch (request.action) {
+      case 'show': {
+        const goal = await this.readGoal(threadId)
+        return { text: goal === undefined ? `No goal is currently set.\n\n${GOAL_USAGE}` : formatGoal(goal), starts: false }
+      }
+      case 'clear': {
+        const response = asRecord(await this.request('thread/goal/clear', { threadId, origin: 'user' }, REQUEST_TIMEOUT_MS))
+        this.applyGoal(undefined)
+        return { text: response?.['cleared'] === true ? 'Goal cleared.' : 'No goal to clear: this thread does not have one.', starts: false }
+      }
+      case 'pause':
+      case 'resume': {
+        if ((await this.readGoal(threadId)) === undefined) {
+          return { text: `No goal to ${request.action}: this thread does not have one.\n\n${GOAL_USAGE}`, starts: false }
+        }
+        const goal = await this.writeGoal(threadId, { status: request.action === 'pause' ? 'paused' : 'active' })
+        return { text: formatGoalChange(request.action === 'pause' ? 'Goal paused' : 'Goal resumed', goal), starts: goal.status === 'active' }
+      }
+      case 'set': {
+        const existing = await this.readGoal(threadId)
+        // The TUI asks before it replaces a goal that is not finished; a command cannot ask, so it says what to do.
+        if (existing !== undefined && existing.status !== 'complete') {
+          return {
+            text: `${formatGoal(existing)}\n\nThis goal is not finished. Run \`/goal clear\` to replace it, or \`/goal resume\` or \`/goal pause\` to carry on or stop.`,
+            starts: false,
+          }
+        }
+        if (existing !== undefined) await this.request('thread/goal/clear', { threadId, origin: 'user' }, REQUEST_TIMEOUT_MS)
+        const goal = await this.writeGoal(threadId, { objective: request.objective, status: 'active' })
+        return { text: formatGoalChange('Goal set', goal), starts: goal.status === 'active' }
+      }
+    }
+  }
+
+  /** `goalRequest` with a failure turned into the answer; the notifications of the change need no note of their own while it runs. */
+  private async answerGoal(
+    request: Exclude<GoalRequest, { readonly action: 'usage' }>,
+    threadId: string,
+  ): Promise<{ readonly text: string; readonly starts: boolean }> {
+    this.goalCommandRunning = true
+    try {
+      return await this.goalRequest(request, threadId)
+    } catch (error: unknown) {
+      // A lost process is the runtime's to handle; anything else is an answer for the user.
+      if (this.closed) throw error
+      return { text: goalFailure(error), starts: false }
+    } finally {
+      this.goalCommandRunning = false
+    }
+  }
+
+  /**
+   * `/goal …`, run as a prompt: setting or resuming a goal makes the app-server run turns by itself, and only an open prompt can show
+   * them (and be stopped). So DSH forwards the line like a message, and the prompt stays open until the goal is no longer pursued.
+   */
+  private async goalCommand(args: string, signal: AbortSignal): Promise<NativePromptResult> {
+    const request = parseGoalArgs(args)
+    if (request.action === 'usage') return this.commandMessage(`${request.problem}\n\n${GOAL_USAGE}`)
+    this.requireTokens().beginPrompt()
+    const reply = await this.answerGoal(request, this.requireThreadId())
+    this.commandMessage(reply.text)
+    return reply.starts ? this.promptResult(await this.followGoal(undefined, signal)) : { stopReason: 'end_turn' }
+  }
+
+  /**
+   * A `/goal …` line steered into a running turn is the user's control of the goal, not a message for the model: it runs now and its
+   * answer shows inside the turn. A pause lets the turn in flight finish and keeps the next one from starting; the prompt that
+   * follows the goal ends with the turn.
+   */
+  private async steerGoal(args: string, threadId: string): Promise<'injected'> {
+    const request = parseGoalArgs(args)
+    this.commandMessage(request.action === 'usage' ? `${request.problem}\n\n${GOAL_USAGE}` : (await this.answerGoal(request, threadId)).text)
+    return 'injected'
+  }
+
+  /**
+   * While a goal is active the app-server starts the next turn by itself as soon as one ends. Those turns belong to the prompt that is
+   * open, so it stays open: each one is followed to its end and streams like the first, until the goal is no longer pursued (complete,
+   * paused, stalled, out of budget), the prompt is cancelled (which pauses the goal, as the TUI does) or the hold reaches its cap.
+   */
+  private async followGoal(first: TurnOutcome | undefined, signal: AbortSignal): Promise<TurnOutcome> {
+    let last = first ?? noTurn(signal)
+    const deadline = Date.now() + GOAL_HOLD_CAP_MS
+    for (;;) {
+      if (signal.aborted || last.stopReason === 'cancelled') {
+        await this.pauseGoal('the prompt was stopped')
+        return { ...last, stopReason: 'cancelled' }
+      }
+      if (!this.goalActive()) return last
+      if (Date.now() >= deadline) {
+        await this.pauseGoal('the prompt followed it for too long')
+        return last
+      }
+      const turnId = await this.nextServerTurn(signal)
+      if (turnId === undefined) {
+        if (signal.aborted) continue
+        return last
+      }
+      last = await this.runTurn(() => this.adoptServerTurn(turnId), signal, 'goal')
+      this.throwOnFailure(last)
+    }
+  }
+
+  /** The next turn the app-server starts for the goal: `undefined` when the goal stops being pursued, the prompt is cancelled or none comes in time. */
+  private nextServerTurn(signal: AbortSignal): Promise<string | undefined> {
+    const waiting = this.claimServerTurn()
+    if (waiting !== undefined) return Promise.resolve(waiting)
+    if (signal.aborted || !this.goalActive()) return Promise.resolve(undefined)
+    return new Promise((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', done)
+        if (this.serverTurnWaiter === done) this.serverTurnWaiter = undefined
+        resolve(signal.aborted ? undefined : this.claimServerTurn())
+      }
+      const timer = setTimeout(done, GOAL_CONTINUATION_GRACE_MS)
+      timer.unref()
+      signal.addEventListener('abort', done, { once: true })
+      this.serverTurnWaiter = done
+    })
+  }
+
+  private wakeServerTurnWaiter(): void {
+    const wake = this.serverTurnWaiter
+    this.serverTurnWaiter = undefined
+    wake?.()
+  }
+
+  /** Takes the oldest turn the app-server started by itself over from the timer that would stop it. */
+  private claimServerTurn(): string | undefined {
+    const [turnId, timer] = this.serverTurns.entries().next().value ?? []
+    if (turnId === undefined) return undefined
+    clearTimeout(timer)
+    this.serverTurns.delete(turnId)
+    return turnId
+  }
+
+  /** The app-server started a turn that none of our requests asked for. A prompt that holds the goal takes it over; otherwise it is stopped. */
+  private serverTurnStarted(turnId: string): void {
+    if (this.serverTurns.has(turnId)) return
+    const timer = setTimeout(() => {
+      void this.releaseUnattended(turnId)
+    }, UNATTENDED_TURN_GRACE_MS)
+    timer.unref()
+    this.serverTurns.set(turnId, timer)
+    this.wakeServerTurnWaiter()
+  }
+
+  private keepCompletion(turnId: string, turn: JsonRecord): void {
+    this.orphanCompletions.set(turnId, turn)
+    const oldest = this.orphanCompletions.keys().next()
+    if (this.orphanCompletions.size > ORPHAN_COMPLETIONS_KEPT && !oldest.done) this.orphanCompletions.delete(oldest.value)
+  }
+
+  /**
+   * A turn of the goal that no prompt is open to show (the thread was resumed with an active goal, say) would run unseen and could not
+   * be stopped from DSH. It is interrupted and the goal paused, so that nothing runs where the user cannot see it.
+   */
+  private async releaseUnattended(turnId: string): Promise<void> {
+    if (!this.serverTurns.delete(turnId) || this.closed || !this.goalActive()) return
+    const threadId = this.threadId
+    if (threadId === undefined) return
+    this.log(`codex: stopping the turn ${turnId} that the app-server started for the goal while no prompt was open`)
+    await this.pauseGoal('no prompt was open to show its work')
+    await this.request('turn/interrupt', { threadId, turnId }, SIDE_CLEANUP_TIMEOUT_MS).catch((error: unknown) => {
+      if (!isNoActiveTurnError(error)) this.log(`codex: turn/interrupt failed: ${messageOf(error)}`)
+    })
+    this.emit({
+      kind: 'notice',
+      text: 'Codex continued a goal on its own while DSH was not following the session, so the goal was paused. Run /goal resume to continue it here.',
+    })
+  }
+
+  /** The `start` of a run that follows a turn the app-server already started: its id is the whole response. */
+  private adoptServerTurn(turnId: string): Promise<unknown> {
+    const run = this.run
+    const early = this.orphanCompletions.get(turnId)
+    this.orphanCompletions.delete(turnId)
+    if (run !== undefined && early !== undefined) run.completions.set(turnId, early)
+    return Promise.resolve({ turn: { id: turnId } })
+  }
+
+  /** Pauses an active goal (the TUI does when the user interrupts), so that the app-server does not start the next turn of it. */
+  private async pauseGoal(reason: string): Promise<void> {
+    const threadId = this.threadId
+    if (threadId === undefined || !this.goalActive() || this.closed) return
+    try {
+      const response = await this.request('thread/goal/set', { threadId, status: 'paused', origin: 'user' }, SIDE_CLEANUP_TIMEOUT_MS)
+      this.applyGoal(parseGoal(asRecord(response)?.['goal']) ?? this.goal)
+      this.log(`codex: paused the goal (${reason})`)
+    } catch (error: unknown) {
+      this.log(`codex: could not pause the goal (${reason}): ${messageOf(error)}`)
+    }
+  }
+
+  // -- rewind -------------------------------------------------------------------------
+
+  /** Whether Codex is working, or this transport is replacing the conversation: a `thread/revert` would cut a running turn off. */
+  private conversationBusy(): boolean {
+    return this.busy || this.run !== undefined || this.switching || this.serverTurns.size > 0
+  }
+
+  /** The directories of the session: the only places a restore of files may touch. */
+  private sessionRoots(): string[] {
+    return [this.requireCwd(), ...(this.attached?.runtimeWorkspaceRoots ?? [])]
+  }
+
+  /** The turns of the thread, page by page: all of them oldest first, or (`until`) newest first down to that turn. */
+  private async readTurns(threadId: string, view: 'summary' | 'full', direction: 'asc' | 'desc', until?: string): Promise<CodexTurn[]> {
+    const turns: CodexTurn[] = []
+    const seen = new Set<string>()
+    let cursor: string | null = null
+    for (let page = 0; page < MAX_TURN_PAGES; page += 1) {
+      const response: unknown = await this.request(
+        'thread/turns/list',
+        { threadId, cursor, limit: view === 'full' ? FULL_TURN_PAGE_LIMIT : TURN_PAGE_LIMIT, sortDirection: direction, itemsView: view },
+        REQUEST_TIMEOUT_MS,
+      )
+      const parsed = parseTurnPage(response)
+      for (const turn of parsed.turns) {
+        turns.push(turn)
+        if (turn.id === until) return turns
+      }
+      if (parsed.nextCursor === undefined || seen.has(parsed.nextCursor)) break
+      seen.add(parsed.nextCursor)
+      cursor = parsed.nextCursor
+    }
+    return turns
+  }
+
+  /** What undoing the file changes the agent made since `checkpoint` would do to the files on disk. */
+  private async restorePlan(threadId: string, checkpoint: CodexCheckpoint): Promise<RestorePlan> {
+    const newestFirst = await this.readTurns(threadId, 'full', 'desc', checkpoint.turnId)
+    if (newestFirst.at(-1)?.id !== checkpoint.turnId) throw new NativeTransportError('that message is no longer in the conversation', 'not-found')
+    const { changes, unsupported } = fileChangesOf(newestFirst.toReversed())
+    return await planRestore(changes, nodeRestoreIo(this.sessionRoots()), unsupported)
+  }
+
+  /**
+   * `/rewind`: list the user's messages, preview going back to just before one (the conversation Codex would forget, the files that
+   * would be restored and those that cannot be), or do it. The conversation goes back with `thread/revert`; the files, which Codex does
+   * not checkpoint, are restored first from the file changes the agent recorded. Nothing is cached: the turns are read from the app-server
+   * each time, so the list is the same after a restart.
+   */
+  private async rewindCommand(args: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    const request = parseRewindArgs(args)
+    if (request.action === 'usage') return { kind: 'error', text: `${request.problem}\n\nUsage: /rewind [<n> [code|chat] [confirm]]` }
+    const threadId = this.requireThreadId()
+    const checkpoints = checkpointsOf(await this.readTurns(threadId, 'summary', 'asc'))
+    if (request.action === 'list') return { kind: 'success', text: renderCheckpoints(checkpoints) }
+    const found = findCheckpoint(checkpoints, request.reference)
+    if ('error' in found) return { kind: 'error', text: found.error }
+    const cwd = this.requireCwd()
+    const point = {
+      checkpoint: found.checkpoint,
+      position: found.position,
+      total: checkpoints.length,
+      mode: request.mode,
+      display: (path: string): string => shownPath(cwd, path),
+    }
+    if (request.action === 'preview') {
+      const plan = request.mode === 'chat' ? undefined : await this.restorePlan(threadId, found.checkpoint)
+      return { kind: 'success', text: renderRewindPreview({ ...point, plan }) }
+    }
+    if (this.conversationBusy()) return { kind: 'error', text: 'Wait for the current turn to finish before rewinding: Codex is working right now.' }
+    signal.throwIfAborted()
+    // No prompt may start while the files and the conversation are going back.
+    this.switching = true
+    try {
+      const plan = request.mode === 'chat' ? undefined : await this.restorePlan(threadId, found.checkpoint)
+      const restore = plan === undefined ? undefined : await applyRestore(plan, nodeRestoreIo(this.sessionRoots()))
+      let rolledBack = false
+      let rollbackError: string | undefined
+      if (request.mode !== 'code') {
+        try {
+          await this.request('thread/revert', { threadId, beforeTurnId: found.checkpoint.turnId }, SESSION_REQUEST_TIMEOUT_MS)
+          rolledBack = true
+          // The thread keeps its id, but what the vendor holds is no longer what DSH logged.
+          this.emit({ kind: 'session_changed', sessionId: threadId, reason: 'rewind' })
+        } catch (error: unknown) {
+          if (this.closed) throw error
+          rollbackError = messageOf(error)
+        }
+      }
+      return {
+        kind: rollbackError === undefined ? 'success' : 'error',
+        text: renderRewindResult({ ...point, plan, restore, rolledBack, rollbackError }),
+      }
+    } finally {
+      this.switching = false
+    }
+  }
+
+  // -- immediate commands -------------------------------------------------------------
+
+  /** `NativeTransport.runCommand`: an immediate command; it may run while a prompt runs and emits no turn updates. */
+  async runCommand(name: string, args: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    this.requireUsable()
+    const command = canonicalCodexCommand(name) ?? name.toLowerCase()
+    try {
+      signal.throwIfAborted()
+      switch (command) {
+        case 'status':
+          return await this.statusCommand()
+        case 'skills':
+          return await this.skillsCommand(args)
+        case 'mcp':
+          return await mcpCommand(this.rpc, this.requireThreadId(), args)
+        case 'ps':
+          return await psCommand(this.rpc, this.requireThreadId())
+        case 'stop':
+          return await stopCommand(this.rpc, this.requireThreadId(), args)
+        case 'hooks':
+          return await hooksCommand(this.rpc, this.requireCwd())
+        case 'diff':
+          return await diffCommand(this.rpc, this.requireCwd(), signal)
+        case 'rewind':
+          return await this.rewindCommand(args, signal)
+        case 'new':
+        case 'clear':
+          return await this.startFreshThread(command, args.trim())
+        default:
+          return { kind: 'error', text: `\`/${name}\` is not an immediate Codex command.` }
+      }
+    } catch (error: unknown) {
+      // A lost process is the runtime's to handle; anything else is an answer for the user.
+      if (this.closed) throw error
+      if (signal.aborted) return { kind: 'error', text: 'The command was cancelled.' }
+      return { kind: 'error', text: `\`/${command}\` failed: ${messageOf(error)}` }
+    }
+  }
+
+  /** `/status`: the TUI's card where the data exists (limits and thread usage only for a ChatGPT account). */
+  private async statusCommand(): Promise<NativeCommandResult> {
+    const state = this.requireState()
+    const threadId = this.requireThreadId()
+    const cwd = this.requireCwd()
+    const [tokenUsage, contextWindow] = this.requireTokens().statusLines()
+    const [limits, threadUsage] = this.chatgptAccount ? await Promise.all([this.rateLimitLines(), this.threadUsageLine(threadId)]) : [[], undefined]
+    const sources = (this.attached?.instructionSources ?? []).map((path) => shownPath(cwd, path))
+    const provider = this.attached?.modelProvider ?? this.launch?.modelProvider
+    const forkedFrom = this.attached?.forkedFromId
+    const settings = state.mode.settings
+    const lines = [
+      `**Model:** ${state.modelId} (reasoning ${state.effort}, summaries ${this.summaryDisabled || state.modelLacksReasoning ? 'off' : 'auto'})`,
+      ...(provider === undefined ? [] : [`**Model provider:** ${provider}`]),
+      `**Directory:** ${cwd}`,
+      `**Permissions:** ${state.mode.name} (approval ${settings.approvalPolicy}, sandbox ${settings.sandboxMode})`,
+      `**Agents.md:** ${sources.length === 0 ? '<none>' : sources.join(', ')}`,
+      `**Account:** ${this.accountText}`,
+      ...(this.threadName === undefined ? [] : [`**Thread name:** ${this.threadName}`]),
+      `**Collaboration mode:** ${state.collaborationMode}`,
+      ...(this.goal === undefined ? [] : [`**Goal:** ${goalStatusLabel(this.goal.status)} — ${truncate(this.goal.objective.replace(/\s+/g, ' ').trim(), 120)}`]),
+      `**Session:** \`${threadId}\``,
+      ...(forkedFrom === undefined ? [] : [`**Forked from:** \`${forkedFrom}\``]),
+      '',
+      `**Token usage:** ${tokenUsage}`,
+      `**Context window:** ${contextWindow}`,
+      `**Limits:** ${limits.length === 0 ? 'data not available yet' : limits.join(' · ')}`,
+      ...(threadUsage === undefined ? [] : [`**Thread usage:** ${threadUsage}`]),
+    ]
+    return { kind: 'success', text: lines.join('  \n') }
+  }
+
+  /** The optional lookups of `/status` never fail the card: what cannot be read is left out. */
+  private async rateLimitLines(): Promise<string[]> {
+    try {
+      const response = await this.request(
+        'account/rateLimits/read',
+        { supportsLunaReserve: true, excludeResetCreditDetails: false },
+        STATUS_LOOKUP_TIMEOUT_MS,
+      )
+      return formatRateLimits(response)
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      this.log(`codex: account/rateLimits/read failed: ${messageOf(error)}`)
+      return []
+    }
+  }
+
+  private async threadUsageLine(threadId: string): Promise<string | undefined> {
+    try {
+      return formatThreadUsage(await this.request('account/usage/read', { threadId }, STATUS_LOOKUP_TIMEOUT_MS))
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      this.log(`codex: account/usage/read failed: ${messageOf(error)}`)
+      return undefined
+    }
+  }
+
+  /** `/skills` lists them (re-reading the disk, as the TUI does); `/skills enable|disable <name>` toggles one. */
+  private async skillsCommand(args: string): Promise<NativeCommandResult> {
+    const [verb, ...nameWords] = args.split(/\s+/).filter((word) => word !== '')
+    if (verb === undefined) {
+      const { skills, errors } = await this.loadSkills(true)
+      return { kind: 'success', text: formatSkills(skills, errors) }
+    }
+    const name = nameWords.join(' ')
+    if ((verb !== 'enable' && verb !== 'disable') || name === '') {
+      return { kind: 'error', text: 'Usage: /skills [enable|disable <name>]' }
+    }
+    const { skills } = await this.loadSkills(true)
+    const exact = skills.filter((skill) => skill.name === name)
+    const named = exact.length > 0 ? exact : skills.filter((skill) => skill.name.toLowerCase() === name.toLowerCase())
+    const [skill] = named
+    if (skill === undefined) return { kind: 'error', text: `No skill is named \`${name}\`. \`/skills\` lists them.` }
+    if (named.length > 1) {
+      return { kind: 'error', text: `More than one skill is named \`${name}\`; toggle it in the Codex terminal (\`/skills\`).` }
+    }
+    const enabled = verb === 'enable'
+    const response = await this.request('skills/config/write', { path: skill.path, enabled }, SKILLS_WRITE_TIMEOUT_MS)
+    const reported = asRecord(response)?.['effectiveEnabled']
+    const effective = typeof reported === 'boolean' ? reported : enabled
+    // The catalog follows the toggle.
+    await this.loadSkills(true)
+    if (effective !== enabled) {
+      return {
+        kind: 'error',
+        text: `Skill \`${skill.name}\` stays ${effective ? 'enabled' : 'disabled'}: the Codex configuration overrides the request.`,
+      }
+    }
+    return { kind: 'success', text: `Skill \`${skill.name}\` ${enabled ? 'enabled' : 'disabled'}.` }
+  }
+
+  /**
+   * `/new` and `/clear`: a fresh thread with this conversation's settings replaces the current one (which stays in the
+   * Codex history). Only between turns: a running turn, a side question or an earlier switch refuses it.
+   */
+  private async startFreshThread(reason: 'new' | 'clear', name: string): Promise<NativeCommandResult> {
+    if (this.conversationBusy() || this.sideRun !== undefined) {
+      return { kind: 'error', text: `'/${reason}' is disabled while a task is in progress.` }
+    }
+    const launch = this.launch
+    const state = this.requireState()
+    const cwd = this.requireCwd()
+    const previous = this.requireThreadId()
+    if (launch === undefined) throw new NativeTransportError('Codex transport was not started', 'not-started')
+    this.switching = true
+    try {
+      const attachment = parseThreadAttachment(
+        await this.request(
+          'thread/start',
+          {
+            config: threadSessionConfig(launch.baseConfig, cwd),
+            modelProvider: launch.modelProvider ?? null,
+            cwd,
+            ...(reason === 'clear' ? { sessionStartSource: 'clear' } : {}),
+          },
+          SESSION_REQUEST_TIMEOUT_MS,
+        ),
+      )
+      this.adoptThread(attachment)
+      await this.carryOverSettings(state)
+      if (name !== '') {
+        try {
+          await this.request('thread/name/set', { threadId: attachment.threadId, name }, REQUEST_TIMEOUT_MS)
+          this.threadName = name
+        } catch (error: unknown) {
+          this.log(`codex: thread/name/set failed: ${messageOf(error)}`)
+        }
+      }
+      this.emit({ kind: 'session_changed', sessionId: attachment.threadId, reason })
+      // The old thread stays in the Codex history; the app-server just stops keeping it loaded.
+      void this.request('thread/unsubscribe', { threadId: previous }, SIDE_CLEANUP_TIMEOUT_MS).catch((error: unknown) => {
+        this.log(`codex: thread/unsubscribe of the previous thread failed: ${messageOf(error)}`)
+      })
+      return {
+        kind: 'success',
+        text: `Started a new Codex conversation (\`${attachment.threadId}\`). The previous one stays in the Codex history.`,
+      }
+    } finally {
+      this.switching = false
+    }
+  }
+
+  /** The new thread is the session from now on: its projection, accounting, goal and sub-agents start over. */
+  private adoptThread(attachment: ThreadAttachment): void {
+    this.threadId = attachment.threadId
+    this.attached = attachment
+    this.threadName = attachment.threadName
+    this.goal = undefined
+    this.orphanCompletions.clear()
+    this.subAgentThreads.clear()
+    this.openToolCalls.clear()
+    this.tokens = new CodexTokenAccounting(false)
+    this.projection = new CodexProjection(this.sink, this.tokens)
+    // The context of a fresh thread is empty; the meter must not keep showing the old one.
+    const size = this.lastContextUsage?.size
+    this.lastContextUsage = undefined
+    if (size !== undefined) this.sink.contextUsage({ used: 0, size })
+  }
+
+  /**
+   * A fresh thread starts with the server's defaults. The turns of this conversation carry their own model, effort and
+   * mode, but `/review` and `/compact` do not, so the new thread gets the controls' values and the collaboration mode too.
+   */
+  private async carryOverSettings(state: CodexControlsState): Promise<void> {
+    const settings = state.mode.settings
+    await this.updateThread({
+      approvalPolicy: settings.approvalPolicy,
+      approvalsReviewer: settings.approvalsReviewer,
+      sandboxPolicy: settings.sandboxPolicy,
+      model: state.modelId,
+      effort: state.effort,
+      serviceTier: state.serviceTier,
+    }).catch((error: unknown) => {
+      if (this.closed) throw error
+      this.log(`codex: thread/settings/update for the new thread failed: ${messageOf(error)}`)
+    })
+    if (state.collaborationMode === 'default') return
+    try {
+      await this.applyCollaborationMode(state.collaborationMode)
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      // The control must not claim a mode the thread does not have.
+      this.log(`codex: the new thread did not take the ${state.collaborationMode} collaboration mode: ${messageOf(error)}`)
+      state.collaborationMode = 'default'
+      this.emit({ kind: 'controls', controls: state.snapshot() })
+    }
+  }
+
+  // -- side questions -----------------------------------------------------------------
+
+  /**
+   * `NativeTransport.sideQuestion` (`/side` = `/btw`), as the TUI asks it: an ephemeral fork of the thread
+   * (`thread/fork`), a hidden boundary message (`thread/inject_items`), the question as a turn of the fork, and
+   * `thread/unsubscribe` once it answered. It runs beside the main turn, never touches the main thread, and
+   * declines whatever the fork asks approval for.
+   */
+  async sideQuestion(question: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    this.requireUsable()
+    const text = question.trim()
+    if (text === '') return { kind: 'error', text: SIDE_USAGE_MESSAGE }
+    if (this.sideRun !== undefined) return { kind: 'error', text: SIDE_ALREADY_RUNNING_MESSAGE }
+    if (this.run?.kind === 'review') return { kind: 'error', text: SIDE_REVIEW_RUNNING_MESSAGE }
+    if (this.switching) return { kind: 'error', text: 'The Codex conversation is being changed. Ask again in a moment.' }
+    if (signal.aborted) return SIDE_CANCELLED
+    const run = new CodexSideRun()
+    this.sideRun = run
+    try {
+      return await this.askSide(run, text, signal)
+    } catch (error: unknown) {
+      // A lost process is the runtime's to handle; anything else is an answer for the user.
+      if (this.closed) throw error
+      return { kind: 'error', text: `The side question failed: ${messageOf(error)}` }
+    } finally {
+      await this.endSide(run)
+    }
+  }
+
+  private async askSide(run: CodexSideRun, question: string, signal: AbortSignal): Promise<NativeCommandResult> {
+    let forked: unknown
+    try {
+      forked = await this.request('thread/fork', await this.sideForkParams(), SESSION_REQUEST_TIMEOUT_MS)
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      return { kind: 'error', text: sideStartFailure(error) }
+    }
+    const threadId = readString(asRecord(asRecord(forked)?.['thread']), 'id')
+    if (threadId === undefined) return { kind: 'error', text: 'Failed to start side conversation: Codex did not return a thread.' }
+    // From here on every notification and request of that thread belongs to the run.
+    run.threadId = threadId
+    try {
+      await this.request('thread/inject_items', { threadId, items: [SIDE_BOUNDARY_ITEM] }, REQUEST_TIMEOUT_MS)
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      return { kind: 'error', text: `Failed to prepare side conversation ${threadId}: ${messageOf(error)}` }
+    }
+    if (signal.aborted) return SIDE_CANCELLED
+    try {
+      const started = await this.startTurn(threadId, codexUserInput([{ type: 'text', text: question }]), {
+        clientUserMessageId: `dsh-side-${randomUUID()}`,
+      })
+      const turnId = readString(asRecord(asRecord(started)?.['turn']), 'id')
+      if (turnId !== undefined) run.identify(turnId)
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      return { kind: 'error', text: `The side question could not be started: ${messageOf(error)}` }
+    }
+    switch (await this.waitForSide(run, signal)) {
+      case 'completed':
+        return sideCommandResult(run.outcome())
+      case 'aborted':
+        return SIDE_CANCELLED
+      case 'timeout':
+        return { kind: 'error', text: 'The side question took too long and was stopped.' }
+    }
+  }
+
+  private async waitForSide(run: CodexSideRun, signal: AbortSignal): Promise<'completed' | 'aborted' | 'timeout'> {
+    const { promise: interrupted, resolve } = Promise.withResolvers<'aborted' | 'timeout'>()
+    const onAbort = (): void => {
+      resolve('aborted')
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    const timer = setTimeout(() => {
+      resolve('timeout')
+    }, SIDE_RUN_TIMEOUT_MS)
+    timer.unref()
+    try {
+      return await Promise.race([run.done.then(() => 'completed' as const), interrupted])
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /** The fork is closed the way the TUI closes one: interrupt what still runs, then unsubscribe. */
+  private async endSide(run: CodexSideRun): Promise<void> {
+    try {
+      const threadId = run.threadId
+      if (threadId === undefined || this.closed) return
+      if (!run.completed) {
+        await this.request('turn/interrupt', { threadId, turnId: run.turnId ?? '' }, SIDE_CLEANUP_TIMEOUT_MS).catch((error: unknown) => {
+          this.log(`codex: turn/interrupt of the side conversation failed: ${messageOf(error)}`)
+        })
+      }
+      await this.request('thread/unsubscribe', { threadId }, SIDE_CLEANUP_TIMEOUT_MS).catch((error: unknown) => {
+        this.log(`codex: thread/unsubscribe of the side conversation failed: ${messageOf(error)}`)
+      })
+    } finally {
+      if (this.sideRun === run) this.sideRun = undefined
+    }
+  }
+
+  /**
+   * `thread/fork` of a side question (the TUI's `side_fork_config`): ephemeral, the parent's model, tier, permissions
+   * and directory, and the thread's own developer instructions followed by the side conversation's.
+   */
+  private async sideForkParams(): Promise<JsonRecord> {
+    const state = this.requireState()
+    const launch = this.launch
+    const cwd = this.requireCwd()
+    const existing = await this.existingInstructions()
+    const provider = this.attached?.modelProvider ?? launch?.modelProvider
+    return {
+      threadId: this.requireThreadId(),
+      ephemeral: true,
+      excludeTurns: true,
+      model: state.modelId,
+      ...(provider === undefined ? {} : { modelProvider: provider }),
+      ...(state.serviceTier === null ? {} : { serviceTier: state.serviceTier }),
+      cwd,
+      approvalPolicy: state.mode.settings.approvalPolicy,
+      approvalsReviewer: state.mode.settings.approvalsReviewer,
+      sandbox: state.mode.settings.sandboxMode,
+      config: threadSessionConfig(launch?.baseConfig ?? {}, cwd),
+      developerInstructions: existing === null ? SIDE_DEVELOPER_INSTRUCTIONS : `${existing}\n\n${SIDE_DEVELOPER_INSTRUCTIONS}`,
+      threadSource: 'user',
+    }
+  }
+
+  /** The `developer_instructions` of the Codex configuration (`CODEX_CONFIG`, else `config/read`), or `null`. */
+  private async existingInstructions(): Promise<string | null> {
+    const configured = this.launch?.baseConfig['developer_instructions']
+    if (typeof configured === 'string' && configured.trim() !== '') return configured
+    try {
+      const response = await this.request('config/read', { includeLayers: false, cwd: this.requireCwd() }, REQUEST_TIMEOUT_MS)
+      const text = readString(asRecord(asRecord(response)?.['config']), 'developer_instructions')
+      return text === undefined || text.trim() === '' ? null : text
+    } catch (error: unknown) {
+      if (this.closed) throw error
+      this.log(`codex: config/read failed (${messageOf(error)}); the side conversation starts without the configured instructions`)
+      return null
+    }
+  }
+
+  // -- catalog ------------------------------------------------------------------------
+
+  private publishCommands(): void {
+    if (this.closed) return
+    // The built-ins are known at once; the skills follow when `skills/list` answered.
+    this.announceCommands()
+    void this.refreshSkills(false)
+  }
+
+  /** Tell the host about the catalog when it differs from what it was told last. */
+  private announceCommands(): void {
+    const key = JSON.stringify(this.commandList)
+    if (this.closed || key === this.announcedCommands) return
+    this.announcedCommands = key
+    this.emit({ kind: 'commands', commands: this.commandList })
+  }
+
+  /** `skills/list`, remembered; the catalog follows. Throws when the request fails. */
+  private async loadSkills(forceReload: boolean): Promise<{ readonly skills: CodexSkill[]; readonly errors: string[] }> {
+    const loaded = await fetchSkills(this.rpc, this.requireCwd(), forceReload)
+    this.skills = loaded.skills
+    this.rebuildCommands()
+    return loaded
+  }
+
+  /** `loadSkills` for the places that can do without: a failure is logged and leaves the catalog as it was. */
+  private async refreshSkills(forceReload: boolean): Promise<void> {
+    try {
+      await this.loadSkills(forceReload)
+    } catch (error: unknown) {
+      this.log(`codex: skills/list failed: ${messageOf(error)}`)
+      this.skills ??= []
+    }
+  }
+
+  /** The enabled skills whose name can be typed as `/name` join the built-ins as prompt commands. */
+  private rebuildCommands(): void {
+    const seen = new Set<string>()
+    const skillCommands: NativeCommand[] = []
+    for (const skill of this.skills ?? []) {
+      const key = skill.name.toLowerCase()
+      // A skill named like a built-in or a TUI command cannot be typed as `/name` (`$name` still reaches it).
+      const typeable = /^\S+$/.test(skill.name) && canonicalCodexCommand(key) === undefined && !isUnsupportedCodexCommand(key)
+      if (!skill.enabled || !typeable || seen.has(key)) continue
+      seen.add(key)
+      skillCommands.push({
+        name: skill.name,
+        description: skill.description === '' ? `Run the ${skill.name} skill` : truncate(skill.description, 200),
+        hint: '[request]',
+        dispatch: 'prompt',
+      })
+    }
+    this.commandList = [...CODEX_NATIVE_COMMANDS, ...skillCommands]
+    this.announceCommands()
+  }
+
+  /** The enabled skill a slash command line names; the skills are read once if nobody did yet. */
+  private async skillNamed(name: string): Promise<CodexSkill | undefined> {
+    if (this.skills === undefined) await this.refreshSkills(false)
+    const lower = name.toLowerCase()
+    return this.skills?.find((skill) => skill.enabled && skill.name.toLowerCase() === lower)
+  }
+
+  // -- guards ---------------------------------------------------------------------------
+
+  /** Commands, prompts and side questions need a running app-server with an attached thread. */
+  private requireUsable(): void {
+    if (this.closing) throw new NativeTransportError('Codex transport is closed', 'closed')
+    if (this.exitError !== undefined) throw this.exitError
+    if (this.threadId === undefined || this.controlsState === undefined) {
+      throw new NativeTransportError('Codex transport was not started', 'not-started')
+    }
+  }
+
+  private requireThreadId(): string {
+    if (this.threadId === undefined) throw new NativeTransportError('Codex transport was not started', 'not-started')
+    return this.threadId
+  }
+
+  private requireCwd(): string {
+    const cwd = this.options?.cwd
+    if (cwd === undefined) throw new NativeTransportError('Codex transport was not started', 'not-started')
+    return cwd
   }
 
   // -- steering ---------------------------------------------------------------------
 
+  /**
+   * Text steered into the running turn is injected as typed, a slash line or a `!cmd` included: the commands DSH
+   * registers that run as an immediate command or a side question never reach this path, and answering `promptRequired`
+   * would make the host interrupt the user's running turn to prompt the line again. The one exception is `/goal`, which
+   * DSH forwards like a message: typed into a running turn it controls the goal right away.
+   */
   async steer(content: readonly NativeContentBlock[], signal?: AbortSignal): Promise<'injected' | 'promptRequired'> {
     if (this.closing || this.exitError !== undefined || signal?.aborted === true) return 'promptRequired'
     const state = this.controlsState
     const threadId = this.threadId
     const run = this.run
     if (state === undefined || threadId === undefined || run === undefined || content.length === 0) return 'promptRequired'
+    const goalArgs = goalLineArgs(content)
+    if (goalArgs !== undefined) return await this.steerGoal(goalArgs, threadId)
     if (!state.imageInput && content.some((block) => block.type === 'image')) return 'promptRequired'
     // The steer target must be the turn that is running; a turn still being started reveals its id shortly.
     const initialTurnId = run.turnId ?? (await withTimeout(run.identified.promise, TURN_ID_WAIT_MS, undefined))
@@ -1486,53 +2650,6 @@ class CodexAppServerTransport implements NativeTransport {
     }
   }
 
-  // -- commands advertised to the host ----------------------------------------------------
-
-  private publishCommands(): void {
-    if (this.closed) return
-    this.emitCommands(COMMANDS)
-    void this.publishSkills()
-  }
-
-  private emitCommands(commands: readonly acp.AvailableCommand[]): void {
-    this.emit({ kind: 'update', update: { sessionUpdate: 'available_commands_update', availableCommands: [...commands] } })
-  }
-
-  /** The skills Codex offers for the session directory (`skills/list`, as codex-acp asks for its cwd). */
-  private async listSkills(): Promise<Array<{ readonly name: string; readonly description: string }>> {
-    const cwd = this.options?.cwd
-    if (cwd === undefined) return []
-    const response = await this.request('skills/list', { cwds: [cwd] }, SKILLS_TIMEOUT_MS)
-    const skills: Array<{ readonly name: string; readonly description: string }> = []
-    for (const entry of readArray(asRecord(response), 'data') ?? []) {
-      for (const skill of readArray(asRecord(entry), 'skills') ?? []) {
-        const record = asRecord(skill)
-        const name = readString(record, 'name')
-        if (name === undefined) continue
-        skills.push({
-          name,
-          description: readString(record, 'shortDescription') ?? readString(record, 'description') ?? '',
-        })
-      }
-    }
-    return skills
-  }
-
-  /** Skills are `$name` commands; listing them is best-effort. */
-  private async publishSkills(): Promise<void> {
-    try {
-      const commands: acp.AvailableCommand[] = [...COMMANDS]
-      for (const skill of await this.listSkills()) {
-        const name = `$${skill.name}`
-        if (commands.some((candidate) => candidate.name === name)) continue
-        commands.push({ name, description: skill.description === '' ? skill.name : skill.description, input: null })
-      }
-      if (commands.length > COMMANDS.length && !this.closed) this.emitCommands(commands)
-    } catch (error: unknown) {
-      this.log(`codex: skills/list failed: ${messageOf(error)}`)
-    }
-  }
-
   // -- shutdown ---------------------------------------------------------------------
 
   close(): Promise<void> {
@@ -1547,6 +2664,10 @@ class CodexAppServerTransport implements NativeTransport {
     this.abortServerRequests()
     const run = this.run
     if (run !== undefined) this.failRun(run, closed)
+    this.sideRun?.fail(closed)
+    for (const timer of this.serverTurns.values()) clearTimeout(timer)
+    this.serverTurns.clear()
+    this.wakeServerTurnWaiter()
     const child = this.child
     if (child === undefined) return
     const exited = child.exited.then(

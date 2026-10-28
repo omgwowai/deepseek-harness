@@ -70,6 +70,7 @@ export function AcpAgentControl({
   const sessionTitle = useProjection('title')
   const running = useSession((state) => state.running)
   const optionWriteAllowed = useAccess('dshAcp/setAgentSessionOption')
+  const draftWriteAllowed = useAccess('dshAcp/setDraftAgentMode')
   const policyWriteAllowed = useAccess('dshAcp/setToolApprovalPolicy')
   const [defaultProvider, setDefaultProvider] = useState<string | undefined>()
   const [defaultGeneration, setDefaultGeneration] = useState(0)
@@ -221,19 +222,36 @@ export function AcpAgentControl({
       policyError ?? error,
     )
   }
-  // The native running projection also locks the small interval before ACP prompt begins.
+  // A live Agent takes a change at any time. While a turn runs, or while the host is still settling it (the native
+  // running projection can lead or lag the host), the host keeps the change and applies it before the next turn.
+  const live = effective !== null && effective.freshness === 'live'
+  const writable = live && optionWriteAllowed
+  const queued = writable && (running || !effective.editable)
   const visibleSnapshot =
-    effective === null ? null : { ...effective, editable: effective.editable && !running && optionWriteAllowed }
-  // With no live Agent (before the first prompt, or while it is disconnected) the mode is still choosable:
-  // the choice is saved and applied before the next prompt is sent.
-  const modeDeferred = effective !== null && effective.freshness === 'stale' && effective.modeWritable === true && !running
+    effective === null
+      ? null
+      : { ...effective, editable: live ? optionWriteAllowed : effective.editable && !running && optionWriteAllowed }
+  // With no live Agent the mode is still choosable, and the host saves the choice: before the first prompt, and while
+  // an Agent is disconnected, it is applied before the next prompt is sent. The first turn's own window counts too,
+  // once its prompt is out but its Agent session does not exist yet (nothing reported, so no snapshot): the host holds
+  // a choice made then for the turn after it. A reported stale snapshot stays read-only while a turn runs.
+  const modeDeferred =
+    effective !== null &&
+    effective.freshness === 'stale' &&
+    effective.modeWritable === true &&
+    (!running || snapshot === null)
+  // Saving a mode is the session-option write that has to wait for the Agent, so it takes the grants of that write and
+  // of the call that saves it. Without both the choices stay as disabled as the snapshot made them.
+  const deferredAllowed = modeDeferred && optionWriteAllowed && draftWriteAllowed
   const label = effective === null ? t('toolApprovalSession') : agentControlLabel(effective, t)
   const agentGroups = (visibleSnapshot === null ? [] : agentControlMenuGroups(visibleSnapshot, t)).map((group) =>
-    group.kind === 'mode' && modeDeferred
+    group.kind === 'mode' && deferredAllowed
       ? { ...group, choices: group.choices.map((choice) => ({ ...choice, disabled: false })) }
       : group,
   )
-  const deferredChoices = new Set(agentGroups.filter((group) => group.kind === 'mode' && modeDeferred).flatMap((group) => group.choices))
+  const deferredChoices = new Set(
+    agentGroups.filter((group) => group.kind === 'mode' && deferredAllowed).flatMap((group) => group.choices),
+  )
   const groups = [
     ...(policySnapshot === null || policyStale || policySnapshot.applies === false
       ? []
@@ -241,11 +259,20 @@ export function AcpAgentControl({
     ...agentGroups,
   ]
   const footer = [...(snapshot === null ? [] : agentControlFooter(snapshot, t))]
-  if (modeDeferred) footer.push({ type: 'label', id: 'mode-deferred', text: t('agentModeAppliesNext') })
+  if (deferredAllowed)
+    footer.push({
+      type: 'label',
+      id: 'mode-deferred',
+      text: t(running ? 'agentChangesApplyNext' : 'agentModeAppliesNext'),
+    })
   // A read-only explanation must not create an empty menu before controls arrive.
   if (groups.length === 0 && footer.length === 0 && snapshot?.note == null && error === null && policyError === null)
     return null
-  if (snapshot !== null && (running || (!visibleSnapshot?.editable && snapshot.freshness === 'live')))
+  // A change made now waits for the next turn: say so while a turn runs and for as long as a choice is waiting.
+  const hasPending = effective?.pendingModeId != null || Object.keys(effective?.pendingOptions ?? {}).length > 0
+  if (queued || (writable && hasPending))
+    footer.push({ type: 'label', id: 'changes-queued', text: t('agentChangesApplyNext') })
+  if (!queued && snapshot !== null && (running || (!visibleSnapshot?.editable && snapshot.freshness === 'live')))
     footer.push({ type: 'label', id: 'read-only', text: t(running ? 'agentControlRunning' : 'agentControlReadOnly') })
   if (error !== null) footer.push({ type: 'label', id: 'error', text: error })
   if (policyError !== null) footer.push({ type: 'label', id: 'policy-error', text: policyError })
@@ -285,6 +312,14 @@ export function AcpAgentControl({
       return
     }
     if (deferredChoices.has(item)) {
+      // A menu left open outlives the grants it was built with: ask the live sources again, for both writes.
+      if (
+        sessionAccessSource(sessionId, 'dshAcp/setAgentSessionOption')?.getSnapshot() !== true ||
+        sessionAccessSource(sessionId, 'dshAcp/setDraftAgentMode')?.getSnapshot() !== true
+      ) {
+        setBusy(false)
+        return
+      }
       const modeId = item.write.kind === 'mode' ? item.write.id : String(item.write.value)
       setError(null)
       void remote

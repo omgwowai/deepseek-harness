@@ -249,7 +249,8 @@ describe.each(profiles)('Agent controls: %s', (profile) => {
         await expect.poll(() => controls().innerText()).toMatch(/plan/i)
         phase = 'running options'
         await openControls()
-        expect(await ask.isDisabled()).toBe(true)
+        // A running turn does not lock the choice: the host keeps it and applies it before the next turn.
+        expect(await ask.isDisabled()).toBe(false)
         await page.keyboard.press('Escape')
         await ask.waitFor({ state: 'hidden' })
         // Reconnect while the same first turn is still running; no new prompt or reload.

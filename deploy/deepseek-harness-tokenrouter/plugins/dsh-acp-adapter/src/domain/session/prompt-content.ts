@@ -14,6 +14,12 @@ export class AcpPromptContentError extends Error {
   }
 }
 
+/** `/name args`, with the characters vendor command names use: `/mcp:server:prompt`, `/plugin:command`, `/skill.name`. */
+const VENDOR_COMMAND_LINE = /^\/[a-z][\w.:-]*(\s|$)/i
+
+/** `!command`: the vendors run it as a shell command without a model turn, and only when it is the whole prompt. */
+const SHELL_ESCAPE_LINE = /^!\s*\S/
+
 /** The skill route available in this exact model request. */
 export type SkillRoute = 'direct' | 'ptc' | 'disabled'
 
@@ -241,13 +247,15 @@ export async function toAcpPrompt(
       'dsh-acp: the claimed message(s) carry no supported content; nothing to send to the ACP agent',
     )
   }
-  // An Agent slash command (`/compact`, `/clear`, …) is recognized only when the prompt's text starts with it,
-  // so a user command is sent bare: no host instructions or DSH context projection ahead of it. The skipped
-  // projection is not lost — the next ordinary prompt carries the complete current one again.
+  // An Agent slash command (`/compact`, `/clear`, `/mcp:server:prompt`, …) is recognized only when the prompt's text starts
+  // with it, and a shell escape (`!ls`) only when it is the whole prompt. A user command is therefore sent bare: no host
+  // instructions or DSH context projection ahead of it. The skipped projection is not lost — the next ordinary prompt
+  // carries the complete current one again.
   const user = admittedMessages.filter((message) => message.source.kind === 'user' && !isGeneratedModelContextMessage(message))
   const command = user.length === 1 && user[0]!.content.length === 1 ? user[0]!.content[0] : undefined
-  if (command?.type === 'text' && /^\/[a-z][\w-]*(\s|$)/i.test(command.text.trim())) {
-    return [{ type: 'text', text: command.text.trim() }]
+  const commandLine = command?.type === 'text' ? command.text.trim() : undefined
+  if (commandLine !== undefined && (VENDOR_COMMAND_LINE.test(commandLine) || SHELL_ESCAPE_LINE.test(commandLine))) {
+    return [{ type: 'text', text: commandLine }]
   }
   if (options.reboundAgentInstructions !== undefined) {
     const instructions = reboundAgentInstructions(admittedMessages, options.reboundAgentInstructions)

@@ -207,6 +207,7 @@ const zh = {
   recoveryHistoryPreserved: '无论选择哪一项，DSH 中已经显示的对话都不会被删除。',
   agentControlTitle: '{agent} 权限',
   agentModeAppliesNext: '所选模式在下一条消息发送前生效。',
+  agentChangesApplyNext: '更改将在下一轮开始时生效。',
   agentControlMode: '模式',
   agentControlMixed: '多个当前值',
   agentControlBack: '返回会话设置',
@@ -297,6 +298,11 @@ const zh = {
   crossBackendFromTo: '将从 {source} 切换到 {target}。',
   crossBackendExistingHistory:
     '当前对话已有历史，但没有记录可恢复的原模型。继续会在新 DSH 会话中运行智能体并保留原对话；取消后当前会话仍选中该智能体，若要继续原对话，请重新选择模型。',
+  commandAnswering: '正在回答…',
+  commandRunning: '正在执行…',
+  commandFailed: '失败',
+  commandNoAnswer: 'Agent 没有返回回答。',
+  commandNoOutput: '命令没有输出。',
 } as const
 
 /** Locale key union the section's `t` seat is typed against. */
@@ -518,6 +524,7 @@ const en: Record<AcpLocaleKey, string> = {
   recoveryHistoryPreserved: 'The conversation already shown in DSH is not deleted by any of these choices.',
   agentControlTitle: '{agent} permissions',
   agentModeAppliesNext: 'The selected mode takes effect before the next message is sent.',
+  agentChangesApplyNext: 'Changes apply when the next turn starts.',
   agentControlMode: 'Mode',
   agentControlMixed: 'Mixed values',
   agentControlBack: 'Back to session settings',
@@ -611,6 +618,11 @@ const en: Record<AcpLocaleKey, string> = {
   crossBackendFromTo: 'Switch from {source} to {target}.',
   crossBackendExistingHistory:
     'This session has conversation history but no recorded model to restore. Continuing runs the Agent in a new DSH session and keeps the original conversation. Cancel leaves this Agent selected in the current session; choose another model to continue that conversation.',
+  commandAnswering: 'Answering…',
+  commandRunning: 'Running…',
+  commandFailed: 'Failed',
+  commandNoAnswer: 'The Agent returned no answer.',
+  commandNoOutput: 'The command returned no output.',
 }
 
 export { en, zh }

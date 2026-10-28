@@ -1,5 +1,5 @@
 import { withSessionFacts } from '../../support/session-facts.ts'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -8,7 +8,7 @@ import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { AcpProfileAdapter } from '../../../src/host/composition/profile-adapter.ts'
 import { AcpForkPreDispatchError } from '../../../src/runtime/session/session-runtime.ts'
 import type { AcpAgentConfig } from '../../../src/domain/session/agent-config.ts'
-import type { AcpProfileRuntime } from '../../../src/host/composition/profile-adapter.ts'
+import type { AcpProfileRuntime, AcpProfileRuntimeOptions } from '../../../src/host/composition/profile-adapter.ts'
 import type { SessionLike, SessionEventLike } from '../../../src/domain/session/current-step-admission.ts'
 import { createAcpSidecar } from '../../../src/persistence/sidecar.ts'
 import type { AcpSidecar } from '../../../src/persistence/sidecar.ts'
@@ -757,4 +757,162 @@ describe('provider adapter ACP fork boundary', () => {
       fs.rmSync(root, { recursive: true, force: true })
     }
   })
+})
+
+describe('the fork cut after the agent changed its conversation on its own', () => {
+  /** A runtime whose agent can be told, from outside, to have replaced its conversation (`/clear`) or rolled it back (`/rewind`). */
+  function replaceableRuntimeFactory(
+    counts: { starts: number; forks: number; prompts: number },
+    fork?: (parent: string) => Promise<void>,
+  ): {
+    readonly factory: (options: AcpProfileRuntimeOptions) => AcpProfileRuntime
+    change(sessionId: string, reason: string): void
+  } {
+    let announce: ((sessionId: string, reason: string) => void) | undefined
+    const factory = (options: AcpProfileRuntimeOptions): AcpProfileRuntime => {
+      let acpSessionId = 'agent-parent'
+      announce = (sessionId, reason) => {
+        acpSessionId = sessionId
+        options.onSessionChanged?.(sessionId, reason)
+      }
+      const runtime: AcpProfileRuntime = {
+        get acpSessionId() {
+          return acpSessionId
+        },
+        agentInfo: { name: 'fork-agent', version: '1' },
+        agentCapabilities: { sessionCapabilities: { resume: {}, ...(fork === undefined ? {} : { fork: {} }) } },
+        protocolVersion: 1,
+        start: async () => {
+          counts.starts += 1
+        },
+        restore: async () => 'resumed',
+        prompt: async () => {
+          counts.prompts += 1
+          return { stopReason: 'end_turn' } as never
+        },
+        close: async () => undefined,
+      }
+      if (fork !== undefined) {
+        runtime.fork = async (parent, _signal, _expected, beforeDispatch) => {
+          try {
+            await beforeDispatch?.()
+          } catch (error) {
+            throw new AcpForkPreDispatchError('ACP_FORK_INTENT_FAILED', error)
+          }
+          counts.forks += 1
+          await fork(parent)
+          acpSessionId = 'agent-child'
+          return { sessionId: acpSessionId } as never
+        }
+      }
+      return runtime
+    }
+    return { factory, change: (sessionId, reason) => announce?.(sessionId, reason) }
+  }
+
+  /** The agent replaced its conversation by one of its own, or rolled it back where it stood (the id it already had). */
+  const changes = [
+    { how: 'replaced it', id: 'agent-parent-2', reason: 'clear' },
+    { how: 'rolled it back in place', id: 'agent-parent', reason: 'rewind' },
+  ] as const
+
+  /** A parent that ran one turn in `agent-parent`, then changed its conversation; its binding followed. */
+  interface MovedParent {
+    readonly root: string
+    readonly sidecar: AcpSidecar
+    readonly sessions: Map<string, FixtureSession>
+    readonly parent: FixtureSession
+    /** The parent as the replay marker of its turn left it: the marker names the conversation before the change. */
+    readonly markedBefore: FixtureSession
+  }
+
+  async function parentThatMovedOn(change: { readonly id: string; readonly reason: string }): Promise<MovedParent> {
+    const { root, sidecar } = await harness()
+    const sessions = new Map<string, FixtureSession>()
+    const parentMessage = user('parent')
+    const parent = makeSession(parentMessage)
+    sessions.set('parent', parent)
+    const agent = replaceableRuntimeFactory({ starts: 0, forks: 0, prompts: 0 })
+    const adapter = new AcpProfileAdapter(
+      'test',
+      profile,
+      seam(),
+      (id) => sessions.get(id),
+      ledgerFor(sidecar),
+      undefined,
+      agent.factory,
+      sidecar,
+    )
+    await drain(adapter.stream(request('parent', parentMessage)))
+    const markedBefore = await parentWithReplay(sidecar, 'parent', parent)
+    agent.change(change.id, change.reason)
+    // A rewind keeps the agent session id, so the next generation is what shows that the binding followed.
+    await vi.waitFor(async () => {
+      const lookup = await sidecar.readLatestBinding('parent' as never)
+      expect(lookup?.status === 'ok' ? lookup.binding : undefined).toMatchObject({
+        agentSessionId: change.id,
+        generation: 2,
+      })
+    })
+    return { root, sidecar, sessions, parent, markedBefore }
+  }
+
+  /** Run the first turn of a child whose seed ends at `marked`; what the agent was asked to do, and how the fork went. */
+  async function runChild(moved: MovedParent, marked: FixtureSession, fork: (parent: string) => Promise<void>) {
+    moved.sessions.set('parent', marked)
+    const childMessage = user('child')
+    moved.sessions.set('child', childFromParent(marked, 'parent', childMessage))
+    const counts = { starts: 0, forks: 0, prompts: 0 }
+    await drain(
+      new AcpProfileAdapter(
+        'test',
+        profile,
+        seam(),
+        (id) => moved.sessions.get(id),
+        ledgerFor(moved.sidecar),
+        undefined,
+        runtimeFactory(counts, fork),
+        moved.sidecar,
+      ).stream(request('child', childMessage)),
+    )
+    const forks = (await moved.sidecar.list('child' as never)).flatMap((entry) =>
+      entry.kind === 'session-fork' ? [entry.data] : [],
+    )
+    return { counts, forks }
+  }
+
+  it.each(changes)(
+    'starts a child cut at the earlier marker blank when the agent $how: its seed ends in a conversation it no longer holds',
+    async (change) => {
+      const moved = await parentThatMovedOn(change)
+      try {
+        const { counts, forks } = await runChild(moved, moved.markedBefore, async () => undefined)
+        expect(counts).toEqual({ starts: 1, forks: 0, prompts: 1 })
+        expect(forks).toMatchObject([{ outcome: 'blank', reason: 'seed-not-latest-semantic-boundary' }])
+      } finally {
+        await moved.sidecar.dispose()
+        fs.rmSync(moved.root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(changes)(
+    'forks a child cut at the marker after the change when the agent $how, from the session the agent is in',
+    async (change) => {
+      const moved = await parentThatMovedOn(change)
+      try {
+        const markedAfter = await parentWithReplay(moved.sidecar, 'parent', moved.parent)
+        const forked: string[] = []
+        const { counts, forks } = await runChild(moved, markedAfter, async (parentId) => {
+          forked.push(parentId)
+        })
+        expect(counts).toEqual({ starts: 0, forks: 1, prompts: 1 })
+        expect(forked).toEqual([change.id])
+        expect(forks).toMatchObject([{ outcome: 'inherited', parentAgentSessionId: change.id }])
+      } finally {
+        await moved.sidecar.dispose()
+        fs.rmSync(moved.root, { recursive: true, force: true })
+      }
+    },
+  )
 })

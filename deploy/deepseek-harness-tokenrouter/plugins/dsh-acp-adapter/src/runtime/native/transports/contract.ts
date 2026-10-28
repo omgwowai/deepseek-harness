@@ -86,12 +86,41 @@ export interface NativeTurnUsage {
   readonly costUsd?: number | undefined
 }
 
+/**
+ * How DSH surfaces one vendor slash command.
+ *
+ * - `prompt`: DSH sends `/name args` as the text of the next prompt and the vendor runs it as a turn
+ *   (prompt commands, skills, custom commands, and the vendor's own local commands that answer a prompt).
+ * - `immediate`: answered by `NativeTransport.runCommand()` without a turn; allowed while a prompt runs.
+ * - `side`: answered by `NativeTransport.sideQuestion()`; never enters the main conversation.
+ */
+export type NativeCommandDispatch = 'prompt' | 'immediate' | 'side'
+
+/** One vendor slash command, classified for DSH. */
+export interface NativeCommand {
+  /** Name typed after `/`, in the vendor's spelling (it may contain characters DSH command names reject, e.g. `:`). */
+  readonly name: string
+  readonly description: string
+  /** Argument hint shown by the palette; absent when the command takes no arguments. */
+  readonly hint?: string | undefined
+  /** Other names the vendor accepts for the same command. */
+  readonly aliases?: readonly string[] | undefined
+  readonly dispatch: NativeCommandDispatch
+}
+
+/** What an immediate command or a side question returns: Markdown for the DSH command row. */
+export interface NativeCommandResult {
+  readonly kind: 'success' | 'error'
+  readonly text: string
+}
+
 /** Event a transport emits while it runs. */
 export type NativeTransportEvent =
   /**
    * One ACP session update without `sessionId`, shaped exactly like the vendor's ACP
    * agent: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
-   * `tool_call_update`, `plan`, `available_commands_update`, `session_info_update`.
+   * `tool_call_update`, `plan`, `session_info_update`. The command catalog travels as a
+   * `commands` event instead of `available_commands_update`: DSH surfaces it as host commands.
    */
   | { readonly kind: 'update'; readonly update: acp.SessionUpdate }
   | { readonly kind: 'context_usage'; readonly contextUsage: NativeContextUsage }
@@ -99,6 +128,13 @@ export type NativeTransportEvent =
   | { readonly kind: 'controls'; readonly controls: NativeControls }
   /** Diagnostic text for the host log; never contains credentials. */
   | { readonly kind: 'notice'; readonly text: string }
+  /** The command catalog changed (skills reloaded, plugins installed, …); the full new list. */
+  | { readonly kind: 'commands'; readonly commands: readonly NativeCommand[] }
+  /**
+   * The vendor replaced the conversation in place (`/clear`, a new thread or session): every later turn
+   * belongs to `sessionId`, and resuming the old id would bring back the context the user cleared.
+   */
+  | { readonly kind: 'session_changed'; readonly sessionId: string; readonly reason: string }
 
 /** A permission prompt the agent raised, in ACP `session/request_permission` shape. */
 export interface NativePermissionRequest {
@@ -113,6 +149,27 @@ export type NativePermissionHandler = (
   signal?: AbortSignal,
 ) => Promise<NativePermissionDecision>
 
+/**
+ * A form the agent needs the user to fill in: ACP `elicitation/create` in form mode, without the
+ * `sessionId` the runtime adds. It is exactly the request the vendor's own ACP agent sends for the same
+ * vendor event (OMP `ask`/`select`/`confirm`/`input`/`editor` dialogs, Claude Code `AskUserQuestion`
+ * and MCP elicitations, Codex `item/tool/requestUserInput` and MCP elicitations), and the response is
+ * decoded the way that agent decodes it.
+ */
+export interface NativeElicitationRequest {
+  readonly message: string
+  readonly requestedSchema: acp.ElicitationSchema
+  /** The tool call the form belongs to, when the vendor names one. */
+  readonly toolCallId?: string | undefined
+  readonly _meta?: { readonly [key: string]: unknown } | undefined
+}
+
+/** `accept` with the form content, `decline`, or `cancel` (also the answer to an abandoned form). */
+export type NativeElicitationHandler = (
+  request: NativeElicitationRequest,
+  signal?: AbortSignal,
+) => Promise<acp.CreateElicitationResponse>
+
 /** Everything a transport needs to own one agent process. */
 export interface NativeTransportStartOptions {
   /** Launcher argv (executable first); the transport appends the protocol and session flags it owns. */
@@ -124,6 +181,12 @@ export interface NativeTransportStartOptions {
   readonly session: NativeSessionTarget
   readonly onEvent: (event: NativeTransportEvent) => void
   readonly onPermission: NativePermissionHandler
+  /**
+   * Put a form to the user. Absent when the host has no question surface: the transport then behaves like
+   * the vendor's ACP agent towards a client without form elicitation (Claude Code keeps `AskUserQuestion`
+   * disallowed, OMP leaves its rich ask dialog off and dismisses dialogs, Codex answers user input empty).
+   */
+  readonly onElicitation?: NativeElicitationHandler | undefined
   readonly log?: ((message: string) => void) | undefined
 }
 
@@ -173,6 +236,23 @@ export interface NativeTransport {
    * Throws only when acceptance is unknown.
    */
   steer(content: readonly NativeContentBlock[], signal?: AbortSignal): Promise<'injected' | 'promptRequired'>
+  /**
+   * The command catalog: the vendor's own list once it reported one, otherwise the static built-ins of
+   * the supported version (`<kind>-commands.ts`). Changes are announced with a `commands` event.
+   */
+  commands?(): readonly NativeCommand[]
+  /**
+   * Run one `immediate` command (`args` is everything after the name, trimmed). It may run while a
+   * prompt runs, never emits turn updates, and reports failures as `{ kind: 'error' }` rather than throwing
+   * (it throws only when the process is lost).
+   */
+  runCommand?(name: string, args: string, signal: AbortSignal): Promise<NativeCommandResult>
+  /**
+   * Answer a side question from the current conversation without adding anything to it (`/btw`). It may
+   * run while a prompt runs, never emits turn updates, and never asks the user for approvals: a tool or
+   * permission request raised on the side is declined. Failures resolve as `{ kind: 'error' }`.
+   */
+  sideQuestion?(question: string, signal: AbortSignal): Promise<NativeCommandResult>
   /** Latest context occupancy, when known. */
   contextUsage(): NativeContextUsage | undefined
   /** End the process gracefully, then terminate it. Idempotent. */

@@ -24,6 +24,7 @@ import {
   createAcpLiveActivityDefinition,
 } from './ui/activity-definitions.ts'
 import { installNativeToolRenderer } from './ui/native-tool-renderer.ts'
+import { installCommandRows } from './ui/AcpCommandRow.ts'
 import { installAcpAssistantStream } from './ui/AcpAssistantStream.ts'
 import { AcpActivityJournalHub } from './data/activity-journal.ts'
 import { AcpUiFeedback } from './data/feedback.ts'
@@ -175,6 +176,7 @@ async function registerUi(ctx: ClientContext): Promise<void> {
     ),
   )
   installNativeToolRenderer(ctx)
+  installCommandRows(ctx)
   installAcpAssistantStream(ctx, {
     journalHub,
     t: ctx.locale.bind('acpActivity'),

@@ -459,6 +459,11 @@ export interface AcpAgentSessionSnapshotView {
   readonly profileId: string
   readonly modeWritable?: boolean
   readonly pendingModeId?: string | null
+  /**
+   * Option values (option id → value) chosen while a turn was running. They stay pending until the host applies
+   * them before the next turn starts; absent or empty when nothing waits.
+   */
+  readonly pendingOptions?: Readonly<Record<string, string | boolean>>
   readonly freshness: 'live' | 'stale'
   readonly editable: boolean
   readonly configOptions: readonly AcpConfigOption[] | null

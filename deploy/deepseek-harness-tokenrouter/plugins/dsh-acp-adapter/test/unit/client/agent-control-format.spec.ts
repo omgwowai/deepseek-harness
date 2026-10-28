@@ -200,4 +200,58 @@ describe('ACP Agent control presentation', () => {
       { label: 'On', current: false, write: { kind: 'config', id: 'fast', value: true } },
     ])
   })
+
+  it('shows a choice waiting for the next turn as selected while the Agent keeps the value it has', () => {
+    const groups = agentControlMenuGroups(
+      snapshot({
+        modes: null,
+        currentModeId: null,
+        configOptions: [
+          {
+            id: 'mode',
+            name: 'Mode',
+            category: 'mode',
+            type: 'select',
+            currentValue: 'agent',
+            options: [
+              { value: 'agent', name: 'Agent' },
+              { value: 'read-only', name: 'Read only' },
+            ],
+          },
+          {
+            id: 'collaboration_mode',
+            name: 'Collaboration mode',
+            type: 'select',
+            currentValue: 'default',
+            options: [
+              { value: 'default', name: 'Default' },
+              { value: 'plan', name: 'Plan' },
+            ],
+          },
+          { id: 'fast', name: 'Fast mode', type: 'boolean', currentValue: false },
+          { id: 'auto_compact', name: 'Auto compact', type: 'boolean', currentValue: true },
+          { id: 'tidy', name: 'Tidy output', type: 'boolean', currentValue: true },
+        ],
+        pendingModeId: 'read-only',
+        pendingOptions: { collaboration_mode: 'plan', fast: true, auto_compact: false },
+      }),
+      (key) => en[key],
+    )
+    expect(groups.map((group) => [group.name, group.current])).toEqual([
+      ['Mode', 'Read only'],
+      ['Collaboration mode', 'Plan'],
+      ['Fast mode', 'On'],
+      ['Auto compact', 'Off'],
+      ['Tidy output', 'On'],
+    ])
+    // The value the Agent has stays offered: choosing it cancels the pending choice.
+    expect(groups[1]?.choices).toMatchObject([
+      { label: 'Default', current: false, write: { kind: 'config', id: 'collaboration_mode', value: 'default' } },
+      { label: 'Plan', current: true, write: { kind: 'config', id: 'collaboration_mode', value: 'plan' } },
+    ])
+    expect(groups[3]?.choices).toMatchObject([
+      { label: 'Off', current: true, write: { kind: 'config', id: 'auto_compact', value: false } },
+      { label: 'On', current: false, write: { kind: 'config', id: 'auto_compact', value: true } },
+    ])
+  })
 })

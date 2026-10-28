@@ -13,8 +13,9 @@ import type { AcpAgentConfig, AcpResolvedAgent } from '../../domain/session/agen
 import { createTeamManagement } from '../teams/management.ts'
 import { createAcpLogger } from '../../domain/observability/logging.ts'
 import { acpProbeConfigKey } from './llm-stub.ts'
-import { installNativeAgentAccess, installNativeCompact } from './native-agent-access.ts'
-import { AcpProfileAdapter } from './profile-adapter.ts'
+import { installNativeAgentAccess } from './native-agent-access.ts'
+import { installNativeCommands } from './native-commands.ts'
+import { AcpProfileAdapter, type AcpProfileRuntimeOptions } from './profile-adapter.ts'
 import { AcpSessionRuntime } from '../../runtime/session/session-runtime.ts'
 import { NativeSessionRuntime } from '../../runtime/native/native-session-runtime.ts'
 import { selectNativeTransportKind } from '../../runtime/native/transports/contract.ts'
@@ -744,7 +745,7 @@ export function installInstalledProfileRegistry(
             (sessionId) => acpSessionView(ctx, sessionStore?.get(sessionId)),
             ledgerStore,
             undefined,
-            (options: ConstructorParameters<typeof AcpSessionRuntime>[0]) => {
+            (options: AcpProfileRuntimeOptions) => {
               const kind = nativeKindOf(options.config)
               if (kind === undefined) return new AcpSessionRuntime(options)
               return new NativeSessionRuntime({
@@ -852,7 +853,20 @@ export function installInstalledProfileRegistry(
     const profileId = acpAgentIdFromRoute(provider ?? '')
     return profileId !== undefined && registrations.has(profileId)
   }
-  installNativeCompact(ctx, ownsAcpRoute)
+  // Per agent on an ACP route: the vendor's commands (native agents) or the `/compact` shadow (the others). The route
+  // is asked again whenever a command runs, so a profile that was removed or edited answers instead of acting.
+  installNativeCommands(
+    ctx,
+    {
+      resolve: (provider) => {
+        const id = acpAgentIdFromRoute(provider ?? '')
+        const adapter = id !== undefined && registrations.has(id) ? profileAdapters.get(id) : undefined
+        const profile = id === undefined ? undefined : activeAgents[id]
+        return adapter === undefined || profile === undefined ? undefined : { adapter, kind: nativeKindOf(profile) }
+      },
+    },
+    log,
+  )
   installNativeAgentAccess(ctx, ownsAcpRoute)
 
   const onSettingsChange = (): void => {

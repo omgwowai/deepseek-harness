@@ -1,0 +1,79 @@
+/* Rows for vendor side questions and immediate commands. Chat's generic command card keeps text in a raw <pre>
+   capped at 260px; these rows draw the Markdown the host returned at its natural height under the same 24px
+   header the other flow rows use. Bodies are indented 22px: the 16px glyph box plus its 6px gap. */
+
+.root {
+  min-width: 0;
+}
+
+/* DisclosureRow owns the header; only the ellipsis of a long title and the trailing state are ours. */
+.title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-width: 0;
+  margin-left: 8px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+}
+
+.root[data-state='error'] .status {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.separator {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  margin-right: 8px;
+  border-radius: 50%;
+  corner-shape: round;
+  background: var(--dsw-alias-label-caption);
+}
+
+/* The question as typed: it wraps and keeps its line breaks instead of being cut to the header's one line. */
+.question {
+  margin: 2px 0 6px 22px;
+  padding-left: 12px;
+  border-left: 2px solid var(--dsw-alias-label-caption);
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.body {
+  min-width: 0;
+  margin: 4px 0 6px 22px;
+}
+
+/* Markdown gives its first and last block document margins; inside this row they would only add blank space. */
+.body > * > :first-child {
+  margin-top: 0;
+}
+
+.body > * > :last-child {
+  margin-bottom: 0;
+}
+
+/* The Markdown root sets its own text color, so the error tone is applied to it directly. */
+.body[data-tone='error'] > * {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.empty {
+  margin: 0 0 0 22px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: calc(24px + var(--dsh-content-font-delta, 0px));
+}

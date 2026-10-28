@@ -71,6 +71,14 @@ const snapshot: AcpAgentSessionSnapshotView = {
   contextUsage: null,
   note: null,
 }
+/** Before the first prompt there is no Agent session to follow: the dock holds the draft menu the host reports. */
+const draft: AcpAgentSessionSnapshotView = {
+  ...snapshot,
+  freshness: 'stale',
+  editable: false,
+  modeWritable: true,
+  currentModeId: null,
+}
 function setup(owner = false, workspace = true) {
   const state = new ClientAccessState(
     owner ? { type: 'baseline', owner: true } : { type: 'baseline', owner: false, grants: [] },
@@ -78,6 +86,7 @@ function setup(owner = false, workspace = true) {
   const sessionAccessSource = (id: string, action: string) => state.resource('session', id, action)
   const remote = {
     draftAgentSession: vi.fn(async () => ({ ok: true, value: null })),
+    setDraftAgentMode: vi.fn(async () => ({ ok: true, value: null })),
     setAgentSessionOption: vi.fn(async () => ({ ok: true, value: snapshot })),
     setToolApprovalPolicy: vi.fn(async () => ({ ok: true, value: null })),
     setTeamMemberModel: vi.fn(async () => ({ ok: true, value: null })),
@@ -85,6 +94,7 @@ function setup(owner = false, workspace = true) {
     rebindRecoveryBlank: vi.fn(async () => ({ ok: true, value: undefined })),
   }
   const createNewSession = vi.fn(async () => {})
+  const flags = { running: false }
   const common = {
     sessionId: 'lead',
     remote,
@@ -96,17 +106,21 @@ function setup(owner = false, workspace = true) {
     useWorkspaces: (select: (value: object) => unknown) =>
       select({ items: workspace ? [{ workspaceId: 'workspace', sessionIds: ['lead'] }] : [] }),
     useSessions: (select: (value: object) => unknown) => select({ byId: { lead: { cwd: '/fixture' } } }),
-    useSession: (select: (value: object) => unknown) => select({ running: false, openState: 'ready' }),
+    useSession: (select: (value: object) => unknown) => select({ running: flags.running, openState: 'ready' }),
     useProjection: () => ({ lastUsed: { provider: 'acp-codex' }, next: { provider: 'acp-codex' } }),
     t: (key: string) => key,
     ownsRoute: (value: string) => value === 'acp-codex',
   }
-  const control = () => {
+  /** The dock for a live snapshot, or for the draft menu of a session that has no Agent session yet. */
+  const control = (
+    view: { snapshot?: AcpAgentSessionSnapshotView | null; draft?: boolean; running?: boolean } = {},
+  ) => {
+    flags.running = view.running ?? false
     seed([
       undefined,
       0,
-      snapshot,
-      null,
+      view.snapshot === undefined ? snapshot : view.snapshot,
+      view.draft === true ? draft : null,
       0,
       { sessionId: 'lead', policy: 'auto', source: 'session', editable: true },
       null,
@@ -176,7 +190,7 @@ function setup(owner = false, workspace = true) {
   }
   return { state, remote, control, model, recovery, createNewSession }
 }
-function groups(tree: Tree): { choices: { disabled: boolean; write: { kind: string } }[] }[] {
+function groups(tree: Tree): { kind: string; choices: { disabled: boolean; write: { kind: string } }[] }[] {
   return tree.props.groups as never
 }
 function select(tree: Tree, kind: string) {
@@ -306,4 +320,72 @@ it('uses the destination workspace or global create grant instead of the source 
     ;(allowed.props.onClick as () => void)()
     expect(h.createNewSession).toHaveBeenCalledExactlyOnceWith('lead')
   }
+})
+
+// A mode chosen before the Agent session exists is saved by the host and applied by the next prompt, so it is a
+// session-option write that waits: it takes the grants of that write and of the call that saves it.
+const savedModeGrants = ['dshAcp/setAgentSessionOption', 'dshAcp/setDraftAgentMode']
+
+it.each([false, true])(
+  'lets only a caller holding both grants save a mode chosen before the Agent session exists (first prompt out: %s)',
+  async (running) => {
+    const attempts: [string, string[]][] = [
+      ['a reader', []],
+      ['the session-option grant alone', ['dshAcp/setAgentSessionOption']],
+      ['the saving call alone', ['dshAcp/setDraftAgentMode']],
+      ['both grants', savedModeGrants],
+    ]
+    for (const [who, held] of attempts) {
+      const h = setup()
+      grants(h.state, 'lead', held)
+      const tree = h.control({ snapshot: null, draft: true, running })
+      const allowed = who === 'both grants'
+      expect(
+        groups(tree)
+          .filter((group) => group.kind === 'mode')
+          .flatMap((group) => group.choices)
+          .every((item) => item.disabled === !allowed),
+        who,
+      ).toBe(true)
+      select(tree, 'mode')
+      expect(h.remote.setDraftAgentMode, who).toHaveBeenCalledTimes(allowed ? 1 : 0)
+      expect(h.remote.setAgentSessionOption).not.toHaveBeenCalled()
+      await Promise.resolve()
+    }
+  },
+)
+
+it('saves a deferred mode for the owner, with the route the composer selected', () => {
+  const h = setup(true)
+  select(h.control({ snapshot: null, draft: true }), 'mode')
+  expect(h.remote.setDraftAgentMode).toHaveBeenCalledExactlyOnceWith('lead', 'acp-codex', 'code')
+})
+
+it('rechecks the actual grants when a deferred choice is made from an already-open menu', () => {
+  const h = setup()
+  grants(h.state, 'lead', savedModeGrants)
+  const opened = h.control({ snapshot: null, draft: true })
+  grants(h.state, 'lead', ['dshAcp/setAgentSessionOption'])
+  select(opened, 'mode')
+  expect(h.remote.setDraftAgentMode).not.toHaveBeenCalled()
+  grants(h.state, 'lead', ['dshAcp/setDraftAgentMode'])
+  select(opened, 'mode')
+  expect(h.remote.setDraftAgentMode).not.toHaveBeenCalled()
+  grants(h.state, 'lead', savedModeGrants)
+  select(h.control({ snapshot: null, draft: true }), 'mode')
+  expect(h.remote.setDraftAgentMode).toHaveBeenCalledOnce()
+})
+
+it('keeps a reported stale snapshot read-only while a turn runs, even for the owner', () => {
+  const h = setup(true)
+  const stale = { ...snapshot, freshness: 'stale' as const, editable: false, modeWritable: true }
+  const tree = h.control({ snapshot: stale, running: true })
+  const modeChoices = groups(tree)
+    .flatMap((group) => group.choices)
+    .filter((item) => item.write.kind === 'mode')
+  expect(modeChoices.length).toBeGreaterThan(0)
+  expect(modeChoices.every((item) => item.disabled)).toBe(true)
+  select(tree, 'mode')
+  expect(h.remote.setDraftAgentMode).not.toHaveBeenCalled()
+  expect(h.remote.setAgentSessionOption).not.toHaveBeenCalled()
 })

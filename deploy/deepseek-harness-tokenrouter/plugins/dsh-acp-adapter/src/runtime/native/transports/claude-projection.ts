@@ -1185,6 +1185,68 @@ const RESULT_BLOCK_TYPES: Readonly<Record<string, true>> = {
 
 const TOOL_USE_BLOCK_TYPES: Readonly<Record<string, true>> = { tool_use: true, server_tool_use: true, mcp_tool_use: true }
 
+// ---------------------------------------------------------------------------
+// System notes (API retries, model fallbacks, notifications)
+// ---------------------------------------------------------------------------
+
+const filled = (value: unknown): string | undefined => {
+  const trimmed = text(value)?.trim()
+  return trimmed === undefined || trimmed === '' ? undefined : trimmed
+}
+
+const seconds = (milliseconds: unknown): string | undefined => {
+  const value = num(milliseconds)
+  return value === undefined ? undefined : `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)} s`
+}
+
+const attemptSuffix = (attempt: number | undefined, max: number | undefined): string =>
+  attempt === undefined ? '' : ` (attempt ${attempt}${max === undefined ? '' : ` of ${max}`})`
+
+/** The longest reason a goal note repeats; the model gets the whole reason anyway. */
+const GOAL_NOTE_LIMIT = 600
+
+/** `/goal` is a session Stop hook; its verdict reaches the model as `Stop hook feedback:\n[<condition>]: <reason>`. */
+const GOAL_FEEDBACK = /^Stop hook feedback:\s*\n\[[\s\S]*?\]: ([\s\S]+)$/
+
+/**
+ * What the user should read for a system frame about an API retry, a model fallback or a notification; `undefined` for a frame that
+ * is not worth showing. The CLI writes the `content` of the fallback frames for people, so it is used as it comes; the generated
+ * wording only covers a frame without one.
+ */
+export function claudeSystemNote(frame: Json): string | undefined {
+  const original = filled(frame['original_model']) ?? 'The model'
+  const fallback = filled(frame['fallback_model']) ?? 'the fallback model'
+  switch (frame['subtype']) {
+    case 'api_retry': {
+      const status = num(frame['error_status'])
+      const kind = filled(frame['error'])
+      const silent = isRecord(frame['no_response']) ? seconds(frame['no_response']['waited_ms']) : undefined
+      const cause =
+        silent !== undefined ? `no response within ${silent}` : status !== undefined ? `HTTP ${status}${kind === undefined ? '' : ` (${kind})`}` : (kind ?? 'a connection error')
+      const delay = seconds(frame['retry_delay_ms'])
+      return `The API request failed (${cause}); retrying${delay === undefined ? '' : ` in ${delay}`}${attemptSuffix(num(frame['attempt']), num(frame['max_retries']))}.`
+    }
+    case 'api_error': {
+      const error = isRecord(frame['error']) ? frame['error'] : {}
+      const cause = filled(error['formatted']) ?? filled(error['message']) ?? 'the request failed'
+      const delay = seconds(frame['retry_in_ms'])
+      return `API error: ${cause}; retrying${delay === undefined ? '' : ` in ${delay}`}${attemptSuffix(num(frame['retry_attempt']), num(frame['max_retries']))}.`
+    }
+    case 'model_fallback':
+      return filled(frame['content']) ?? `${original} failed (${(filled(frame['trigger']) ?? 'error').replace(/_/g, ' ')}); this turn runs on ${fallback}.`
+    case 'model_refusal_fallback':
+      return filled(frame['content']) ?? `${original} declined the request; retrying with ${fallback}.`
+    case 'model_refusal_no_fallback':
+      return filled(frame['content']) ?? `${original} declined the request and no fallback model is configured.`
+    case 'model_consent_fallback':
+      return filled(frame['content']) ?? `Switched from ${original} to ${fallback}.`
+    case 'notification':
+      return frame['priority'] === 'low' ? undefined : filled(frame['text'])
+    default:
+      return undefined
+  }
+}
+
 const COMPACTION_TITLE = 'Compact conversation'
 
 export interface FrameMapperOptions {
@@ -1212,6 +1274,17 @@ export class ClaudeFrameMapper {
   private compactionId: string | undefined
   private last: NativeContextUsage | undefined
   private lastCost: { amount: number; currency: string } | undefined
+  /** The attempt the last retry note told about: `api_retry` and `api_error` can describe the same retry. */
+  private retryNoted: number | undefined
+  /**
+   * `/goal` progress. The CLI sends `active_goal` frames only to a remote worker; a local stream-json session learns each check from the
+   * Stop hook feedback it hands the model. Once the frames come, they narrate the checks and the feedback adds nothing.
+   */
+  private goalFrames = false
+  /** The highest check of the current goal an `active_goal` frame was narrated for. */
+  private goalChecks = 0
+  /** The text of the last banner (`informational`), which the CLI may also send as a `notification`. */
+  private lastBanner: string | undefined
 
   constructor(options: FrameMapperOptions) {
     this.cwd = options.cwd
@@ -1255,11 +1328,20 @@ export class ClaudeFrameMapper {
         return this.lastTotal === undefined
           ? []
           : [updateEvent({ sessionUpdate: 'usage_update', used: this.lastTotal, size: this.window, _meta: { '_claude/rateLimit': frame['rate_limit_info'] } })]
+      case 'active_goal':
+        return this.mapActiveGoal(frame)
       case 'system':
         return this.mapSystem(frame)
       default:
         return []
     }
+  }
+
+  /** The conversation was replaced or cut back: the context window holds `used` tokens now (none after a `/clear`). */
+  restartContext(used: number): NativeTransportEvent[] {
+    this.lastUsage = undefined
+    this.lastTotal = used
+    return [this.usageEvent(used, {})]
   }
 
   /** The `usage_update` that ends a turn: last context occupancy, the window the CLI reported, the session cost. */
@@ -1286,6 +1368,8 @@ export class ClaudeFrameMapper {
     this.emitted.clear()
     this.dispatched.clear()
     this.streamed.clear()
+    this.retryNoted = undefined
+    this.lastBanner = undefined
     return events
   }
 
@@ -1444,6 +1528,8 @@ export class ClaudeFrameMapper {
       return body ? [updateEvent({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: body } })] : []
     }
     if (!Array.isArray(content)) return []
+    const goalCheck = this.goalFeedback(frame, content)
+    if (goalCheck !== undefined) return goalCheck
     // A lone text block is the echo of a user message, not output.
     if (content.length === 1 && isRecord(content[0]) && content[0]['type'] === 'text') return []
     const structured = isRecord(frame['tool_use_result']) ? frame['tool_use_result'] : undefined
@@ -1680,6 +1766,7 @@ export class ClaudeFrameMapper {
       case 'informational': {
         const content = text(frame['content'])
         if (!content) return []
+        this.lastBanner = content.trim()
         const level = text(frame['level']) ?? 'info'
         const label = level.charAt(0).toUpperCase() + level.slice(1)
         return [
@@ -1690,9 +1777,73 @@ export class ClaudeFrameMapper {
           }),
         ]
       }
+      case 'api_retry':
+      case 'api_error': {
+        const attempt = num(frame['attempt']) ?? num(frame['retry_attempt'])
+        if (attempt !== undefined && attempt === this.retryNoted) return []
+        this.retryNoted = attempt
+        return this.noteEvents(frame)
+      }
+      case 'model_fallback':
+      case 'model_refusal_fallback':
+      case 'model_refusal_no_fallback':
+      case 'model_consent_fallback':
+      case 'notification': {
+        // The CLI says some things twice, as a banner and as a notification.
+        const said = filled(frame['text'])
+        return said !== undefined && said === this.lastBanner ? [] : this.noteEvents(frame)
+      }
       default:
         return []
     }
+  }
+
+  /** A system note is a thought of its own (never merged into the model's thinking), shown in the turn the user is watching. */
+  private noteEvents(frame: Json): NativeTransportEvent[] {
+    return this.thought(claudeSystemNote(frame), text(frame['uuid']), frame['subtype'])
+  }
+
+  private thought(note: string | undefined, messageId: string | undefined, subtype: unknown): NativeTransportEvent[] {
+    if (note === undefined) return []
+    return [
+      updateEvent({
+        sessionUpdate: 'agent_thought_chunk',
+        content: { type: 'text', text: `${note}\n\n` },
+        ...(messageId === undefined ? {} : { messageId }),
+        _meta: { claudeCode: { kind: 'note', subtype } },
+      }),
+    ]
+  }
+
+  /** What the user reads when `/goal`'s Stop hook found the goal not met yet; the model gets the same reason as its next instruction. */
+  private goalNote(reason: string, check?: number): string {
+    const clipped = reason.length <= GOAL_NOTE_LIMIT ? reason : `${reason.slice(0, GOAL_NOTE_LIMIT - 1).trimEnd()}…`
+    return `Goal not met yet${check === undefined ? '' : ` (check ${check})`}: ${clipped}`
+  }
+
+  /** An `active_goal` frame: a check that found the goal not met is worth a note; setting, clearing and meeting a goal the CLI announces itself. */
+  private mapActiveGoal(frame: Json): NativeTransportEvent[] {
+    this.goalFrames = true
+    const value = isRecord(frame['value']) ? frame['value'] : undefined
+    const iterations = num(value?.['iterations']) ?? 0
+    const reason = filled(value?.['last_reason'])
+    // No goal, or a goal that was just set: counting starts over.
+    if (iterations === 0) this.goalChecks = 0
+    if (reason === undefined || iterations <= this.goalChecks) return []
+    this.goalChecks = iterations
+    return this.thought(this.goalNote(reason, iterations), text(frame['uuid']), 'active_goal')
+  }
+
+  /**
+   * The Stop hook behind `/goal` reports back to the model as a synthetic user message, `Stop hook feedback:\n[<condition>]: <reason>`.
+   * Undefined for any other user message.
+   */
+  private goalFeedback(frame: Json, content: readonly unknown[]): NativeTransportEvent[] | undefined {
+    const [block] = content
+    const body = frame['isSynthetic'] === true && content.length === 1 && isRecord(block) && block['type'] === 'text' ? text(block['text']) : undefined
+    const reason = body === undefined ? undefined : filled(GOAL_FEEDBACK.exec(body)?.[1])
+    if (reason === undefined) return undefined
+    return this.goalFrames ? [] : this.thought(this.goalNote(reason), text(frame['uuid']), 'goal')
   }
 
   private compactionStarted(id: string): NativeTransportEvent[] {
