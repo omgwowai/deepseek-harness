@@ -9,7 +9,7 @@ kind: "package-library"
 
 ## 概述
 
-使用 `dsh-agent-loop-testkit` 可以为 AgentLoop 测试准备标准先决条件和生产 loop 驱动，避免重复设置。Harness 可以创建真实 Agent，并公开 Inbox 输入认领能力，以测试持久事件、恢复、通知和认领行为。只需编辑队列的消费方测试应选择进程内 Inbox 桩；待处理输入绝不应被访问时，应选择快速失败的 Inbox。测试仍然负责适配器、可选插件、加载顺序和上下文释放，本包不会添加模型可见行为。
+使用 `dsh-agent-loop-testkit` 可以为 AgentLoop 测试准备标准先决条件和生产 loop 驱动，避免重复设置。harness 可以创建真实 Agent，并公开 Inbox 输入认领能力，以测试持久事件、恢复、通知和认领行为。只需编辑队列的消费方测试应选择进程内 Inbox 桩；待处理输入绝不应被访问时，应选择快速失败的 Inbox。测试仍然负责适配器、可选插件、加载顺序和上下文释放，本包不会添加模型可见行为。
 
 ## 目录
 
@@ -24,6 +24,8 @@ kind: "package-library"
 
 <a id="use-this-package"></a>
 ## 使用本包
+
+仅测试消费方且使用结构化 Agent 桩的测试可调用 `provideWorkingDirectoryFixture(ctx, defaultDirectory?)`。它只提供目录值，不校验路径、不切换目录，也不记录事件。目录行为测试使用 `mountAgentLoopTestDependencies(ctx, { workingDirectory: true })` 与真实临时目录。
 
 本包为 AgentLoop 测试提供可用的服务拓扑，并要求测试明确选择生产 Inbox 行为或结构化桩。
 
@@ -72,7 +74,7 @@ const agent = {
 
 ### 可能出什么问题
 
-harness 不会挂载任何 LLM 适配器。若测试发送的任务会启动模型请求，请先注册被测路由的适配器。每个测试结束后都应释放所属上下文，使 Agent 达到静止状态并解除其作用域注册。
+harness 不会挂载任何 LLM（大语言模型）适配器。若测试发送的任务会启动模型请求，请先注册被测路由的适配器。每个测试结束后都应 dispose（资源释放）所属上下文，使 Agent 完全停稳，并解除其作用域注册。
 
 -----
 
@@ -86,7 +88,7 @@ harness 不会挂载任何 LLM 适配器。若测试发送的任务会启动模�
 
 ### 设计
 
-`mountAgentLoopTestDependencies` 按固定依赖顺序——LLM、会话、会话投影注册表、系统提示词注册表、工具注册表、agent 注册表——挂载六个服务插件，并在 `AgentLoop` 之前停下，使调用方控制 loop 加载顺序。`mountAgentLoopTestHarness` 挂载公开的生产插件，通过其服务创建 Agent，并公开生产驱动的认领操作，而不导出 loop 的具体 Inbox 类或投影定义。[`src/inbox.ts`](src/inbox.ts) 仅包含进程内可变桩和快速失败且不支持操作的占位值；它不持有投影或持久事件实现。挂载与驱动实现位于 [`src/index.ts`](src/index.ts)。本包不发布 invariant companion，因为它只持有测试辅助工具，不存在可能相互偏离的独立生产观测。
+`mountAgentLoopTestDependencies` 按固定依赖顺序——LLM、会话、会话投影注册表、系统提示词注册表、工具注册表、agent 注册表——挂载六个服务插件，并在 `AgentLoop` 之前停下，使调用方控制 loop 加载顺序。`mountAgentLoopTestHarness` 挂载公开的生产插件，通过其服务创建 Agent，并公开生产驱动的认领操作，而不导出 loop 的具体 Inbox 类或投影定义。[`src/inbox.ts`](src/inbox.ts) 仅包含进程内可变桩和快速失败且不支持操作的占位值；它不持有投影或持久事件实现。挂载与驱动实现位于 [`src/index.ts`](src/index.ts)。
 
 </details>
 
@@ -100,8 +102,8 @@ harness 不会挂载任何 LLM 适配器。若测试发送的任务会启动模�
 - [Agent loop 包](../../core/agent-loop/README.zh.md)——本辅助函数为生产行为挂载的具体 loop。
 - [会话包](../../core/session/README.zh.md)——生产 Inbox 行为使用的持久事件日志。
 - [LLM 包](../../llm/llm/README.zh.md)——本辅助函数准备的 LLM 运行时与适配器接口。
-- [测试策略](../../../docs/testing.zh.md)——这些测试所服务的覆盖层级。
-- [test-support 组地图](../README.zh.md)——兄弟 harness 与支持包。
+- [测试策略](../../../docs/testing.zh.md)——这些测试对应的覆盖层级。
+- [test-support 组索引](../README.zh.md)——兄弟 harness 与支持包。
 
 -----
 

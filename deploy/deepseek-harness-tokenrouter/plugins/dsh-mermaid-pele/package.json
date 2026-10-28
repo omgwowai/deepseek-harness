@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-mermaid-pele",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render ```mermaid fences in the dsh chat with Pele (Mermaid syntax → themeable SVG).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "scripts": {
+    "build": "node tools/build.mjs"
+  }
+}

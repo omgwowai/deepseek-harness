@@ -1,0 +1,63 @@
+# Refresh the committed fallback independently of a release. A failed refresh
+# preserves both files, records the reason and reports an issue.
+name: registry sync
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Prepare registry snapshot for review
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - name: Refresh Registry or retain validated fallback
+        id: registry
+        run: |
+          node scripts/check-ci-user.mjs
+          node scripts/sync-release-registry.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: registry-snapshot-for-review
+          path: .local/registry-release/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+    outputs:
+      registry-status: ${{ steps.registry.outputs.status }}
+
+  notify:
+    needs: sync
+    if: always() && needs.sync.outputs.registry-status == 'fallback'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    concurrency:
+      group: registry-fallback-issue
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: registry-snapshot-for-review
+          path: .local/registry-release
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await require('./scripts/report-registry-sync.cjs')({ github, context, core })

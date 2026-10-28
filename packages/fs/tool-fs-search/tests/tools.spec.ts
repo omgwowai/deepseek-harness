@@ -10,10 +10,13 @@
  * Real-`rg` behavior is pinned separately in integration.spec.ts.
  */
 
+import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import { createScope, type Scope } from '@deepseek-ai/dsh-scope'
 import { join, sep } from 'node:path'
 import { createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { TOOL_ABORTED_BEFORE_DISPATCH, type ToolExecution, type ToolExecutionToken } from '@deepseek-ai/dsh-tools'
 import { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
@@ -38,6 +41,12 @@ import {
   sampleAcrossTopLevel,
   toWorkdirRelative,
 } from '@deepseek-ai/dsh-tool-fs-search'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'test': { kind: 'test' } & ContextFormed
+  }
+}
 
 const testToolSignal = new AbortController().signal
 
@@ -96,6 +105,7 @@ class FakeReader implements SubprocessOutputReader {
  * abort→terminate escalation.
  */
 class FakeHandle implements SubprocessHandle {
+  readonly control = undefined
   readonly stdin = undefined
   readonly stdout = undefined
   readonly stderr = undefined
@@ -146,6 +156,7 @@ class FakeHandle implements SubprocessHandle {
  * assert on the exact spawn specs and settled handles.
  */
 class FakeSubprocess extends SubprocessRuntime {
+  async terminalEnvironment() { return { platform: 'posix' as const } }
   spawns: SubprocessSpawnSpec[] = []
   override async resolveExecutable(command: string): Promise<string> { return command }
   override spawnTerminal(): Promise<never> { throw new Error('search tools spawn pipes, never terminals') }
@@ -188,6 +199,7 @@ const DEFAULT_CONFIG = { sampleOverCapGlobResults: true } satisfies ToolFsSearch
 
 async function setup(options: SetupOptions = {}) {
   const ctx = new Context()
+  provideWorkingDirectoryFixture(ctx)
   const warnings: string[] = []
   ctx.logger.warn = ((message: unknown) => { warnings.push(String(message)) }) as typeof ctx.logger.warn
   await ctx.plugin(SystemPrompt)
@@ -240,14 +252,13 @@ describe('registration', () => {
     const prompt = renderPrompt(await ctx.systemPrompt.assemble())
     expect(prompt).toContain('Use the glob tool')
     expect(prompt).toContain('Use the grep tool')
-    expect(prompt).toContain('sampled across top-level entries')
-    expect(prompt).not.toContain('sampled across top-level directories')
     const glob = ctx.tools.schemas().find(schema => schema.name === 'glob')
     expect(glob?.description).toContain('sampled across top-level entries')
   })
 
   it('stays pending until ctx.subprocess exists (inject)', async () => {
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(ToolFsSearch, DEFAULT_CONFIG) // no subprocess service
@@ -278,11 +289,8 @@ describe('registration', () => {
 
   it('describes the modification-time head when over-cap sampling is disabled', async () => {
     const { ctx } = await setup({ config: { sampleOverCapGlobResults: false } })
-    const prompt = renderPrompt(await ctx.systemPrompt.assemble())
-    expect(prompt).toContain('a larger one keeps the modification-time-ordered head')
-    expect(prompt).not.toContain('sampled across top-level entries')
     const glob = ctx.tools.schemas().find(schema => schema.name === 'glob')
-    expect(glob?.description).toContain('a larger result returns the first 100 paths in modification-time order')
+    expect(glob?.description).toContain('Returns up to 100 paths in modification-time order; a larger result keeps the first paths')
     expect(glob?.description).not.toContain('sampled across top-level entries')
   })
 })
@@ -306,6 +314,7 @@ describe('config validation', () => {
     ['timeoutMs', { timeoutMs: -100 }],
   ] as const)('rejects a non-positive or fractional %s at load', async (name, config) => {
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(FakeSubprocess)
@@ -314,6 +323,7 @@ describe('config validation', () => {
 
   it('rejects a grace beyond the Node timer range at load', async () => {
     const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(FakeSubprocess)
@@ -762,7 +772,7 @@ describe('glob results', () => {
     ctx.on('tools/post-execute', async () => ({
       kind: 'accept',
       additionalContexts: [createUserMessage({
-        content: [{ type: 'text', text: 'glob context' }], source: { kind: 'plugin', plugin: 'test' },
+        content: [{ type: 'text', text: 'glob context' }], source: { kind: 'test' },
       })],
     }))
     subprocess.handler = () => runResult('a.ts\nb.ts\nc.ts\nd.ts\n')
@@ -974,7 +984,7 @@ describe('grep results', () => {
     ctx.on('tools/post-execute', async () => ({
       kind: 'accept',
       additionalContexts: [createUserMessage({
-        content: [{ type: 'text', text: 'grep context' }], source: { kind: 'plugin', plugin: 'test' },
+        content: [{ type: 'text', text: 'grep context' }], source: { kind: 'test' },
       })],
     }))
     subprocess.handler = () => runResult([
@@ -1152,7 +1162,7 @@ describe('presentation', () => {
     expect(view).toEqual({ card: 'search', shape: 'paths', paths: ['a.ts', 'b.ts'], truncated: true, total: 3 })
   })
 
-  it('nested Code dispatch computes no meta, so presentResult falls back to the generic card', async () => {
+  it('nested Code dispatch projects search metadata into the search card', async () => {
     const { ctx, subprocess } = await setup()
     subprocess.handler = () => runResult(`${matchLine('a.ts', 1, 'one')}\n`)
     const result = await call(ctx, 'grep', { pattern: 'o' }, {
@@ -1160,8 +1170,19 @@ describe('presentation', () => {
       parent: Symbol('run_code') as ToolExecutionToken,
     })
     if (result.isError) throw new Error('expected grep success')
-    expect(result.meta).toBeUndefined()
-    expect(presentGrepResult({ pattern: 'o' }, result)).toBeUndefined()
+    expect(result.meta).toEqual({
+      shape: 'matches',
+      files: [{ path: 'a.ts', matches: [{ lineNumber: 1, line: 'one' }] }],
+      truncated: false,
+      total: 1,
+    })
+    expect(presentGrepResult({ pattern: 'o' }, result)).toEqual({
+      card: 'search',
+      shape: 'matches',
+      files: [{ path: 'a.ts', matches: [{ lineNumber: 1, line: 'one' }] }],
+      truncated: false,
+      total: 1,
+    })
   })
 
   it('presentResult returns undefined for a failed result and for the other tool’s meta shape', () => {
@@ -1207,3 +1228,58 @@ describe('helpers', () => {
     expect(grouped).toBe('b.ts\nLine 2: x\nLine 5: z\n\na.ts\nLine 1: y')
   })
 })
+
+/** Create a real per-agent scope over the mounted tool plugins. */
+async function guidanceScope(ctx: Context) {
+  const key = {}
+  let scope!: Scope
+  await ctx.plugin(Object.assign((inner: Context) => { scope = createScope(inner, key) },
+    { inject: ['tools', 'systemPrompt'] }))
+  return { key, scope }
+}
+
+const originalSearchGuidance = {
+  glob: 'Use the glob tool — not shell find — to discover files by path pattern.',
+  grep: 'Use the grep tool — not shell grep or rg — to search file contents. Use read on a matched file when you need surrounding context.',
+}
+
+describe('scope-aware search guidance', () => {
+  it.each([[], ['glob'], ['grep'], ['glob', 'grep']].map(allow => ({ allow })))('renders only visible search guidance: $allow', async ({ allow }) => {
+    const { ctx } = await setup()
+    const { key, scope } = await guidanceScope(ctx)
+    scope.ctx.tools.restrict({ allow })
+    try {
+      const assembly = await ctx.systemPrompt.assemble({ scope: key })
+      expect(assembly.tools.map(tool => tool.name)).toEqual([...allow].sort())
+      expect(renderPrompt(assembly)).toBe(withPersona(...allow.map(name => name === 'glob'
+        ? originalSearchGuidance.glob
+        : originalSearchGuidance.grep.replace(' Use read on a matched file when you need surrounding context.', ''))))
+    } finally {
+      await scope.dispose()
+    }
+  })
+
+  it('reuses the unchanged grep paragraph when read is visible', async () => {
+    const { ctx } = await setup()
+    ctx.tools.register({
+      name: 'read', description: 'read fixture', parameters: {},
+      output: { schema: { type: 'string' }, render: () => [{ type: 'text', text: '' }] },
+      execute: () => Promise.resolve(''),
+    })
+    const { key, scope } = await guidanceScope(ctx)
+    try {
+      expect(renderPrompt(await ctx.systemPrompt.assemble({ scope: key })))
+        .toBe(withPersona(originalSearchGuidance.glob, originalSearchGuidance.grep))
+      scope.ctx.tools.restrict({ deny: ['read'] })
+      expect(renderPrompt(await ctx.systemPrompt.assemble({ scope: key })))
+        .toBe(withPersona(originalSearchGuidance.glob, originalSearchGuidance.grep.split(' Use read')[0]!))
+    } finally {
+      await scope.dispose()
+    }
+  })
+})
+
+/** Preserve the default persona and exact section separators in the oracle. */
+function withPersona(...sections: string[]): string {
+  return ['You are an AI agent powered by DeepSeek Harness.', ...sections].join('\n\n')
+}

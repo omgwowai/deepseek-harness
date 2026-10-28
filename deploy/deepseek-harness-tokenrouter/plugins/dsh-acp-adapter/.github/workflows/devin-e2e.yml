@@ -1,0 +1,98 @@
+name: Real Devin integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_model_usage:
+        description: Authorize this run to use the configured Devin account and model quota
+        type: boolean
+        required: true
+        default: false
+      devin_version:
+        description: Pinned Devin release to verify
+        type: choice
+        required: true
+        default: '3000.10.31'
+        options: ['3000.10.31', '3000.11.3', '3000.3.27']
+
+run-name: Real Devin ${{ inputs.devin_version || '3000.10.31' }} (${{ github.ref_name }})
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devin-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-devin:
+    if: github.event_name == 'workflow_dispatch' && inputs.allow_model_usage == true && github.repository == 'zaimokuza-yoshiteru/dsh-acp-adapter'
+    environment: devin-e2e
+    env:
+      DEVIN_TEST_VERSION: ${{ inputs.devin_version || '3000.10.31' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.7.0
+      - name: Build trusted checkout without credentials
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Install pinned Devin (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$DEVIN_TEST_VERSION/$(uname -m)" in
+            3000.10.31/arm64) platform=aarch64-apple-darwin; sha=051dfcf29e0f5cb5f0a07c7579dc97255fee7f02ce4c6feacc7d4065ce76b5bd ;;
+            3000.10.31/x86_64) platform=x86_64-apple-darwin; sha=ca450a13a7e2d83a2c6e641c0f80842826f944cad3ca93ba892a7ade3948555a ;;
+            3000.11.3/arm64) platform=aarch64-apple-darwin; sha=c08cc3f3507d103246b8c601a584fcc719fd77f6cc10f26cc90e9f4186640df2 ;;
+            3000.11.3/x86_64) platform=x86_64-apple-darwin; sha=594f89b6b0d03dffec4eabc754104e4471cc43a014a2164e2fdd7d0d752d0100 ;;
+            3000.3.27/arm64) platform=aarch64-apple-darwin; sha=ec047ea396d53fc370c1c7c6de211637585cf99a5c5cd5dcdbf7e4c7f2a20626 ;;
+            3000.3.27/x86_64) platform=x86_64-apple-darwin; sha=2d67b0c3aeee4fa98d022ce13925573d6c18f2666927fef79672c1abc1aff729 ;;
+            *) exit 1 ;;
+          esac
+          mkdir "$RUNNER_TEMP/devin-real"
+          curl --fail --location --silent --show-error --retry 3 "https://static.devin.ai/cli/$DEVIN_TEST_VERSION/devin-$DEVIN_TEST_VERSION-$platform.tar.gz" -o "$RUNNER_TEMP/devin-real/archive.tar.gz"
+          echo "$sha  $RUNNER_TEMP/devin-real/archive.tar.gz" | shasum -a 256 --check
+          tar -xzf "$RUNNER_TEMP/devin-real/archive.tar.gz" -C "$RUNNER_TEMP/devin-real"
+          devin_exe="$(find "$RUNNER_TEMP/devin-real" -type f -name devin)"
+          "$devin_exe" version | grep -F "devin $DEVIN_TEST_VERSION ("
+          echo "DEVIN_TEST_EXE=$devin_exe" >> "$GITHUB_ENV"
+          node scripts/check-devin-mcp.ts "$devin_exe"
+      - name: Authenticated native DSH Teams (macOS)
+        if: runner.os == 'macOS'
+        env:
+          WINDSURF_API_KEY: ${{ secrets.DEVIN_CLI_TOKEN }}
+          DEVIN_TEST_MODEL: swe-2-high
+          DEVIN_LIVE_TRACE_DIR: ${{ runner.temp }}/devin-live-diagnostics
+        run: node scripts/check-devin-live.ts "$DEVIN_TEST_EXE"
+      - name: Authenticated native DSH Teams (ordinary Windows user)
+        if: runner.os == 'Windows'
+        env:
+          WINDSURF_API_KEY: ${{ secrets.DEVIN_CLI_TOKEN }}
+          DEVIN_TEST_MODEL: swe-2-high
+          DEVIN_LIVE_TRACE_DIR: ${{ runner.temp }}\devin-live-diagnostics
+        shell: pwsh
+        run: ./scripts/run-windows-user-ci.ps1 -Live
+      - name: Upload safe Devin live diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: devin-live-diagnostics-${{ runner.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/devin-live-diagnostics/real-devin-live-*.jsonl
+          if-no-files-found: warn
+          retention-days: 7
+      # Only the bounded, sanitized JSONL trace is uploaded. Runner timeouts can
+      # terminate the job before this always() step gets a chance to run.

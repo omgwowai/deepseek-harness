@@ -1,27 +1,23 @@
 /**
  * The plugin body: one `file` provider registered into `ctx.resources` for the
- * fiber's lifetime, reading through `ctx.remote` and resolving addresses
- * authorizing absolute addresses through the current `ctx.sessions` entry.
+ * fiber's lifetime, reading through `ctx.remote` in the Session each address names.
  */
 import { Context } from '@deepseek-ai/cordis'
 import type { ResourceProvider } from '@deepseek-ai/dsh-client-resources/client'
-import { absoluteFileAddress, sessionFileAddress } from '@deepseek-ai/dsh-util-workspace-path'
+import { sessionFileAddress } from '@deepseek-ai/dsh-util-workspace-path'
 import { describe, expect, it, onTestFinished } from 'vitest'
 import { apply, inject } from '../src/client/index.ts'
-import { FakeRemote, settle } from './fake-remote.client.ts'
+import { FakeRemote } from './fake-remote.client.ts'
 
 describe('workspace-files client apply', () => {
-  it('registers the file provider over ctx.remote and ctx.sessions, and unregisters it with the fiber', async () => {
+  it('registers the file provider over ctx.remote, and unregisters it with the fiber', async () => {
     const ctx = new Context()
     const remote = new FakeRemote()
+    remote.autoReady = false
     const controller = new AbortController()
     const pulls: Array<Promise<unknown>> = []
     ctx.provide('remote', remote as never)
     ctx.provide('remote.workspaceFiles', remote.workspaceFiles as never)
-    // No Session summary or cwd is available; only absolute addresses need current.
-    ctx.provide('sessions', {
-      list: { getSnapshot: () => ({ byId: {}, current: 's1' }) },
-    } as never)
     const registered: Array<ResourceProvider<'file'>> = []
     let released = 0
     ctx.provide('resources', {
@@ -39,23 +35,31 @@ describe('workspace-files client apply', () => {
     const fiber = ctx.plugin({ inject: [...inject], apply })
     onTestFinished(async () => {
       await fiber.dispose()
+      await remote.dispose()
       await Promise.all(pulls)
     })
     await fiber.await()
 
     expect(registered.map(provider => provider.protocol)).toEqual(['file'])
     const signal = controller.signal
-    // A session address reaches the Host as its relative path; an absolute one
-    // is read through the current Session with its absolute path.
+    // A session address reaches the Host with its relative or absolute path.
     pulls.push(registered[0]!.open(sessionFileAddress('s1', 'a.txt'), { signal })[Symbol.asyncIterator]().next())
-    pulls.push(registered[0]!.open(absoluteFileAddress('/etc/hosts'), { signal })[Symbol.asyncIterator]().next())
-    await settle()
+    pulls.push(registered[0]!.open(sessionFileAddress('s1', '/etc/hosts'), { signal })[Symbol.asyncIterator]().next())
+    await Promise.all([remote.waitForChanges(0), remote.waitForChanges(1)])
+    expect(remote.opened.map(watch => [watch.sessionId, watch.path])).toEqual([['s1', 'a.txt'], ['s1', '/etc/hosts']])
+    expect(remote.stats).toEqual([])
+    await remote.ready(0)
+    await remote.waitForStat(0)
+    expect(remote.stats.map(pending => [pending.sessionId, pending.path])).toEqual([['s1', 'a.txt']])
+    await remote.ready(1)
+    await remote.waitForStat(1)
     expect(remote.stats.map(pending => [pending.sessionId, pending.path])).toEqual([['s1', 'a.txt'], ['s1', '/etc/hosts']])
-    expect(remote.opened).toHaveLength(1)
+    expect(remote.opened).toHaveLength(2)
 
     await fiber.dispose()
     await Promise.all(pulls)
     expect(released).toBe(1)
-    expect(remote.opened[0]!.source.aborted).toBe(true)
+    expect(remote.opened.map(watch => watch.source.aborted)).toEqual([true, true])
+    expect(remote.disposed).toHaveLength(2)
   })
 })

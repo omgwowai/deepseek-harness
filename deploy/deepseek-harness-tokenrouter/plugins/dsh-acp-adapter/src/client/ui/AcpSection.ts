@@ -1,0 +1,1113 @@
+import { catalogIdOf } from '../../contract/agent-config.ts'
+/**
+ * The ACP plugin detail panel component tree.
+ *
+ * Thin presentation only: every decision (validation, parsing, health/login
+ * derivation, CRUD semantics) lives in logic.ts, and every side effect
+ * (settings writes, dshAcp Remote calls) in controller.ts. Components
+ * receive the `t`/`useStore`/`panel` inject face and keep only interactive
+ * state (open editor, staged draft text, delete confirmation, busy flags) —
+ * the ModelsSection/CustomProviderCard precedent. : state rides the
+ * entry's store seat (`useStore` over AcpPanelSnapshot; the PropsStore
+ * `actions` share is the glue-only write set, unused here); the wire
+ * callbacks arrive as the `panel` member so the reserved PropsStore `actions`
+ * seat is never shadowed. Written with createElement because the frozen
+ * tsconfig has no `jsx` option (see react.d.ts); classes come from
+ * AcpSection.module.css ( CSS Modules).
+ * @module @local/dsh-acp-adapter/client/AcpSection
+ */
+
+import { createElement as h, Fragment, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
+import {
+  Button,
+  Input,
+  IconChevronDownOutlineMedium,
+  IconPlusOutlineMedium,
+  IconRefreshOutlineMedium,
+  Menu,
+  Tag,
+} from '@deepseek-ai/dsh-client-ui-primitives'
+import {
+  agentLoginHint,
+  draftFromAgent,
+  draftFromCatalogEntry,
+  dropMaskedEnvKey,
+  emptyDraft,
+  errorMessageOf,
+  healthRowOf,
+  sortedAgentIds,
+  validateAgentDraft,
+} from '../data/logic.ts'
+import { localizedDiagnostic } from '../data/diagnostics.ts'
+import { ACP_CATALOG_ENTRIES, catalogEntryOf, type AcpCatalogEntry } from '../data/catalog.ts'
+import type { AcpAgentConfig, AcpProviderHealth, AgentDraft, DraftError } from '../data/logic.ts'
+import type { AcpLocaleKey } from './locales.ts'
+import type { AcpPanelSnapshot, HealthState } from '../data/stores/panel-store.ts'
+import css from './AcpSection.module.css'
+
+/** The section's translate seat (slot renderer binds it from the entry's `locale` declaration). */
+export type AcpTranslate = (key: AcpLocaleKey, params?: Record<string, string | number>) => string
+
+/** The framework-synthesized selector hook over the entry's store (PropsStore share). */
+export type UsePanelStore = <S>(selector: (snapshot: AcpPanelSnapshot) => S, equal?: (a: S, b: S) => boolean) => S
+
+/** The controller wire handed to the section (bound in apply; plain callbacks). */
+export interface AcpSectionWire {
+  /** recheck = true 即「重新检查」（收尾：丢弃 probe 缓存并重探）；省略 = 只读缓存视图。 */
+  refreshHealth(recheck?: boolean): void
+  refreshAgentHealth(agentId: string): void
+  saveAgent(editingId: string | undefined, draft: AgentDraft): Promise<string | undefined>
+  deleteAgent(id: string): Promise<string | undefined>
+  notifyOutcome?(outcome: 'saved' | 'save-failed' | 'deleted' | 'delete-failed'): void
+  setToolApprovalDefault(policy: 'auto' | 'ask'): Promise<string | undefined>
+  /**
+   * 删除确认提示：该 profile 的既有会话 binding 计数；undefined = 计数不可
+   * 得（RPC 失败/畸形），确认块退回无计数的基础文案（不冒充 0）。
+   */
+  countBoundSessions(id: string): Promise<number | undefined>
+}
+
+/** Injected props of the section; Partial because the renderer erases the share boundary. */
+export interface AcpSectionProps {
+  t?: AcpTranslate | undefined
+  useStore?: UsePanelStore | undefined
+  panel?: AcpSectionWire | undefined
+}
+
+/** Which editor card is open; the add flow carries its seed draft (empty or a one-click template). */
+type EditorState = { readonly key: number } & ({ mode: 'add'; seed: AgentDraft } | { mode: 'edit'; id: string })
+
+/** The change events our inputs care about (the attribute bag types handlers loosely; see react.d.ts). */
+interface InputEvent {
+  target: { value: string }
+}
+/**
+ * Render the ACP section content column.
+ * @param props - slot-delivered inject face.
+ * @returns the section, or null while the shell has not injected yet (ModelsSection precedent).
+ */
+export function AcpSection(props: AcpSectionProps): ReactNode {
+  const { t, useStore, panel } = props
+  if (t === undefined || useStore === undefined || panel === undefined) return null
+  return h(Loaded, { t, useStore, panel })
+}
+
+interface CatalogAnchorProps {
+  open: boolean
+  disabled: boolean
+  menuId: string
+  className: string
+  probeClassName: string
+  icon: ReactNode
+  label: string
+  onToggle(): void
+  onMeasure(rect: DOMRect, side: 'bottom' | 'top', sideChanged: boolean): void
+  onClear(): void
+}
+
+/**
+ * Owns only the catalog anchor's measurement lifecycle. The actual menu stays
+ * the native Menu primitive; this Fragment adds a zero-layout probe so the
+ * resolved frame overlay token, rather than a copied host formula, drives its
+ * available height.
+ */
+function CatalogAnchor({
+  open,
+  disabled,
+  menuId,
+  className,
+  probeClassName,
+  icon,
+  label,
+  onToggle,
+  onMeasure,
+  onClear,
+}: CatalogAnchorProps): ReactNode {
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const probeRef = useRef<HTMLDivElement | null>(null)
+  const lastSide = useRef<'bottom' | 'top' | null>(null)
+
+  useLayoutEffect(() => {
+    if (!open) return
+    const button = buttonRef.current
+    const probe = probeRef.current
+    if (button === null || probe === null) return
+
+    let eventFrame: number | undefined
+    let animationFrame: number | undefined
+    let stopped = false
+    let lastWidth = ''
+    let lastHeight = ''
+    let lastList: HTMLElement | null = null
+    const measure = (): void => {
+      const rect = button.getBoundingClientRect()
+      const resolvedOverlayTop = Number.parseFloat(getComputedStyle(probe).height)
+      const overlayTop = Number.isFinite(resolvedOverlayTop) ? resolvedOverlayTop : 12
+      const below = Math.max(0, window.innerHeight - rect.bottom - 16)
+      const above = Math.max(0, rect.top - overlayTop - 4)
+      // Equal space keeps the menu below the anchor, matching native placement.
+      const side = below >= above ? 'bottom' : 'top'
+      const width = `${rect.width}px`
+      const height = `${side === 'bottom' ? below : above}px`
+      if (lastList !== null && !lastList.isConnected) lastList = null
+      const list = lastList ?? (document.getElementsByClassName(menuId).item(0) as HTMLElement | null)
+      if (list !== null) {
+        if (list !== lastList) {
+          lastWidth = ''
+          lastHeight = ''
+          lastList = list
+        }
+        if (width !== lastWidth) {
+          if (list.style.getPropertyValue('--acp-catalog-menu-width') !== width)
+            list.style.setProperty('--acp-catalog-menu-width', width)
+          lastWidth = width
+        }
+        if (height !== lastHeight) {
+          if (list.style.getPropertyValue('--acp-catalog-menu-max-height') !== height)
+            list.style.setProperty('--acp-catalog-menu-max-height', height)
+          lastHeight = height
+        }
+      }
+      const sideChanged = lastSide.current !== side
+      if (sideChanged) lastSide.current = side
+      onMeasure(rect, side, sideChanged)
+    }
+    const schedule = (): void => {
+      if (eventFrame === undefined)
+        eventFrame = window.requestAnimationFrame(() => {
+          eventFrame = undefined
+          measure()
+        })
+    }
+    const tick = (): void => {
+      if (stopped) return
+      measure()
+      animationFrame = window.requestAnimationFrame(tick)
+    }
+
+    // The child layout effect runs before Menu's placement effect. Seed its
+    // portal sizing and anchor rect synchronously for the first open frame.
+    measure()
+    animationFrame = window.requestAnimationFrame(tick)
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(schedule)
+    observer?.observe(button)
+    observer?.observe(probe)
+    window.addEventListener('scroll', schedule, true)
+    window.addEventListener('resize', schedule)
+    return () => {
+      stopped = true
+      if (eventFrame !== undefined) window.cancelAnimationFrame(eventFrame)
+      if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame)
+      observer?.disconnect()
+      window.removeEventListener('scroll', schedule, true)
+      window.removeEventListener('resize', schedule)
+      onClear()
+    }
+  }, [menuId, onClear, onMeasure, open])
+
+  return h(
+    Fragment,
+    null,
+    h('div', { ref: probeRef, className: probeClassName, 'aria-hidden': true }),
+    h(
+      'button',
+      {
+        type: 'button',
+        className,
+        ref: buttonRef,
+        disabled,
+        'aria-haspopup': 'menu',
+        'aria-expanded': open,
+        onClick: onToggle,
+      },
+      icon,
+      label,
+    ),
+  )
+}
+
+function Loaded({
+  t,
+  useStore,
+  panel,
+}: {
+  t: AcpTranslate
+  useStore: UsePanelStore
+  panel: AcpSectionWire
+}): ReactNode {
+  const snapshot = useStore((value) => value)
+  const [editor, setEditor] = useState<EditorState | null>(null)
+  const editorKey = useRef(0)
+  const [approvalSaving, setApprovalSaving] = useState(false)
+  const [approvalSaveFailed, setApprovalSaveFailed] = useState(false)
+  const [approvalMenuOpen, setApprovalMenuOpen] = useState(false)
+  // Delegate placement, scrolling, focus and keyboard interaction to the native Menu.
+  const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const [addMenuSide, setAddMenuSide] = useState<'bottom' | 'top'>('bottom')
+  const addAnchorRect = useRef<DOMRect | null>(null)
+  const catalogMenuId = `acp-catalog-${useId().replaceAll(':', '')}`
+  const getCatalogAnchorRect = useCallback((): DOMRect | null => addAnchorRect.current, [])
+  const onCatalogMeasure = useCallback((rect: DOMRect, side: 'bottom' | 'top', sideChanged: boolean): void => {
+    addAnchorRect.current = rect
+    if (sideChanged) setAddMenuSide(side)
+  }, [])
+  const clearCatalogAnchor = useCallback((): void => {
+    addAnchorRect.current = null
+  }, [])
+  // Opening the panel reads saved health facts; only an explicit recheck probes.
+  useEffect(() => {
+    panel.refreshHealth()
+  }, [panel])
+
+  const closeEditor = (key: number, changed: boolean): void => {
+    setEditor((previous) => (previous?.key === key ? null : previous))
+    if (changed) panel.notifyOutcome?.('saved')
+  }
+  const openAdd = (seed: AgentDraft): void => {
+    setEditor({ key: ++editorKey.current, mode: 'add', seed })
+  }
+  const openEdit = (id: string): void => {
+    if (editor?.mode === 'edit' && editor.id === id) setEditor(null)
+    else setEditor({ key: ++editorKey.current, mode: 'edit', id })
+  }
+  const onDeleted = (id: string): void => {
+    // Only the deleted row's own editor closes; an unrelated add/edit draft survives.
+    setEditor((previous) => (previous?.mode === 'edit' && previous.id === id ? null : previous))
+    panel.notifyOutcome?.('deleted')
+  }
+  // singleton 冲突的「打开已有配置」出口：关掉当前草稿，改开已有 profile 的编辑器
+  const openExisting = (id: string): void => {
+    setEditor({ key: ++editorKey.current, mode: 'edit', id })
+  }
+
+  const settings = snapshot.settings
+  const children: ReactNode[] = []
+
+  if (settings.status !== 'ready') {
+    const key =
+      settings.status === 'loading'
+        ? 'settingsLoading'
+        : settings.status === 'unavailable'
+          ? 'settingsUnavailable'
+          : 'settingsInvalid'
+    const cls = settings.status === 'invalid' ? css.error : css.hint
+    children.push(h('p', { key: 'status', className: cls }, t(key)))
+    return h('div', { className: css.section, 'data-dsh-acp-panel': '' }, children)
+  }
+
+  const readOnly = !settings.writable
+  const agents = settings.agents
+  const ids = sortedAgentIds(agents)
+  children.push(h('h2', { key: 'agents-title', className: css.sectionTitle }, t('agentConfiguration')))
+
+  const onApprovalDefaultChange = async (policy: unknown): Promise<void> => {
+    if (policy !== 'auto' && policy !== 'ask') return
+    setApprovalSaving(true)
+    setApprovalSaveFailed(false)
+    try {
+      if ((await panel.setToolApprovalDefault(policy)) !== undefined) setApprovalSaveFailed(true)
+    } catch {
+      setApprovalSaveFailed(true)
+    } finally {
+      setApprovalSaving(false)
+    }
+  }
+
+  if (readOnly) children.push(h('p', { key: 'ro', className: css.notice }, t('readOnly')))
+  if (snapshot.health.status === 'unreachable') {
+    children.push(h('p', { key: 'unreachable', className: css.notice }, t('healthUnreachable')))
+    if (snapshot.health.message !== undefined) {
+      children.push(
+        h(
+          'p',
+          { key: 'unreachable-detail', className: css.hint },
+          localizedDiagnostic(t, 'healthCheckTransportFailed', snapshot.health.message),
+        ),
+      )
+    }
+  }
+  const refreshing = snapshot.health.status === 'loading'
+  const checkingAnyAgent = snapshot.health.checkingAgentIds.length > 0
+
+  if (ids.length === 0 && editor?.mode !== 'add') {
+    children.push(h('p', { key: 'empty', className: css.hint }, t('emptyAgents')))
+  }
+
+  if (ids.length > 0) {
+    children.push(
+      h(
+        'ul',
+        { key: 'rows', className: css.rows },
+        ids.map((id) => {
+          const config = agents[id] as AcpAgentConfig
+          const editing = editor?.mode === 'edit' && editor.id === id
+          return h(AgentCard, {
+            key: id,
+            t,
+            id,
+            config,
+            health: snapshot.health,
+            readOnly,
+            editing,
+            agents,
+            panel,
+            editorKey: editor?.mode === 'edit' && editor.id === id ? editor.key : -1,
+            onEdit: () => {
+              openEdit(id)
+            },
+            onDeleted,
+            onCloseEditor: (changed) => closeEditor(editor?.key ?? -1, changed),
+            onOpenAgent: openExisting,
+          })
+        }),
+      ),
+    )
+  }
+
+  if (editor?.mode === 'add') {
+    children.push(
+      h(
+        'div',
+        { key: 'add', className: css.rowCard },
+        h(AgentForm, {
+          key: `add-form-${editor.key}`,
+          t,
+          initial: editor.seed,
+          editingId: undefined,
+          agents,
+          readOnly,
+          panel,
+          editorKey: editor.key,
+          onClose: closeEditor,
+          onOpenAgent: openExisting,
+        }),
+      ),
+    )
+  }
+
+  // Match the native Models settings footer: two equal-width dashed entry
+  // points below the rows. The template chooser itself is the host Menu
+  // primitive, so its surface and interaction stay native across themes.
+  const customAgentItemId = 'custom'
+  const verified = ACP_CATALOG_ENTRIES.filter((entry) => entry.verification === 'adapter-tested')
+  const unverified = ACP_CATALOG_ENTRIES.filter((entry) => entry.verification === 'unverified')
+  const catalogItem = (entry: AcpCatalogEntry) => ({
+    id: entry.id,
+    label: h(
+      'span',
+      { className: css.catalogEntry, title: entry.name },
+      h('span', { className: css.catalogName }, entry.name),
+      entry.version === undefined ? null : h('span', { className: css.catalogVersion }, ` · ${entry.version}`),
+    ),
+  })
+  children.push(
+    h(
+      'div',
+      { key: 'actions', className: css.addActions },
+      h(Menu, {
+        open: addMenuOpen,
+        portal: true,
+        dense: true,
+        autoFocus: true,
+        className: css.addMenu ?? '',
+        listClassName: `${css.catalogMenu ?? ''} ${catalogMenuId}`,
+        side: addMenuSide,
+        getAnchorRect: getCatalogAnchorRect,
+        items: [
+          ...(verified.length === 0
+            ? []
+            : [
+                {
+                  type: 'label' as const,
+                  id: 'verified-label',
+                  text: t('catalogVerified', { count: verified.length }),
+                },
+              ]),
+          ...verified.map(catalogItem),
+          ...(verified.length === 0 || unverified.length === 0
+            ? []
+            : [{ type: 'separator' as const, id: 'verification-divider' }]),
+          ...(unverified.length === 0
+            ? []
+            : [
+                {
+                  type: 'label' as const,
+                  id: 'unverified-label',
+                  text: t('catalogUnverified', { count: unverified.length }),
+                },
+              ]),
+          ...unverified.map(catalogItem),
+        ],
+        footer: [
+          { type: 'label', id: 'verification-scope', text: t('catalogVerificationScope') },
+          { id: customAgentItemId, label: h('span', { className: css.catalogEntry }, t('addCustom')) },
+        ],
+        onClose: () => {
+          setAddMenuOpen(false)
+        },
+        onSelect: (id: string) => {
+          setAddMenuOpen(false)
+          if (id === customAgentItemId) {
+            openAdd(emptyDraft())
+            return
+          }
+          const seed = draftFromCatalogEntry(id)
+          if (seed !== undefined) openAdd(seed)
+        },
+        anchor: h(CatalogAnchor, {
+          open: addMenuOpen,
+          disabled: readOnly,
+          menuId: catalogMenuId,
+          className: css.addButton ?? '',
+          probeClassName: css.catalogGeometryProbe ?? '',
+          icon: h(IconPlusOutlineMedium, { size: 14 }),
+          label: t('addAgent'),
+          onToggle: () => setAddMenuOpen((previous) => !previous),
+          onMeasure: onCatalogMeasure,
+          onClear: clearCatalogAnchor,
+        }),
+      }),
+      h(
+        'button',
+        {
+          type: 'button',
+          className: css.addButton,
+          disabled: refreshing || checkingAnyAgent,
+          onClick: () => {
+            panel.refreshHealth(true)
+          },
+        },
+        h(IconRefreshOutlineMedium, { size: 14 }),
+        t(refreshing ? 'refreshing' : 'refresh'),
+      ),
+    ),
+  )
+
+  children.push(
+    h(
+      'section',
+      { key: 'tool-approval', className: css.preferences, 'aria-labelledby': 'dsh-acp-approval-title' },
+      h('h2', { id: 'dsh-acp-approval-title', className: css.preferencesTitle }, t('toolApprovalDefault')),
+      h('p', { className: css.hint }, t('toolApprovalDefaultHelp')),
+      h(Menu, {
+        open: approvalMenuOpen,
+        portal: true,
+        dense: true,
+        autoFocus: true,
+        side: 'bottom',
+        align: 'start',
+        selectedId: settings.toolApprovalDefault,
+        items: [
+          { id: 'auto', label: h('span', { className: css.catalogEntry }, t('toolApprovalAuto')) },
+          { id: 'ask', label: h('span', { className: css.catalogEntry }, t('toolApprovalAsk')) },
+        ],
+        onClose: () => setApprovalMenuOpen(false),
+        onSelect: (id: string) => {
+          setApprovalMenuOpen(false)
+          void onApprovalDefaultChange(id)
+        },
+        anchor: h(
+          'button',
+          {
+            type: 'button',
+            className: css.approvalButton,
+            disabled: readOnly || approvalSaving,
+            'aria-label': t('toolApprovalDefault'),
+            'aria-haspopup': 'menu',
+            'aria-expanded': approvalMenuOpen,
+            onClick: () => setApprovalMenuOpen((value) => !value),
+          },
+          t(settings.toolApprovalDefault === 'auto' ? 'toolApprovalAuto' : 'toolApprovalAsk'),
+          h(IconChevronDownOutlineMedium, null),
+        ),
+      }),
+      approvalSaveFailed ? h('p', { className: css.error, role: 'alert' }, t('toolApprovalSaveFailed')) : null,
+    ),
+  )
+
+  return h('div', { className: css.section, 'data-dsh-acp-panel': '' }, children)
+}
+
+/** 一个已配置 Agent：默认只展示名称、可操作状态和管理动作。 */
+function AgentCard(props: {
+  t: AcpTranslate
+  id: string
+  config: AcpAgentConfig
+  health: HealthState
+  readOnly: boolean
+  editing: boolean
+  agents: Record<string, AcpAgentConfig>
+  panel: AcpSectionWire
+  onEdit(): void
+  onDeleted(id: string): void
+  editorKey: number
+  onCloseEditor(changed: boolean): void
+  onOpenAgent(id: string): void
+}): ReactNode {
+  const { t, id, config, panel } = props
+  const [confirming, setConfirming] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [failure, setFailure] = useState<string | undefined>(undefined)
+  // 删除确认的绑定计数（确认块打开时现取；undefined = 不可得，不冒充 0）
+  const [boundCount, setBoundCount] = useState<number | undefined>(undefined)
+  const boundCountGeneration = useRef(0)
+  useEffect(
+    () => () => {
+      boundCountGeneration.current += 1
+    },
+    [],
+  )
+  const checking = props.health.status === 'loading' || props.health.checkingAgentIds.includes(id)
+  const checkError = props.health.agentErrors[id]
+  const confirmDelete = (): void => {
+    setDeleting(true)
+    setFailure(undefined)
+    void panel
+      .deleteAgent(id)
+      .then((message) => {
+        if (message !== undefined) {
+          panel.notifyOutcome?.('delete-failed')
+          setFailure(localizedDiagnostic(t, 'actionDeleteFailed', message))
+          return
+        }
+        props.onDeleted(id)
+      })
+      .catch((error: unknown) => {
+        panel.notifyOutcome?.('delete-failed')
+        setFailure(localizedDiagnostic(t, 'actionDeleteFailed', errorMessageOf(error)))
+      })
+      .finally(() => {
+        setDeleting(false)
+      })
+  }
+
+  const healthRow = healthRowOf(props.health.rows, id)
+  const state = healthRow?.state
+  const statusText = state === undefined ? t('stateSavedUnverified') : stateText(t, state)
+  const statusTone = state === 'ready' ? 'success' : 'neutral'
+  const diagnostic = healthDiagnostic(t, config.command, healthRow, checkError)
+
+  const children: ReactNode[] = [
+    h(
+      'div',
+      { key: 'head', className: css.rowHead },
+      h(
+        'span',
+        { className: css.rowIdentity },
+        h('span', { className: css.rowName }, config.name),
+        h(Tag, { tone: statusTone }, statusText),
+      ),
+      h(
+        'span',
+        { className: css.rowActions },
+        h(
+          Button,
+          {
+            variant: 'outline',
+            size: 'sm',
+            disabled: checking,
+            onClick: () => {
+              panel.refreshAgentHealth(id)
+            },
+          },
+          t(checking ? 'refreshing' : 'refresh'),
+        ),
+        h(
+          Button,
+          {
+            variant: 'outline',
+            size: 'sm',
+            onClick: props.onEdit,
+          },
+          t('edit'),
+        ),
+        h(
+          Button,
+          {
+            variant: 'ghost',
+            size: 'sm',
+            className: css.dangerButton,
+            disabled: props.readOnly || deleting,
+            onClick: () => {
+              setFailure(undefined)
+              setBoundCount(undefined)
+              setConfirming(true)
+              // 进入确认块时现取绑定计数（点击时刻的新鲜事实，不用缓存健康视图）
+              const generation = ++boundCountGeneration.current
+              void panel
+                .countBoundSessions(id)
+                .then((count) => {
+                  if (boundCountGeneration.current === generation) setBoundCount(count)
+                })
+                .catch(() => {
+                  if (boundCountGeneration.current === generation) setBoundCount(undefined)
+                })
+            },
+          },
+          t('remove'),
+        ),
+      ),
+    ),
+  ]
+
+  if (healthRow?.probe.status === 'ok' && healthRow.probe.versionCompatibility === 'different') {
+    const reference = catalogEntryOf(catalogIdOf(id, config))?.version
+    children.push(
+      h(
+        'p',
+        { key: 'version-reference', className: css.hint },
+        t('catalogVersionDifferent', {
+          actual: healthRow.probe.agentInfo?.version ?? healthRow.version ?? '—',
+          reference: reference ?? '—',
+        }),
+      ),
+    )
+  }
+  if (diagnostic !== undefined) {
+    children.push(h('p', { key: 'diagnostic', className: css.error, role: 'alert' }, diagnostic))
+  }
+  if (state === 'auth-required') {
+    const hint = agentLoginHint(id, config)
+    children.push(
+      h(
+        'p',
+        { key: 'login-hint', className: css.hint },
+        hint === undefined ? t('loginGenericInstruction') : t('loginInstruction', { hint }),
+      ),
+    )
+  }
+  if (state === 'incompatible') {
+    children.push(h('p', { key: 'incompatible-hint', className: css.hint }, t('incompatibleInstruction')))
+  }
+
+  if (confirming) {
+    children.push(
+      h(
+        'div',
+        { key: 'delete', className: css.deleteBlock },
+        h('p', { className: css.deleteText }, t('removeConfirm', { name: config.name })),
+        // 预告：计数 > 0 时明示后果——这些会话将显示 backend-unavailable，
+        // 不会静默改用其他 profile（countBoundSessions 不可得不渲染本行，不冒充 0）
+        boundCount === undefined || boundCount === 0
+          ? null
+          : h('p', { className: css.deleteText }, t('removeConfirmBound', { count: boundCount })),
+        failure === undefined ? null : h('p', { className: css.error }, failure),
+        h(
+          Button,
+          {
+            variant: 'ghost',
+            className: css.dangerButton,
+            disabled: deleting,
+            onClick: confirmDelete,
+          },
+          t(deleting ? 'removing' : 'remove'),
+        ),
+        h(
+          Button,
+          {
+            variant: 'outline',
+            disabled: deleting,
+            onClick: () => {
+              boundCountGeneration.current += 1
+              setConfirming(false)
+            },
+          },
+          t('cancel'),
+        ),
+      ),
+    )
+  }
+
+  if (props.editing) {
+    children.push(
+      h(AgentForm, {
+        key: `edit-${id}-${props.editorKey}`,
+        t,
+        initial: draftFromAgent(id, config),
+        editingId: id,
+        agents: props.agents,
+        readOnly: props.readOnly,
+        panel,
+        editorKey: props.editorKey,
+        onClose: (_key, changed) => props.onCloseEditor(changed),
+        onOpenAgent: props.onOpenAgent,
+      }),
+    )
+  }
+
+  return h('li', { className: css.rowCard, 'data-dsh-acp-agent': props.id }, children)
+}
+
+/** Localize product-owned probe failures from stable facts; never render host prose verbatim. */
+function healthDiagnostic(
+  t: AcpTranslate,
+  command: string,
+  health: AcpProviderHealth | undefined,
+  transportError?: string | undefined,
+): string | undefined {
+  if (transportError !== undefined) {
+    return localizedDiagnostic(t, 'healthCheckTransportFailed', transportError)
+  }
+  if (health?.probe.status !== 'error') return undefined
+  const key: AcpLocaleKey =
+    health.probe.failureKind === 'spawn-failure'
+      ? 'probeNotInstalled'
+      : health.probe.failureKind === 'auth_required'
+        ? 'probeAuthRequired'
+        : health.probe.failureKind === 'resource-exhausted'
+          ? 'probeResourceExhausted'
+          : health.probe.failureKind === 'timeout'
+            ? 'probeTimeout'
+            : health.probe.failureKind === 'crash'
+              ? 'probeCrash'
+              : health.probe.failureKind === 'aborted'
+                ? 'probeCancelled'
+                : 'probeProtocolError'
+  return localizedDiagnostic(t, key, health.probe.message, { command })
+}
+
+/**
+ * 产品状态只承诺“未探测 / 协议可用”。失败类别仍通过下方诊断和登录
+ * 指引展示，但不会伪装成可持续跟踪的外部登录状态。
+ */
+function stateText(t: AcpTranslate, state: AcpProviderHealth['state']): string {
+  return t(state === 'ready' ? 'stateReady' : 'stateSavedUnverified')
+}
+
+/** The add/edit editor card: staged text fields validated live, saved through the controller. */
+function AgentForm(props: {
+  t: AcpTranslate
+  initial: AgentDraft
+  editingId: string | undefined
+  agents: Record<string, AcpAgentConfig>
+  readOnly: boolean
+  panel: AcpSectionWire
+  editorKey: number
+  onClose(key: number, changed: boolean): void
+  /** singleton 冲突的出口：打开占用该 runtime 的已有 profile 的编辑器。 */
+  onOpenAgent(id: string): void
+}): ReactNode {
+  const { t } = props
+  const [draft, setDraft] = useState<AgentDraft>(() => props.initial)
+  const [busy, setBusy] = useState(false)
+  const [attempted, setAttempted] = useState(false)
+  const [failure, setFailure] = useState<string | undefined>(undefined)
+  // Built-in templates work with their tested defaults. Keep implementation
+  // details out of the common path, while manual profiles open the same fields
+  // immediately because command and route identity are required there.
+  const [advancedOpen, setAdvancedOpen] = useState(() => props.initial.runtime === undefined)
+  const [optionsOpen, setOptionsOpen] = useState(false)
+  const disabled = props.readOnly || busy
+  const validation = validateAgentDraft(draft, props.agents, props.editingId)
+  const scope = props.editingId ?? 'new'
+
+  const edit = (patch: Partial<AgentDraft>): void => {
+    setDraft((previous) => ({ ...previous, ...patch }))
+    setFailure(undefined)
+  }
+  const save = (): void => {
+    setAttempted(true)
+    if (validation.config === undefined) return
+    setBusy(true)
+    setFailure(undefined)
+    void props.panel
+      .saveAgent(props.editingId, draft)
+      .then((message) => {
+        if (message !== undefined) {
+          props.panel.notifyOutcome?.('save-failed')
+          setFailure(localizedDiagnostic(t, 'actionSaveFailed', message))
+          return
+        }
+        props.onClose(props.editorKey, true)
+      })
+      .catch((error: unknown) => {
+        props.panel.notifyOutcome?.('save-failed')
+        setFailure(localizedDiagnostic(t, 'actionSaveFailed', errorMessageOf(error)))
+      })
+      .finally(() => {
+        setBusy(false)
+      })
+  }
+
+  // Required-field errors stay quiet over a pristine empty field until the
+  // first save attempt; format/uniqueness errors answer actual input at once
+  // (the CustomProviderCard route-field precedent).
+  const shown = (error: DraftError | undefined, value: string): DraftError | undefined =>
+    error !== undefined && (attempted || value.trim() !== '') ? error : undefined
+
+  // catalog 播种条目的安装指引（来自 registry 分发事实；纯展示，不自动安装）
+  const seededEntry = props.editingId === undefined ? catalogEntryOf(draft.catalogId ?? draft.id) : undefined
+  const loginHint = agentLoginHint(draft.id, draft)
+  const envCount =
+    draft.envText.split('\n').filter((line) => line.trim()).length + Object.keys(draft.maskedEnv ?? {}).length
+
+  return h(
+    'div',
+    { className: css.editor },
+    h(
+      'div',
+      { className: css.editorHeader },
+      h(
+        'span',
+        { className: css.editorTitle },
+        t(props.editingId === undefined ? 'editorTitleAdd' : 'editorTitleEdit'),
+      ),
+    ),
+    props.editingId === undefined && seededEntry !== undefined
+      ? h('p', { key: 'install-hint', className: css.hint }, t('catalogInstallHint', { hint: seededEntry.installHint }))
+      : null,
+    seededEntry?.requiresCommand ? h('p', { className: css.hint }, t('catalogManualCommand')) : null,
+    textField({
+      t,
+      id: `dsh-acp-${scope}-name`,
+      label: t('fieldName'),
+      hint: t('fieldNameHint'),
+      error: shown(validation.name, draft.name),
+      value: draft.name,
+      disabled,
+      placeholder: 'Devin',
+      onChange: (value) => {
+        edit({ name: value })
+      },
+    }),
+    h(
+      'button',
+      {
+        type: 'button',
+        className: css.advancedToggle,
+        'aria-expanded': advancedOpen,
+        onClick: () => {
+          setAdvancedOpen((previous) => !previous)
+        },
+      },
+      h(IconChevronDownOutlineMedium, {
+        size: 14,
+        className: advancedOpen ? `${css.chevron} ${css.chevronFlip}` : css.chevron,
+      }),
+      t('advancedSettings'),
+    ),
+    advancedOpen
+      ? h(
+          'div',
+          { className: css.advancedFields },
+          textField({
+            t,
+            id: `dsh-acp-${scope}-id`,
+            label: t('fieldId'),
+            hint: t('fieldIdHint'),
+            error: shown(validation.id, draft.id),
+            value: draft.id,
+            disabled,
+            placeholder: 'devin',
+            onChange: (value) => {
+              edit({ id: value })
+            },
+          }),
+          textField({
+            t,
+            id: `dsh-acp-${scope}-command`,
+            label: t('fieldCommand'),
+            hint: t('fieldCommandHint'),
+            error: shown(validation.command, draft.command),
+            value: draft.command,
+            disabled,
+            placeholder: 'devin',
+            onChange: (value) => {
+              edit({ command: value })
+            },
+          }),
+          textField({
+            t,
+            id: `dsh-acp-${scope}-args`,
+            label: t('fieldArgs'),
+            hint: t('fieldArgsHint'),
+            value: draft.argsText,
+            disabled,
+            multiline: true,
+            placeholder: 'acp',
+            onChange: (value) => {
+              edit({ argsText: value })
+            },
+          }),
+          h(
+            'p',
+            { className: css.hint },
+            loginHint === undefined ? t('loginGenericInstruction') : t('loginSetupInstruction', { hint: loginHint }),
+          ),
+        )
+      : null,
+    h(
+      'button',
+      {
+        type: 'button',
+        className: css.advancedToggle,
+        'aria-expanded': optionsOpen,
+        onClick: () => {
+          setOptionsOpen((previous) => !previous)
+        },
+      },
+      h(IconChevronDownOutlineMedium, {
+        size: 14,
+        className: optionsOpen ? `${css.chevron} ${css.chevronFlip}` : css.chevron,
+      }),
+      t('advancedOptions'),
+    ),
+    envCount === 0 ? null : h('p', { className: css.hint }, t('advancedOptionsConfigured', { envCount })),
+    optionsOpen
+      ? h(
+          'div',
+          { className: css.advancedFields },
+          h('p', { className: css.hint }, t('advancedOptionsHint')),
+          textField({
+            t,
+            id: `dsh-acp-${scope}-env`,
+            label: t('fieldEnv'),
+            hint: t('fieldEnvHint'),
+            error: validation.env,
+            value: draft.envText,
+            disabled,
+            multiline: true,
+            placeholder: 'NO_COLOR=1',
+            onChange: (value) => {
+              edit({ envText: value })
+            },
+          }),
+          // 疑似 secret 的存量 env 键只展示键名 + 已配置状态，值永不进文本框；
+          // 「移除」从草稿的 maskedEnv 删键（保存后即从 settings 抹去）。
+          draft.maskedEnv === undefined
+            ? null
+            : h(
+                'div',
+                { className: css.field },
+                h('span', { className: css.fieldLabel }, t('fieldEnvMasked')),
+                h(
+                  'ul',
+                  { className: css.maskedEnvRows },
+                  Object.keys(draft.maskedEnv)
+                    .sort()
+                    .map((key) =>
+                      h(
+                        'li',
+                        { key, className: css.maskedEnvRow },
+                        h('code', { className: css.maskedEnvKey }, key),
+                        h('span', { className: css.healthMuted }, t('envMaskedConfigured')),
+                        h(
+                          Button,
+                          {
+                            variant: 'outline',
+                            size: 'sm',
+                            disabled,
+                            onClick: () => {
+                              setDraft((previous) => dropMaskedEnvKey(previous, key))
+                              setFailure(undefined)
+                            },
+                          },
+                          t('envMaskedRemove'),
+                        ),
+                      ),
+                    ),
+                ),
+              ),
+        )
+      : null,
+    // singleton：草稿 runtime 与存量 profile 冲突的块级错误（runtime 不是
+    // 可编辑字段，错误不挂在某个输入框上）——点名已有 profile 并给「打开已有
+    // 配置」出口；保存钮经 validation.config 缺席自然禁用（不自动覆盖/删除）。
+    validation.runtime === undefined
+      ? null
+      : h(
+          'div',
+          { className: css.field },
+          h('p', { className: css.error, role: 'alert' }, t(validation.runtime.key, validation.runtime.params)),
+          h(
+            Button,
+            {
+              variant: 'outline',
+              onClick: () => {
+                props.onOpenAgent(String(validation.runtime?.params?.['id'] ?? ''))
+              },
+            },
+            t('openExisting'),
+          ),
+        ),
+    failure === undefined ? null : h('p', { className: css.error }, failure),
+    h(
+      'div',
+      { className: css.editorActions },
+      h(
+        Button,
+        {
+          variant: 'outline',
+          disabled: busy,
+          onClick: () => {
+            props.onClose(props.editorKey, false)
+          },
+        },
+        t('cancel'),
+      ),
+      h(
+        Button,
+        {
+          variant: 'primary',
+          disabled: disabled || validation.config === undefined,
+          onClick: save,
+        },
+        t(busy ? 'saving' : 'save'),
+      ),
+    ),
+  )
+}
+
+/** One labelled text/textarea control with its hint-or-error line (fields.tsx precedent). */
+function textField(props: {
+  t: AcpTranslate
+  id: string
+  label: string
+  hint: string
+  value: string
+  disabled: boolean
+  onChange(value: string): void
+  error?: DraftError | undefined
+  multiline?: boolean
+  placeholder?: string
+}): ReactNode {
+  const invalid = props.error !== undefined
+  const control =
+    props.multiline === true
+      ? h('textarea', {
+          id: props.id,
+          className: invalid ? `${css.textarea} ${css.textareaInvalid}` : css.textarea,
+          value: props.value,
+          disabled: props.disabled,
+          placeholder: props.placeholder ?? '',
+          rows: 3,
+          ...(invalid ? { 'aria-invalid': true } : {}),
+          onChange: (event: InputEvent) => {
+            props.onChange(event.target.value)
+          },
+        })
+      : h(Input, {
+          id: props.id,
+          className: invalid ? `${css.input} ${css.inputInvalid}` : css.input!,
+          type: 'text',
+          value: props.value,
+          disabled: props.disabled,
+          placeholder: props.placeholder ?? '',
+          ...(invalid ? { 'aria-invalid': true } : {}),
+          onChange: (event: InputEvent) => {
+            props.onChange(event.target.value)
+          },
+        })
+  return h(
+    'div',
+    { className: css.field },
+    h('label', { className: css.fieldLabel, htmlFor: props.id }, props.label),
+    control,
+    h(
+      'p',
+      { className: invalid ? css.error : css.hint },
+      props.error !== undefined ? props.t(props.error.key, props.error.params) : props.hint,
+    ),
+  )
+}

@@ -1,0 +1,108 @@
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 220px;
+  height: 28px;
+  padding: 0 4px 0 8px;
+  border: none;
+  border-radius: var(--dsw-radius-xl);
+  corner-shape: round;
+  outline: none;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.retryTrigger {
+  width: fit-content;
+  max-width: min(320px, calc(100vw - 24px));
+  height: auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.trigger:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.trigger:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+
+.trigger:disabled {
+  color: var(--dsw-alias-label-dimmed);
+  cursor: default;
+}
+
+.triggerLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chevron {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-caption);
+  transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chevron {
+    transition: none;
+  }
+}
+
+.settingRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+}
+.settingName,
+.currentValue {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settingName {
+  flex: 1;
+}
+.currentValue {
+  max-width: 50%;
+  color: var(--dsw-alias-label-caption);
+}
+.settingRow > svg {
+  flex-shrink: 0;
+}
+/* Scope the portal to our own content, preserving native menu styling. */
+.menuList {
+  width: min(348px, 65vw);
+}
+.menuAnchor {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+}
+.choice {
+  display: flex;
+  flex-direction: column;
+  white-space: normal;
+}
+.choiceDescription {
+  font-size: 12px;
+  color: var(--dsw-alias-label-caption);
+}
