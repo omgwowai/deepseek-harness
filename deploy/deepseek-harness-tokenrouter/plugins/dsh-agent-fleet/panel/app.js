@@ -344,12 +344,34 @@ function agentRowHtml(a, o) {
 
 const agentRowModel = (a, o) => ({ sig: agentRowSig(a, o), html: agentRowHtml(a, o) });
 
+/**
+ * The token this page sends as `x-agent-fleet-token` for the credential of its URL fragment, or '' when there is none
+ * or the hub refused it. The caller keeps it in memory only (never sessionStorage/localStorage, where a same-origin
+ * script could read it) and scrubs the address bar.
+ *   #token=…  manual entry: used as is, and exchanged for the hub's HttpOnly cookie so a reload survives.
+ *   #nonce=…  the DSH plugin's panel URL: redeemed once (`POST api/session`) for a panel session key.
+ * The header is what works in the desktop app, which embeds the loopback hub in an iframe of its dsh-app:// page: the
+ * browser keeps the SameSite cookie out of that third-party frame. `fetchImpl`/`apiBase` are injected so tests can run
+ * this against a real hub.
+ */
+async function redeemCredential(h, fetchImpl, apiBase) {
+  const post = (route, headers) => fetchImpl(`${apiBase}api/${route}`, { method: 'POST', headers, credentials: 'same-origin', cache: 'no-store' }).catch(() => null);
+  if (h.token) {
+    post('session-nonce', { 'x-agent-fleet-token': h.token });   // only its Set-Cookie matters
+    return h.token;
+  }
+  if (!h.nonce) return '';
+  const res = await post('session', { 'x-agent-fleet-nonce': h.nonce });
+  const body = res && res.ok ? await res.json().catch(() => null) : null;
+  return body && typeof body.session === 'string' ? body.session : '';
+}
+
 if (typeof document === 'undefined') {   // loaded by tests: expose the pure part and stop
   globalThis.__fleetPure = {
     KINDS, SITES, CATS, NAMESPACE, SITE_LABEL, STATUS_LABEL, ROLE_LABEL, CAT_LABEL, GAP_MS, GAP_VIRT, siteOfCluster, podKeyOfTarget, fileKeyOfTarget,
     splitFileKey, fileOpClass, fmtDur, fmtAge, fmtNum, fmtBytes, agentTitle, containerClass, buildGraph, rootOf, subtree, resolveFocus,
     packLanes, makeAxis, pickStep, tickTimes, bucketSpans, visibleSegments, createSseParser, parseHash, buildHash, summarizeTouches, esc, clip, clipPx,
-    ico, kindBadge, statusDot, agentRowSig, agentRowHtml, agentRowModel, isActive,
+    ico, kindBadge, statusDot, agentRowSig, agentRowHtml, agentRowModel, isActive, redeemCredential,
   };
   return;
 }
@@ -2219,29 +2241,10 @@ function initEvents() {
   window.addEventListener('resize', hideTip);
 }
 
-/**
- * The credential a URL fragment carries stays in this page's memory and goes out as the `x-agent-fleet-token`
- * header. It is never written to sessionStorage/localStorage (a same-origin script could read it there) or back into
- * a URL; the caller scrubs the address bar.
- *   #token=…  manual entry: used as is, and exchanged for the hub's HttpOnly cookie so a reload survives.
- *   #nonce=…  the DSH plugin's panel URL: redeemed once (`POST api/session`) for a panel session key.
- * The header is what works in the desktop app, which embeds the loopback hub in an iframe of its dsh-app:// page: the
- * browser keeps the SameSite cookie out of that third-party frame. A spent or expired nonce leaves the page on the
- * cookie, which still serves a same-site reload.
- */
+/** A spent or expired nonce keeps whatever the page already holds; the cookie still serves a same-site reload. */
 async function adoptCredential(h) {
-  if (h.token) {
-    S.token = h.token;
-    postCredential('session-nonce', { 'x-agent-fleet-token': h.token });   // only its Set-Cookie matters
-    return;
-  }
-  const res = await postCredential('session', { 'x-agent-fleet-nonce': h.nonce });
-  const body = res && res.ok ? await res.json().catch(() => null) : null;
-  if (body && typeof body.session === 'string' && body.session !== '') S.token = body.session;
-}
-/** Body-less POST to one of the hub's credential routes; null when the hub cannot be reached. */
-function postCredential(route, headers) {
-  return fetch(`${API_BASE}api/${route}`, { method: 'POST', headers, credentials: 'same-origin', cache: 'no-store' }).catch(() => null);
+  const credential = await redeemCredential(h, (url, init) => fetch(url, init), API_BASE);
+  if (credential) S.token = credential;
 }
 async function boot() {
   const h = parseHash(location.hash);

@@ -1,11 +1,13 @@
-// Panel logic: the pure helpers of panel/app.js (loaded without a DOM), drift against lib/protocol.mjs, and
-// the integrity of panel/fixtures/demo.json that ?demo=1 serves.
+// Panel logic: the pure helpers of panel/app.js (loaded without a DOM), drift against lib/protocol.mjs, the panel's
+// credential redemption against a real hub, and the integrity of panel/fixtures/demo.json that ?demo=1 serves.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import vm from "node:vm";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as protocol from "../lib/protocol.mjs";
+import { startHub } from "../lib/hub/index.mjs";
 
 const panelDir = fileURLToPath(new URL("../panel/", import.meta.url));
 const ctx = vm.createContext({ console, URLSearchParams });
@@ -221,6 +223,32 @@ test("fleet rows: the signature ignores the clock, the time cells are refreshed 
   assert.match(html, /<span class="muted" data-live="since" data-t="1500000">8m20s<\/span>/, "live counter carries its start time");
   assert.notEqual(P.agentRowHtml(a, { ...row, now: 5_600_000 }), html, "the rendered time advances without a rebuild");
   assert.doesNotMatch(P.agentRowHtml({ ...a, status: "waiting", live: { ...a.live, since: null } }, { ...row, now: 2_000_000 }), /data-live="since"/, "no counter without a live start");
+});
+
+// Regression: the desktop app embeds the loopback hub in an iframe of its dsh-app:// page, where the browser never
+// sends the hub's SameSite cookie. The plugin's `#nonce=` has to turn into a credential the panel sends as a header.
+test("panel credentials: the plugin's #nonce becomes a session key that reads the hub by header alone", async (t) => {
+  const scratch = fileURLToPath(new URL("../.scratch/", import.meta.url));
+  mkdirSync(scratch, { recursive: true });
+  const dir = mkdtempSync(join(scratch, "panel-auth-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const hub = await startHub({ hostId: "mac", log: () => {}, http: { host: "127.0.0.1", port: 0, tokenFile: join(dir, "token") } });
+  t.after(() => hub.stop());
+  const root = `http://127.0.0.1:${hub.http.port}/`, token = readFileSync(join(dir, "token"), "utf8").trim();
+  const mint = async () => (await (await fetch(`${root}api/session-nonce`, { method: "POST", headers: { "x-agent-fleet-token": token } })).json()).nonce;
+  const cookieless = (url, init) => fetch(url, { ...init, credentials: "omit" });   // what the browser does in a third-party frame
+  const reads = (key) => fetch(`${root}api/snapshot`, { headers: { "x-agent-fleet-token": key } }).then((res) => res.status);
+
+  const nonce = await mint();
+  const session = await P.redeemCredential(P.parseHash(`#nonce=${nonce}&focus=s-1`), cookieless, root);
+  assert.match(session, /^[A-Za-z0-9_-]{32}$/);
+  assert.notEqual(session, token, "the page never holds the hub token");
+  assert.equal(await reads(session), 200, "the session key alone reads the snapshot");
+  assert.equal(await P.redeemCredential(P.parseHash(`#nonce=${nonce}`), cookieless, root), "", "a spent nonce buys nothing");
+  assert.equal(await P.redeemCredential(P.parseHash("#view=fleet"), cookieless, root), "", "no credential, no request");
+  assert.equal(await P.redeemCredential(P.parseHash(`#token=${token}`), cookieless, root), token, "a manual token is used as is");
+  await hub.stop();
+  assert.equal(await P.redeemCredential(P.parseHash("#nonce=n"), cookieless, root), "", "an unreachable hub is not an exception");
 });
 
 /* ───────────── demo fixture ───────────── */
