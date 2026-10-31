@@ -1,0 +1,84 @@
+# Disposable test pod for dsh-agent-fleet: one per cluster (chengdu, weihai, ulanqab-iron, ulanqab-osmium),
+# namespace mc-bochao-li. Runs `sleep infinity`; the four agent CLIs (dsh, claude, codex, omp) are installed
+# into the pod by `apply-test-pods.sh <context> provision` and driven with `kubectl exec`.
+#
+# Do not `kubectl apply` this file directly: apply-test-pods.sh substitutes two placeholders, the image
+# (Node >= 22.15; default harbor.omgwow.ai/dockerhub-cache/library/node:22-bookworm) and a `hostAliases:` block
+# pinning tokenrouterv2.omgwow.tech to 10.0.60.77 (left empty on chengdu, where the in-cluster DNS answer
+# 10.97.12.103 is the one that works).
+#
+# TokenRouter egress, measured per cluster: chengdu -> 10.97.12.103:443 direct; weihai -> 10.0.60.77:443 direct;
+# ulanqab-iron / ulanqab-osmium -> only through the HTTP proxy the cluster injects into every container
+# (HTTPS_PROXY / NO_PROXY; a direct TLS session to 10.0.60.77 hangs there after the TCP handshake). dsh, claude, codex
+# and omp all honor that environment, so never strip it from an agent launch on those two clusters.
+#
+# StatefulSet (1 replica) rather than a Deployment: the pod name stays `agent-fleet-test-0` across restarts and
+# reschedules, so `kubectl exec` commands, the monitor's `^agent-fleet-test` pattern and the collector host id
+# `k8s/<site>/agent-fleet-test-0` stay stable. A Deployment would rename the pod on every recreation.
+#
+# API credentials come only from the Secret `agent-fleet-agents` (env: TOKENROUTER_API_KEY, OPENAI_API_KEY,
+# ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY=""); they are never written into this file or into
+# files in the pod.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent-fleet-test
+  namespace: mc-bochao-li
+  labels:
+    app.kubernetes.io/name: agent-fleet-test
+    app.kubernetes.io/part-of: agent-fleet
+  annotations:
+    agent-fleet.omgwow.ai/purpose: "dsh-agent-fleet monitor test pod (2C/4Gi, no GPU); delete after acceptance"
+spec:
+  serviceName: agent-fleet-test
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-fleet-test
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-fleet-test
+        app.kubernetes.io/part-of: agent-fleet
+        agent-fleet.omgwow.ai/collect: "true"
+        agent-fleet.omgwow.ai/container: workspace
+    spec:
+      terminationGracePeriodSeconds: 5
+      # PID 1 is `sleep infinity`, which never reaps; with a shared PID namespace the pause container is the
+      # init and reaps orphans left behind by `kubectl exec`-launched agent processes.
+      shareProcessNamespace: true
+      @HOST_ALIASES@
+      containers:
+        - name: workspace
+          image: @IMAGE@
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          workingDir: /work
+          envFrom:
+            - secretRef:
+                name: agent-fleet-agents
+          env:
+            - { name: HOME, value: /root }
+            - { name: PATH, value: "/opt/agent-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            - { name: LANG, value: C.UTF-8 }
+            # Pods are disposable: let Claude Code accept --dangerously-skip-permissions as root, and keep it
+            # from self-updating or phoning home (iron/osmium reach the internet only through an HTTP proxy).
+            - { name: IS_SANDBOX, value: "1" }
+            - { name: DISABLE_AUTOUPDATER, value: "1" }
+            - { name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, value: "1" }
+          resources:
+            requests: { cpu: "2", memory: 4Gi }
+            limits: { cpu: "2", memory: 4Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: tools, mountPath: /opt/agent-tools }
+            - { name: home, mountPath: /root }
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 20Gi }
+        # emptyDirs survive container restarts (OOM kill) but not pod deletion; re-run `provision` after a recreate.
+        - name: tools
+          emptyDir: { sizeLimit: 8Gi }
+        - name: home
+          emptyDir: { sizeLimit: 4Gi }

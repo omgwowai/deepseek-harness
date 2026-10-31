@@ -3,3 +3,9 @@
 # (pnpm build) and remains ignored, as do node_modules/ directories created by install.mjs.
 !plugins/dsh-agent-dag/telemetry/lib/
 !plugins/dsh-agent-dag/telemetry/lib/**
+# Agent Fleet ships plain-JavaScript modules under lib/ (no build step), so its lib/ is source too.
+!plugins/dsh-agent-fleet/lib/
+!plugins/dsh-agent-fleet/lib/**
+# Agent Fleet scratch output, the built single-file collector and local test artifacts.
+plugins/dsh-agent-fleet/.scratch/
+plugins/dsh-agent-fleet/dist/

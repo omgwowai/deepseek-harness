@@ -5,6 +5,7 @@
 - 把 Mermaid 代码块直接渲染成图；
 - 通过 ACP 或各家的原生协议接入 Claude Code、Codex、Oh My Pi，并在同一个工作区里继续它们的原生会话；
 - 在每个会话旁边打开 Agent DAG 面板（整个会话家族的时间线、用量和 Context）；
+- 用一张实时视图看本机、服务器和各个集群上的所有 agent 会话、子代理、它们启动的 agent，以及它们碰过的 Pod 和文件（Agent Fleet）；
 - 让各个 code agent 共用同一套 skills。
 
 所有插件都按 DSH profile 级 bundle 安装，适用于该 profile 下所有工作区的所有会话。实测环境是 DSH `0.2.1-rc.2`（Desktop 与 `dsh web` 两个 profile），macOS arm64；本分支的仓库代码基于上游 `0.2.1-rc.3`，插件不依赖仓库里的 DSH 源码。
@@ -15,6 +16,7 @@
 | `plugins/dsh-acp-adapter` | `@local/dsh-acp-adapter` | 把 Claude Code / Codex / Oh My Pi 接入 DSH，走 ACP 或各家的原生协议（基于 `@zaimokuza/dsh-acp-adapter` 的 fork） | 各 agent 的 CLI |
 | `plugins/dsh-agent-dag` | `@local/dsh-agent-dag` | 原生会话导入、两级模型选择器、Agent DAG 页签、用量统计条、复制会话 ID、共享 skills、会话日志修复工具 | `dsh-acp-adapter`；Agent DAG 页签另需 Paseo `agent-dag` 面板服务 |
 | `plugins/dsh-agent-dag/telemetry` | `@tokenrouter/dsh-telemetry` | Agent DAG 的子插件：把会话结构（不含内容）上报给 TokenRouter，控制台「会话树」靠它重建代理树。随 agent-dag 一起安装 | 模型请求走 TokenRouter，或设置 `TOKENROUTER_API_KEY` |
+| `plugins/dsh-agent-fleet` | `@local/dsh-agent-fleet` | 多机、多集群的 Agent 实时监控：DSH / Claude Code / Codex / Oh My Pi 的会话、子代理、ACP 子代理、跨主机启动的 agent，以及它们碰过的 Pod 和文件；自带面板和 `agent_fleet` 模型工具 | 无（纯 JavaScript，Node ≥ 22.15）；可选 `kubectl`、`ssh` |
 | `skills/mermaid-diagrams` | — | 结构类图（流程、时序、状态、ER、类、甘特、思维导图）优先输出 Mermaid 代码块；截图、照片、数据图表、界面草图等仍用正常图片输出 | 配合 `dsh-mermaid-pele` |
 | `install.mjs` | — | 把上面的插件以 `link:` 依赖装进某个 DSH profile | Node ≥ 22、pnpm、npm |
 
@@ -31,8 +33,25 @@ node install.mjs --profile desktop --skill
 node plugins/dsh-agent-dag/configure.mjs --desktop \
   --panel-token-file <paseo-agent-dag>/plugins/agent-dag/.cache/web/token
 
-# 3. 完全退出 DSH 再打开（dsh web 则重启进程），然后刷新一次 Web GUI
+# 3. Agent Fleet（可选，见下文）。Desktop 用 embedded：hub 跑在 DSH 进程里，跟随服务器的 hub；
+#    桌面 hub 要一份服务器 hub 的 token 副本，推 collector 时还要 ingest token 的副本
+node install.mjs --profile desktop --plugins fleet
+node plugins/dsh-agent-fleet/configure.mjs --profile desktop --mode embedded \
+  --ssh-target bochao_li@10.0.60.98
+ssh bochao_li@10.0.60.98 'cat ~/.config/agent-fleet/token' > ~/.config/agent-fleet/upstream-token
+ssh bochao_li@10.0.60.98 'cat ~/.config/agent-fleet/ingest-token' > ~/.config/agent-fleet/upstream-ingest-token
+chmod 600 ~/.config/agent-fleet/upstream-token ~/.config/agent-fleet/upstream-ingest-token
+
+# 4. DSH Web（服务器）：同一个插件、remote 模式，连本机 127.0.0.1:7840 的 hub
+node install.mjs --profile web --plugins fleet
+node plugins/dsh-agent-fleet/configure.mjs --profile web --mode remote
+
+# 5. 完全退出 DSH 再打开（dsh web 则重启进程），然后刷新一次 Web GUI
 ```
+
+`--plugins` 默认只装 mermaid、acp、agent-dag；`fleet`（Agent Fleet）要单独选，或者写 `--plugins mermaid,acp,agent-dag,fleet` 全装。它没有构建步骤，装好后再用 `plugins/dsh-agent-fleet/configure.mjs` 写它那一行配置。
+
+`install.mjs` 按包目录找插件，所以 Web 那一步要在有这份目录的机器上跑。服务器上的部署方式不同：`deploy/deploy-server.sh sync` 把插件放到 `~/agent-fleet/dsh-agent-fleet`，`web` profile 直接 link 这个目录（`@local/dsh-agent-fleet`，装一次就固定）。profile 里已经有这条 link 时，只写配置：`cd ~/agent-fleet/dsh-agent-fleet && node configure.mjs --profile web --mode remote`；之后更新插件只用 `sync` + `units`，见下文「服务端部署」。
 
 `install.mjs` 依次做这几件事：
 
@@ -155,6 +174,227 @@ Agent DAG 在本机看会话家族，会话遥测让网关那边也能看到同�
 
 **范围。** 这个子插件只覆盖 DSH 自己的 agent。通过 ACP 接入的 Claude Code、Codex、Oh My Pi 是独立进程，它们的会话遥测由各 agent 自己的 TokenRouter 配套客户端负责（paseo-deploy 的 local-mac 流程会装好），本目录不安装那些客户端。
 
+## dsh-agent-fleet：多集群 Agent 实时监控
+
+**用途。** 一张实时视图，列出用户在每个站点上跑的所有 code agent 会话：DeepSeek Harness、Claude Code、Codex、Oh My Pi。每个会话显示状态、正在做什么、模型、token 用量和起止时间；关系上能看到主会话 → 原生子代理、DSH 会话 → ACP 子代理（Claude Code / Codex / Oh My Pi）→ 子代理自己的子代理，以及一个 agent 在别的机器或 Pod 上起的会话。同一张视图里还有这些 agent 碰过的 K8s Pod 和读写过的文件。数据来自各站点 collector 读到的原生会话文件和进程表，汇总到一个 hub；DSH 桌面应用和服务器上的 DSH Web 各有一个入口，模型还能用 `agent_fleet` 工具直接查。`plugins/dsh-agent-fleet/README.md` 是开发者文档，`CONTRACT.md` 是设计契约。
+
+**站点。**
+
+| 站点 | 机器 | 到 hub 的通道 |
+|---|---|---|
+| `mac` | 本机 Mac（DSH 桌面应用） | 桌面插件在 DSH 进程里跑一个 hub（`127.0.0.1:7846`）和本机 collector；同时用 `ssh -W` 订阅服务器 hub，并把本机 collector 推给它 |
+| `server-bochao-01` | 10.0.60.98，跑 hub、DSH Web、edge | hub 进程内的 collector |
+| `sg-compute` | 10.0.1.138 | 本机 collector 用 `ssh -W 127.0.0.1:7841 bochao_li@10.0.60.98` 推到服务器 hub |
+| `chengdu` `weihai` `iron` `os` | 各集群 `mc-bochao-li` 命名空间里的 Pod | hub 用 `kubectl exec -i <pod> -- node /tmp/agent-fleet/collector.mjs --stdio` 拉取；chengdu / weihai 的 Pod 没有到服务器的出网，所以总是 hub 发起 |
+
+**跟踪的内容。**
+
+- 四种 agent 的每个会话：状态（`running` / `waiting` / `idle` / `done` / `error` …）、正在做的事、模型、token 用量、开始和结束时间。来源是各家自己的会话文件（`~/.claude/projects`、`~/.codex/sessions`、`~/.omp/agent/sessions`、`~/.dsh/sessions`）和进程表；额外的会话目录用 `--root kind=path` 或 `AGENT_FLEET_ROOTS` 加。
+- 关系：主会话 → 原生子代理；DSH 会话 → ACP 子代理 → 该子代理自己的子代理。ACP 绑定从 DSH 的 `sidecar.sqlite` 读，父会话按原生会话 id 精确挂接。
+- 跨主机 / 跨集群启动：agent 用 `kubectl exec <pod> -- omp …` 或 `ssh <host> claude …` 起的会话，按命令行的目标和时间窗挂到发起它的 agent 下面；带 `AGENT_FLEET_PARENT` 环境变量的按变量精确挂接。DSH 自己为 ACP 子进程设 `AGENT_FLEET_VIA=dsh:<会话 id>`（见 `dsh-acp-adapter` 的 `FORK.md`）。
+- Pod：agent 碰过的 Pod 都会列出来（即使没有 collector），还能看它的容器、kube 事件和哪些调用碰过它。
+- 文件：工具调用里出现的路径（读、写、改、搜）按主机和路径归并，可以点开预览。预览只读、脱敏，上限 256 KiB。
+
+**面板。**
+
+桌面应用和服务器的 DSH Web 里都有「Agent Fleet」侧边栏入口和一个会话页签，打开的是 hub 提供的同一个面板（iframe；token 放在 URL fragment 里）。
+
+| 页签 | 内容 |
+|---|---|
+| Fleet | 站点 → 主机 / Pod → agent 树，跨主机的子节点标 `↗` |
+| Timeline | 类似 Agent DAG 的甘特图：一条泳道一个 agent，工具调用按类别着色，带 spawn / return 连线 |
+| Pods | 被 agent 碰过的 Pod，按站点分；相位、节点、容器、kube 事件、谁碰过 |
+| Files | 被碰过的文件，按路径归并；点开是只读预览 |
+| Feed | 整个 fleet 的工具调用实时流 |
+
+面板的状态都在 URL hash 里（`#view=timeline&key=<agent key>`）；远程面板地址是 `http://10.0.60.98:443/fleet/`。插件打开面板时给的是 `/fleet/?nonce=…`（要定位会话时再加 `#focus=…`）：hub 把一次性 nonce 换成 HttpOnly cookie 并 302 到裸面板，所以原始 token 不进 URL、fragment 或页面存储。手动进入时仍然可以用 `#token=<token>`（只留在页面内存里，同样换成 cookie），`/?token=<token>` 也是一次性换 cookie。桌面应用用的是它自己 hub 的地址。
+
+**延迟。** 实测（2026-10-31）：在各站点的会话文件里追加一行工具调用，到它出现在浏览器经 edge 订阅的 `/fleet/api/stream` 上，每个站点 60 个样本（时钟偏差已校正）：
+
+| 站点 | p50 | p95 | 最大 |
+|---|---|---|---|
+| server-bochao-01 | 536 ms | 826 ms | 930 ms |
+| sg-compute | 311 ms | 459 ms | 567 ms |
+| chengdu Pod | 316 ms | 501 ms | 556 ms |
+| weihai Pod | 294 ms | 483 ms | 566 ms |
+| iron Pod | 308 ms | 489 ms | 535 ms |
+| os Pod | 353 ms | 476 ms | 545 ms |
+| mac | 347 ms | 718 ms | 894 ms |
+
+面板 DOM 上看到同一条事件的时间（server-bochao-01，n=10）是 p50 297 ms、p95 586 ms。时间主要花在 collector 的 250 ms 合并窗口和 hub 的 200 ms 合并窗口上。服务器比其他站点慢 200–350 ms，原因是那台机器的会话目录太多，超过了 collector 的 2048 个 `fs.watch` 预算，新目录改走 500 ms 的轮询。
+
+**实测覆盖（2026-10-31）。** 下面每一类都在真实站点上跑过，并在 hub 里核对过链接的类型和最终状态：
+
+| 形态 | 站点 × agent | 链接 |
+|---|---|---|
+| 主会话 → 原生子代理 | 6 个站点（server、sg-compute、4 个 Pod）× 4 种 agent，共 24 格 | `file`，精确 |
+| DSH → ACP 子代理 → 它的子代理 | server（Claude / Codex / OMP）、sg-compute（3 种）、4 个 Pod（各 3 种）、Mac（Claude） | `acp` 精确，然后 `file` 精确 |
+| 跨主机 / 跨集群启动 | sg-compute claude → ssh → server codex；server DSH → kubectl → iron Pod omp；server codex → kubectl → weihai Pod dsh；Mac omp → kubectl → weihai Pod claude | `command`（推断，挂到具体工具调用 id），子代理 `file` 精确 |
+
+**已知限制。**
+
+- 服务器 hub 只加载最近 6 小时（`--since 6h`）写过的会话。一个跨主机启动的父会话如果早于这个窗口，子会话会作为根节点出现。
+- 不带 `--context` 的 `kubectl exec` 不知道是哪个集群；四个集群里有同名 Pod 时，按开始时间最近的会话挂接。
+- DSH headless profile 没有 `connection` 服务，装不上本插件，所以 headless 发起的跨主机启动只能按命令行推断（`command`），拿不到精确的工具调用 id。DSH Web 和桌面应用不受影响。
+- DSH ACP adapter 每轮会起一次模型目录探测，留下 cwd 在 `dsh-acp-probe-*` 的短会话。它们标为 `probe` 角色，不挂到任何父会话，也不会被推断链接认领。
+
+**`agent_fleet` 模型工具。** 装了插件后，DSH 里的模型可以直接查这些数据（只读，数据是几秒前的）。输出是一条摘要加紧凑 JSON（上限约 12 KB，列表超长时带 `more` 计数）。
+
+| action | 用途 |
+|---|---|
+| `overview` | 主机 × agent 种类（运行中 / 总数）、主机连接状态、Pod 数、跨主机链接 |
+| `list` | agent 列表，可按 `site` / `host` / `kind` / `status` / `role` / `text` / `since` 过滤 |
+| `family` | 一个 agent 所在的整棵树（根、子代理、ACP 子代理、跨主机启动的 agent） |
+| `agent` | 单个 agent 的记录和最近事件，可向前翻页 |
+| `pods` / `pod` | 被碰过的 Pod 列表 / 单个 Pod 的容器、碰过它的调用和 kube 事件 |
+| `files` / `file` | 文件清单（按 agent 或全部）/ 预览一个文件 |
+| `query` | 按类别、目标类型、站点、关键字搜工具调用 |
+
+**架构。**
+
+```mermaid
+flowchart LR
+  subgraph mac["Mac（DSH 桌面应用）"]
+    desk["embedded hub<br/>127.0.0.1:7846"]
+    mcol["本机 collector"]
+  end
+  subgraph srv["server-bochao-01（主出口）"]
+    hub["hub<br/>7840 HTTP / 7841 ingest"]
+    web["DSH Web<br/>127.0.0.1:3080"]
+    edge["edge<br/>10.0.60.98:443"]
+    panel["TRTA v4 面板<br/>127.0.0.1:8464"]
+  end
+  sg["sg-compute collector"]
+  subgraph k8s["K8s（chengdu / weihai / iron / os）"]
+    pod["Pod 内 collector<br/>/tmp/agent-fleet/collector.mjs"]
+  end
+  browser["浏览器"]
+  mcol --> desk
+  desk -- "ssh -W：订阅 7840，推送 7841" --> hub
+  sg -- "ssh -W 127.0.0.1:7841" --> hub
+  hub -- "kubectl exec -i：--stdio" --> pod
+  web -- "HTTP 127.0.0.1:7840" --> hub
+  browser -- "/fleet/ 和 /dsh/" --> edge
+  edge -- "/fleet/*" --> hub
+  edge -- "/dsh/*" --> web
+  edge -- "其余路径" --> panel
+```
+
+hub 持有全部状态：它接收 collector 的 `hello` / `agent` / `events` / `heartbeat`，解析父子链接，维护一个带 `cursor` 的变更日志，并用 SSE（`/api/stream`）推给面板。collector 只读本机文件、不自己开网络连接：桌面和 sg-compute 用 `ssh -W`，Pod 用 hub 发起的 `kubectl exec`。桌面 hub 是完整 hub 的第二个实例，它订阅服务器 hub 并合并状态，所以桌面应用单独运行也能看本机，联网时看到整个 fleet。edge 是服务器上唯一的对外监听，按前缀转发。
+
+**服务端部署。** 全部从本目录的 checkout 执行，目标是 `bochao_li@10.0.60.98`（`AGENT_FLEET_SERVER` 可覆盖）和 `sg-compute`（`AGENT_FLEET_SG`）。脚本会构建 collector bundle，不复制 `.scratch`、`node_modules`、`tests`。
+
+```bash
+cd deploy/deepseek-harness-tokenrouter/plugins/dsh-agent-fleet
+deploy/deploy-server.sh sync       # 复制插件到 ~/agent-fleet/dsh-agent-fleet
+deploy/deploy-server.sh units      # 渲染并（重）启动 hub 和 DSH Web 的 user unit
+deploy/deploy-server.sh sg         # 复制到 sg-compute 并（重）启动它的 collector unit
+deploy/deploy-server.sh edge-test  # 在 127.0.0.1:7849 起一个临时 edge，逐个探测路由
+deploy/deploy-server.sh cutover    # 把 TRTA v4 面板挪到 127.0.0.1:8464，edge 接管 :443
+deploy/deploy-server.sh rollback   # 撤销 cutover
+deploy/deploy-server.sh status     # unit 状态 + 各健康检查地址
+```
+
+| 子命令 | 做什么 |
+|---|---|
+| `sync` | 本地构建 `dist/agent-fleet-collector.mjs`，再把插件 rsync 到服务器的 `~/agent-fleet/dsh-agent-fleet`，并确认服务器上的 `node` 版本和 bundle。 |
+| `units` | 先写 `~/.config/agent-fleet/hub.env`（`AGENT_FLEET_ROOTS`，给 TRTA v4 分析容器里的会话用），再渲染 `agent-fleet-hub.service` 和 `dsh-web.service`，`daemon-reload` 后重启这两个 unit。 |
+| `sg` | 用 tar 覆盖到 sg-compute 的 `~/agent-fleet/dsh-agent-fleet`，渲染 `agent-fleet-collector.service`（`--root` 指向 `~/agent-fleet/homes/<kind>`），重启该 unit。 |
+| `edge-test` | 用 `agent-fleet edge --listen 127.0.0.1:7849` 代理现网 hub、DSH Web 和面板，打印三个路径的 HTTP 状态码，然后退出。改 edge 之前先跑它。 |
+| `cutover` | 装系统 unit `agent-fleet-edge.service` 和 TRTA v4 面板的 drop-in（面板改听 `127.0.0.1:8464`），重启面板，启用并启动 edge，最后列出 443 / 8464 的监听。 |
+| `rollback` | 停用 edge，删掉 drop-in，`daemon-reload` 并重启面板（回到 443），再列出 443 的监听。 |
+| `status` | 打印 hub、DSH Web、edge、TRTA 面板和 sg-compute collector 的 unit 状态，以及各健康检查地址的 HTTP 状态码。 |
+
+| Unit | 作用域 | 内容 |
+|---|---|---|
+| `agent-fleet-hub.service` | 服务器，`systemd --user` | `hub --listen 127.0.0.1:7840 --ingest 127.0.0.1:7841 --base /fleet --public-host 10.0.60.98 --token-file … --ingest-token-file … --kubeconfig … --since 6h`。jemalloc 预加载、`MemoryMax=4G`、`OOMScoreAdjust=500`：这台机器还跑 TRTA v4 作业，hub 必须小，并且在内存压力下先被内核选中、自己重启。日志 `journalctl --user -u agent-fleet-hub.service`。 |
+| `dsh-web.service` | 服务器，`systemd --user` | `dsh --profile web --host 127.0.0.1 --port 3080 --public-url http://10.0.60.98:443/dsh/ --trusted-host 10.0.60.98:443`。 |
+| `agent-fleet-edge.service` | 服务器，system | `edge --listen 10.0.60.98:443 --route /fleet=http://127.0.0.1:7840 --route /dsh=http://127.0.0.1:3080 --fallback http://127.0.0.1:8464`，只保留 `CAP_NET_BIND_SERVICE`。 |
+| `agent-fleet-collector.service` | sg-compute，`systemd --user` | `collector --ssh bochao_li@10.0.60.98 --ssh-port 7841 --host-id sg-compute --site sg-compute --token-file %h/.config/agent-fleet/ingest-token …`，断线按 5 s 重连。 |
+
+| 端口 | 绑定 | 用途 |
+|---|---|---|
+| 443 | 10.0.60.98 | edge：`/fleet/*` → hub，`/dsh/*` → DSH Web，其余 → 面板 |
+| 7840 | 127.0.0.1（服务器） | hub HTTP API + 面板 |
+| 7841 | 127.0.0.1（服务器） | hub 的 collector ingest，只给 `ssh -W` 用 |
+| 3080 | 127.0.0.1（服务器） | DSH Web |
+| 8464 | 127.0.0.1（服务器） | 挪到 edge 后面的 TRTA v4 面板 |
+| 7846 | 127.0.0.1（Mac） | 桌面插件里的 embedded hub |
+
+**切到 443 和回滚。** `cutover` 保持面板原来的公开地址不变（面板变成 edge 的兜底路由），中间只有一小段没有 443 监听的时间；`rollback` 把面板放回 443 并停掉 edge，两条命令都只动 edge unit、面板 drop-in 和面板 unit。切之前先跑 `edge-test`：它用临时端口验证三条路由都通，不碰 443。
+
+**找 DSH Web 的启动地址。** 浏览器打开 `http://10.0.60.98:443/dsh/` 需要带启动 token，DSH Web 启动时会把它打在日志里：
+
+```bash
+ssh bochao_li@10.0.60.98 'journalctl --user -u dsh-web.service --no-pager | grep "dsh web:" | tail -1'
+```
+
+输出形如 `dsh web: http://10.0.60.98:443/dsh/?token=…`。这个 token 是启动凭据，不要贴到聊天或文档里；换了 unit 或重启 DSH Web 后会变。
+
+**Collector。** 每台机器 / 每个 Pod 一个，都读同一套原生会话文件。
+
+- 服务器：hub 进程里的 collector（`--no-local` 可关掉），`--since 6h` 只加载最近 6 小时的会话；额外的会话根目录写在 `~/.config/agent-fleet/hub.env` 的 `AGENT_FLEET_ROOTS`。
+- sg-compute：`agent-fleet-collector.service`。agent 用隔离的 home 跑在 `~/agent-fleet/homes/<kind>`，unit 用四个 `--root` 指过去；额外的根目录写在 `~/.config/agent-fleet/collector.env` 的 `AGENT_FLEET_ROOTS`。
+- Pod：打了 `agent-fleet.omgwow.ai/collect=true` 标签的 Pod 由 hub 自动挂 collector。容器取 `agent-fleet.omgwow.ai/container`，没写就用第一个；hub 先探 Pod 里有没有 Node ≥ 22.15，再把 `dist/agent-fleet-collector.mjs` 推到 `/tmp/agent-fleet/collector.mjs`（内容变了才推），然后 `kubectl exec -i` 起它。测试 Pod 是 `deploy/k8s/agent-fleet-test.yaml`（StatefulSet，Pod 名固定 `agent-fleet-test-0`，所以 host id `k8s/<site>/agent-fleet-test-0` 也固定）。
+- Pod 里的 ACP 接线：`deploy/k8s/provision-acp.sh <context> [--check | --turn claude|codex|omp]` 把 fork 的 ACP adapter 和 `claude-agent-acp` / `codex-acp` 装进 `/opt/agent-tools`，写下 headless profile 和 `/root/.dsh/acp-model-{claude,codex,omp}.yml`，幂等。它在 server-bochao-01 上跑（源码在那儿；kubectl 不在那台机器的 PATH 上，脚本会自己找 `~/.local/bin/kubectl`，也可以用 `KUBECTL=…` 指定）。`--check` 不调模型，但会让每家 agent 起一个 ACP 握手，因此留下一次性的探测会话；`--turn` 用 `--patch` 挂上对应的 overlay 跑一轮 headless 回合，不改 home 的默认模型行，所以跑完不需要还原。容器重启（OOM）保留 `/opt/agent-tools` 和 `/root`；Pod 重建两者都丢，要重跑 `apply-test-pods.sh <ctx> provision` 再跑 `provision-acp.sh <ctx>`，`/root/.dsh/sessions` 和 ACP sidecar 绑定也一起没了；hub 会自己重推 collector bundle。
+- 跨主机链路：agent 启动别的 agent 时带上 `AGENT_FLEET_PARENT=<kind>:<id>`（或完整 agent key）就是精确链接；不带就按 `kubectl exec` / `ssh` 命令行的目标和时间窗推断。
+- ingest 端口：hub 启动时带 `--ingest-token-file`（unit 用 `~/.config/agent-fleet/ingest-token`），走 TCP ingest 的 collector 必须用 `--token-file` 带上同一把 token（在 `hello` 里比对）；hub 自己拨的通道（`kubectl exec`、`--dial-ssh`、进程内 collector）不需要。显式传 `--stdio` 的 Pod 通道也由 hub 自己拨。
+
+**配置项。** 写在 profile 的 `cordis.patch.yml` 里 `dsh-agent-fleet` 那一行（`configure.mjs` 负责写）。未知键会让插件拒绝加载。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `mode` | `remote` | `remote`：用 HTTP 连本机 hub。`embedded`：在 DSH 进程里跑 hub（桌面应用）。 |
+| `hubUrl` | `http://127.0.0.1:7840` | `remote`：hub 的 HTTP 根。`embedded`：没有 `upstream.url` 时要跟随的服务器 hub。 |
+| `tokenFile` | `~/.config/agent-fleet/token` | `remote`：hub 的 token。`embedded`：本机 hub 自己的 token 文件（缺了会创建，0600）。 |
+| `panelUrl` | 无 | 面板地址，不能带 `?` 或 `#`。不写时：`embedded` 用 `http://127.0.0.1:<httpPort>/`，`remote` 用 `/fleet/`。 |
+| `upstream.sshTarget` | 无 | `embedded`：服务器 hub 所在机器的 ssh 登录名（`user@host`）。跟随订阅和 collector 推送都走它。 |
+| `upstream.url` | `hubUrl` | `embedded`：服务器 hub 的 HTTP 根（从那台机器看）。 |
+| `upstream.tokenFile` | `~/.config/agent-fleet/upstream-token` | `embedded`：服务器 hub 的 token 副本。 |
+| `upstream.ingestTokenFile` | `~/.config/agent-fleet/upstream-ingest-token` | `embedded`：服务器 hub 的 ingest token 副本；把本机 collector 推到 7841 时在 `hello` 里带上。 |
+| `collector.roots` | 无 | `embedded`：额外的会话目录，`{dsh/claude/codex/omp: [目录]}`。 |
+| `collector.since` | collector 默认（24h） | `embedded`：启动时加载多久以内的会话，`"6h"`、`"90m"` 或毫秒。 |
+| `hostId` / `site` | `mac` / `mac` | `embedded`：本机在 fleet 里的 host id 和站点。 |
+| `httpPort` | `7846` | `embedded`：本机 hub 的 HTTP 端口。 |
+
+**安全模型。**
+
+- hub、collector、DSH Web 都只监听 `127.0.0.1`；唯一对外监听是 edge 的 `10.0.60.98:443`（iptables 已把 443 限制在内网网段）。
+- API token 在 `~/.config/agent-fleet/token`（0600，64 位十六进制），`x-agent-fleet-token`、`Authorization: Bearer` 或 cookie 都接受；`/api/health` 不带 token 只回 `{ok, version}`（存活检查），带 token 才有端口、hosts、upstream、kube 明细；面板外壳公开，其余接口都要 token。插件给面板的 URL 带一次性的 `?nonce=…`（`POST /api/session-nonce` 换取，60 s 内单次有效），hub 换成 HttpOnly cookie 后 302 到裸面板，所以原始 token 不进 URL、fragment 或页面存储；手动 `#token=` 入口仍然可用，也是换成同一个 cookie。hub 和 edge 的访问日志不记 query 和 cookie；Host 头只接受回环名和 `--public-host` 列出的名字，其余回 403（服务器 unit 带 `--public-host 10.0.60.98`，因为 edge 转发过去的 Host 就是它）。
+- collector 的 ingest 端口另有一把 token（`--ingest-token-file`，默认文件 `~/.config/agent-fleet/ingest-token`，0600），走 TCP ingest 的 collector 在 `hello` 里带上，hub 做常量时间比较；hub 自己拨的通道（`kubectl exec`、`--dial-ssh`、进程内 collector）视为可信。
+- collector 的文件预览、命令行和文件内容都过 `lib/redact.mjs`；看起来是密钥的路径直接拒绝；预览只读、256 KiB 上限、二进制不返回正文。
+- kubeconfig 在服务器 `~/.config/agent-fleet/kubeconfig.yaml`（0600），不写日志、不发给任何 collector。
+- Pod 文件读取把路径作为位置参数传给 `sh -c`，不拼进命令；解析符号链接后再判断密钥路径和 `/proc`、`/sys`、`/dev`。
+- 没有任何写文件、杀进程或由用户输入决定的 exec 接口；Pod 的 collector 只由 hub 按标签发起。
+
+**排障。** 先看 hub 自己的健康接口和主机表（`hosts` 里的 `online` 数、每台的 `VIA` 和 `LAG`）：
+
+```bash
+# 服务器上
+node ~/agent-fleet/dsh-agent-fleet/bin/agent-fleet.mjs status \
+  --url http://127.0.0.1:7840 --token-file ~/.config/agent-fleet/token
+curl -s -H "x-agent-fleet-token: $(cat ~/.config/agent-fleet/token)" http://127.0.0.1:7840/api/health
+
+# 从 Mac 经 edge 看服务器 hub（在本目录执行）
+node bin/agent-fleet.mjs status --url http://10.0.60.98:443/fleet \
+  --token-file ~/.config/agent-fleet/upstream-token
+
+# 看桌面应用里的本机 hub（在本目录执行）
+node bin/agent-fleet.mjs status --url http://127.0.0.1:7846
+```
+
+带 token 的 `/api/health` 里 `hosts.total` / `hosts.online`、`agents`、`running`、`pods`、`upstream[].status` 和 `kube.<site>.status` 各自对应一层；不带 token 只有 `{ok, version}`，`status` 会自己带上 token。
+
+| 现象 | 先看 |
+|---|---|
+| 少了一台主机 | 那台的 collector：服务器 `systemctl --user status agent-fleet-hub.service`，sg-compute `systemctl --user status agent-fleet-collector.service`；`--ssh` 目标要能免密登录 |
+| 主机一直 `connecting` / `offline` | 手动试 `ssh -W 127.0.0.1:7841 bochao_li@10.0.60.98`；hub 的 ingest 是否在 7841 |
+| 某个集群报错 | `kube` 里该站点的 `status` / `error`；context 名是 `chengdu`、`weihai`、`ulanqab-iron`、`ulanqab-osmium`，`kubectl` 要在 PATH 上 |
+| Pod 没有 collector | Pod 有没有 `agent-fleet.omgwow.ai/collect=true`；Pod 里 `node --version` 是否 ≥ 22.15；`/tmp/agent-fleet/collector.mjs` 是否推送过 |
+| 面板提示未授权 | token 过期或没带：用 `#token=…` 或 `/?token=…` 重新换 cookie |
+| 443 打不开 | `deploy/deploy-server.sh status`；`journalctl -u agent-fleet-edge.service`；需要回退时 `deploy/deploy-server.sh rollback` |
+| DSH Web 打不开 | `journalctl --user -u dsh-web.service`；启动地址按上面的 `grep "dsh web:"` 取 |
+
 ## 安全与隐私
 
 - 仓库里没有任何真实的 Key、token 或个人路径（适配器的脱敏测试里有明显是假的样例值，例如 AWS 文档里的示例 Key）。TokenRouter Key 只在本机由 `configure.mjs` 从 Paseo 配置复制进 profile patch，文件权限是 `0600`。会话遥测子插件从环境变量或模型请求读取 Key，不写进任何配置文件。
@@ -172,9 +412,10 @@ Agent DAG 在本机看会话家族，会话遥测让网关那边也能看到同�
 | `plugins/dsh-agent-dag` | Paseo 仓库里的 `plugins/dsh-agent-dag`。`configure.mjs`、`models.js` 在这里去掉了对 Paseo 目录结构的假设 |
 | `plugins/dsh-mermaid-pele` | 本机 `~/.dsh/plugins/dsh-mermaid-pele`。不含带机器路径的 `install-desktop.sh`，README 按 `install.mjs` 的用法改写 |
 | `plugins/dsh-agent-dag/telemetry` | `@tokenrouter/dsh-telemetry@0.3.2` 发布包的内容。它的 `lib/` 就是运行时源码，靠本目录 `.gitignore` 里的例外保留（仓库根的规则会忽略所有 `lib/`） |
+| `plugins/dsh-agent-fleet` | 在这个目录里开发，没有外部来源。纯 JavaScript，没有构建步骤；`dist/` 是本地构建的 collector bundle，靠本目录 `.gitignore` 忽略（`lib/` 同样靠例外保留） |
 | `skills/mermaid-diagrams` | `~/.agents/skills/mermaid-diagrams` |
 
-本目录自己维护的文件是 `README.md`、`install.mjs`、`.gitignore`、`plugins/dsh-agent-dag/configure.mjs` 和 `models.js`，以及 mermaid 与遥测两个插件的 `README.md`；其余内容跟随上面的来源更新。本目录不在 pnpm workspace 里，仓库根的 `pnpm install`、类型检查和测试都不会碰它；`scripts/` 里 `verify-concrete-terms`、`verify-repository-references`、`verify-translation-pairing` 这三个全仓库扫描的门禁把它排除在外。
+本目录自己维护的文件是 `README.md`、`install.mjs`、`.gitignore`、`plugins/dsh-agent-dag/configure.mjs` 和 `models.js`、整个 `plugins/dsh-agent-fleet`（含它的 `README.md` 和 `CONTRACT.md`），以及 mermaid 与遥测两个插件的 `README.md`；其余内容跟随上面的来源更新。本目录不在 pnpm workspace 里，仓库根的 `pnpm install`、类型检查和测试都不会碰它；`scripts/` 里 `verify-concrete-terms`、`verify-repository-references`、`verify-translation-pairing` 这三个全仓库扫描的门禁把它排除在外。
 
 ## 第三方许可
 

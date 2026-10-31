@@ -1,0 +1,8 @@
+{"type":"session","version":4,"id":"session-d0000000-0000-4000-8000-000000000003","createdAt":1790848800000,"cwd":"/work/demo","delegationDepth":0,"parentSession":"session-d0000000-0000-4000-8000-000000000001","isSeeded":true}
+{"type":"user/message","seq":0,"time":1790848800000,"data":{"content":[{"type":"text","text":"SEEDED prompt copied from the parent"}],"source":{"kind":"user"},"role":"user","id":"su1"},"surfaceOp":"append"}
+{"type":"tool/call","seq":1,"time":1790848800010,"data":{"turn":1,"step":1,"callId":"call_seed1","name":"bash","arguments":"{\"command\":\"echo seeded\"}"}}
+{"type":"tool/result","seq":2,"time":1790848800020,"data":{"turn":1,"step":1,"message":{"role":"tool","source":{"kind":"tool","callId":"call_seed1"},"toolCallId":"call_seed1","content":[{"type":"text","text":"seeded"}],"isError":false,"id":"tr20"}}}
+{"type":"assistant/message","seq":3,"time":1790848800030,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"SEEDED answer"}],"source":{"kind":"model","provider":"deepseek","model":"ds-flash"},"id":"am30"},"usage":{"inputTokens":999,"outputTokens":999,"cacheReadTokens":0,"cacheWriteTokens":0}},"surfaceOp":"append"}
+{"type":"session/end-seed","seq":4,"time":1790848800040,"data":{}}
+{"type":"turn/start","seq":5,"time":1790856000000,"data":{"turn":2}}
+{"type":"user/message","seq":6,"time":1790856000010,"data":{"content":[{"type":"text","text":"fresh question after the fork"}],"source":{"kind":"user"},"role":"user","id":"su2"},"surfaceOp":"append"}

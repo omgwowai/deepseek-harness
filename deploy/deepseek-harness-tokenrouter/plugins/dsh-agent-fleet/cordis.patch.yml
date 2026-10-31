@@ -1,0 +1,7 @@
+# Agent Fleet: live view of every DSH / Claude Code / Codex / Oh My Pi session, their subagents, pods and files.
+# `remote` talks to the hub on this machine (127.0.0.1:7840, token in ~/.config/agent-fleet/token); the Mac desktop
+# app runs `embedded` instead. configure.mjs writes the per-profile override (mode, hubUrl, tokenFile, sshTarget, ...).
+- insert:
+    - id: dsh-agent-fleet
+      name: '@local/dsh-agent-fleet'
+      config: {mode: remote}

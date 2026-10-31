@@ -1,0 +1,27 @@
+# Agent Fleet hub on server-bochao-01 (systemd --user). Loopback only: HTTP 127.0.0.1:7840 (behind the edge at
+# /fleet), collector ingest 127.0.0.1:7841 (reached by remote collectors through `ssh -W`).
+# Placeholders: @@F@@ = plugin dir on the server, @@NODE@@ = node ≥ 22.15, @@ROOTS@@ = extra --root flags (optional).
+# Extra session roots can also come from ~/.config/agent-fleet/hub.env (AGENT_FLEET_ROOTS=kind=glob:kind=glob).
+# Memory: this host also runs the TRTA v4 jobs. jemalloc (Ubuntu libjemalloc2) keeps the native heap compact: with the
+# server's ~2,100 DSH transcripts the hub peaked at 2.7 GB RSS on glibc malloc and 1.3 GB on jemalloc (per-frame zstd
+# decoding fragments glibc's heap). MemoryMax confines a runaway hub to its own cgroup, and OOMScoreAdjust makes the
+# kernel pick the monitor, which restarts by itself, before any analysis job under global memory pressure.
+[Unit]
+Description=Agent Fleet hub (multi-host agent monitor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/agent-fleet/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+EnvironmentFile=-%h/.config/agent-fleet/hub.env
+ExecStart=@@NODE@@ @@F@@/bin/agent-fleet.mjs hub --listen 127.0.0.1:7840 --ingest 127.0.0.1:7841 --base /fleet --public-host 10.0.60.98 --kubeconfig %h/.config/agent-fleet/kubeconfig.yaml --token-file %h/.config/agent-fleet/token --ingest-token-file %h/.config/agent-fleet/ingest-token --host-id server-bochao-01 --site server-bochao-01 --since 6h @@ROOTS@@
+Restart=always
+RestartSec=2
+Nice=5
+MemoryMax=4G
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=default.target

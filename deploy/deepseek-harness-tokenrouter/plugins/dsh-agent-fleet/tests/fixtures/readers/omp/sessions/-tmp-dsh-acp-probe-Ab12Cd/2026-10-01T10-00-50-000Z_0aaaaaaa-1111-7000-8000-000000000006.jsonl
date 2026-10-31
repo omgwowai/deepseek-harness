@@ -1,0 +1,4 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-10-01T10:00:50.000Z","pad":"                                                                                                          "}
+{"type":"session","version":3,"id":"0aaaaaaa-1111-7000-8000-000000000006","timestamp":"2026-10-01T10:00:50.000Z","cwd":"/tmp/dsh-acp-probe-Ab12Cd"}
+{"type":"model_change","id":"97e66435","parentId":null,"timestamp":"2026-10-01T10:00:50.120Z","runtime":{"version":"18.12.6"},"model":"acme/model-a","resolvedModelIsFallback":false}
+{"type":"thinking_level_change","id":"ef430d3f","parentId":null,"timestamp":"2026-10-01T10:00:50.130Z","thinkingLevel":"high"}
