@@ -5410,6 +5410,7 @@ const hasSuccessfulToolResult =
             : (capabilities) =>
                 this.createMcpLease!(sessionId, capabilities, runtime, this.admittedToolSchemas.get(sessionId)),
           await this.lineageOf(sessionId),
+          sessionId,
         ),
       createFileSystemHandlers: () =>
         createAcpFileSystemHandlers({

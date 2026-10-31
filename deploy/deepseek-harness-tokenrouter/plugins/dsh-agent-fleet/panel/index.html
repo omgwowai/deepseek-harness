@@ -1,0 +1,200 @@
+<!doctype html>
+<!-- Agent Fleet panel shell. Static markup only: app.js fills every list, table and the timeline.
+     Everything is addressed with RELATIVE urls so the page works at "/" and under "/fleet/". -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
+<title>Agent Fleet</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-fleet" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="18" r="2.2"/><circle cx="19" cy="18" r="2.2"/><path d="M12 7.2v4.3M12 11.5c0 3.2-7 3.2-7 4.3M12 11.5c0 3.2 7 3.2 7 4.3"/></symbol>
+    <symbol id="i-read" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4M10 12h5M10 16h5"/></symbol>
+    <symbol id="i-write" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4M12.5 11v6M9.5 14h6"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3L8 19z"/><path d="M14 7l3 3"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l6 6"/></symbol>
+    <symbol id="i-shell" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10l3 2.5L7 15M12.5 15H17"/></symbol>
+    <symbol id="i-remote" viewBox="0 0 24 24"><path d="M4 8h14M14 4l4 4-4 4M20 16H6M10 12l-4 4 4 4"/></symbol>
+    <symbol id="i-k8s" viewBox="0 0 24 24"><path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z"/><circle cx="12" cy="12" r="2.2"/><path d="M12 9.8V6M13.9 13.1l3.3 1.9M10.1 13.1l-3.3 1.9"/></symbol>
+    <symbol id="i-spawn" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/><path d="M12 7v4M12 11c0 3-6 3-6 6M12 11c0 3 6 3 6 6"/></symbol>
+    <symbol id="i-web" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></symbol>
+    <symbol id="i-coordination" viewBox="0 0 24 24"><path d="M4 5h16v11h-9l-5 4v-4H4z"/></symbol>
+    <symbol id="i-other" viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="18" cy="12" r="1.3"/></symbol>
+    <symbol id="i-error" viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.01"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></symbol>
+    <symbol id="i-model" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></symbol>
+    <symbol id="i-pod" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></symbol>
+    <symbol id="i-host" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/></symbol>
+    <symbol id="i-caret" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M8 16L16 8M9 8h7v7"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-timeline" viewBox="0 0 24 24"><path d="M4 6h8M8 12h12M6 18h9"/></symbol>
+    <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l6 6M10.5 8v5M8 10.5h5"/></symbol>
+    <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l6 6M8 10.5h5"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+  </defs>
+</svg>
+
+<div id="app">
+  <header class="topbar">
+    <div class="brand"><svg class="ico"><use href="#i-fleet"/></svg><b>Agent Fleet</b><span class="sub">智能体集群</span></div>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="视图 Views">
+      <button type="button" role="tab" id="tab-fleet" data-view="fleet" aria-controls="view-fleet">网络 <small>Fleet</small></button>
+      <button type="button" role="tab" id="tab-timeline" data-view="timeline" aria-controls="view-timeline">时间线 <small>Timeline</small></button>
+      <button type="button" role="tab" id="tab-pods" data-view="pods" aria-controls="view-pods">Pods</button>
+      <button type="button" role="tab" id="tab-files" data-view="files" aria-controls="view-files">文件 <small>Files</small></button>
+      <button type="button" role="tab" id="tab-feed" data-view="feed" aria-controls="view-feed">动态 <small>Feed</small></button>
+    </nav>
+    <div class="status">
+      <span id="demo-badge" class="pill demo" hidden title="演示数据 · 由 fixtures/demo.json 模拟，无 hub">DEMO</span>
+      <span id="conn-pill" class="pill conn" data-state="connecting"><i class="cdot"></i><span id="conn-text">连接中…</span></span>
+      <span id="fresh" class="fresh" title="距上一次收到 hub 增量 · time since the last hub delta">—</span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
+
+  <div class="body">
+    <main id="main">
+
+      <!-- 1. 网络 Fleet -->
+      <section id="view-fleet" class="view" role="tabpanel" aria-labelledby="tab-fleet" hidden>
+        <div id="site-cards" class="cards" aria-label="站点 Sites"></div>
+        <div class="toolbar">
+          <div class="seg" id="f-kinds" role="group" aria-label="Agent 类型 Kind">
+            <button type="button" class="kfilter k-dsh" data-kind="dsh" aria-pressed="false" title="DeepSeek Harness"><span class="kb k-dsh">D</span></button>
+            <button type="button" class="kfilter k-claude" data-kind="claude" aria-pressed="false" title="Claude Code"><span class="kb k-claude">C</span></button>
+            <button type="button" class="kfilter k-codex" data-kind="codex" aria-pressed="false" title="Codex"><span class="kb k-codex">X</span></button>
+            <button type="button" class="kfilter k-omp" data-kind="omp" aria-pressed="false" title="Oh My Pi"><span class="kb k-omp">O</span></button>
+          </div>
+          <label class="fld">状态 <select id="f-status" aria-label="状态过滤 Status filter">
+            <option value="recent">近期活跃 Recent</option>
+            <option value="running">运行/等待 Running</option>
+            <option value="all">全部 All</option>
+          </select></label>
+          <label class="fld">站点 <select id="f-site" aria-label="站点过滤 Site filter"><option value="">全部 All</option></select></label>
+          <input id="f-q" class="search" type="search" placeholder="搜索 标题 / 模型 / cwd / id / 主机…" aria-label="搜索 Search" autocomplete="off" spellcheck="false">
+          <button type="button" id="f-expand" class="btn" title="展开全部 Expand all">展开</button>
+          <button type="button" id="f-collapse" class="btn" title="折叠全部 Collapse all">折叠</button>
+          <label class="chk" title="显示 DSH 对 ACP 子 agent 的镜像记录 · show DSH projection records"><input type="checkbox" id="f-proj"> 投影</label>
+          <span id="f-count" class="muted count"></span>
+        </div>
+        <div class="treewrap">
+          <div class="row colhdr" aria-hidden="true"><div>会话 Session</div><div class="c-model">模型 Model</div><div class="c-doing">当前动作 Doing</div><div class="c-tok" title="输入 / 输出 / 缓存读取 tokens · input / output / cache-read">tokens in/out/cache</div><div class="c-age" title="距最近一次活动 · since last activity">活跃</div><div class="c-cnt" title="工具调用 ⚙ · 错误 ⚠ · 子 agent ⑂">计数</div></div>
+          <div id="fleet-tree" class="tree scroll" role="tree" aria-label="Agent 树 Agent tree"></div>
+        </div>
+      </section>
+
+      <!-- 2. 时间线 Timeline -->
+      <section id="view-timeline" class="view" role="tabpanel" aria-labelledby="tab-timeline" hidden>
+        <div class="toolbar">
+          <div id="tl-scope" class="scope" aria-live="polite"></div>
+          <div class="seg" id="tl-ranges" role="group" aria-label="时间范围 Range">
+            <button type="button" class="btn" data-range="5m">5m</button>
+            <button type="button" class="btn" data-range="30m">30m</button>
+            <button type="button" class="btn" data-range="2h">2h</button>
+            <button type="button" class="btn" data-range="all">全部</button>
+          </div>
+          <button type="button" id="tl-axis" class="btn toggle" aria-pressed="false" title="活跃时间轴：折叠超过 15 分钟的空档 · Active axis: collapse gaps over 15 min">活跃轴 <small>Active</small></button>
+          <div class="seg">
+            <button type="button" id="tl-zoom-out" class="btn icon" title="缩小 Zoom out (−)" aria-label="缩小"><svg class="ico"><use href="#i-zoom-out"/></svg></button>
+            <button type="button" id="tl-zoom-in" class="btn icon" title="放大 Zoom in (+)" aria-label="放大"><svg class="ico"><use href="#i-zoom-in"/></svg></button>
+            <button type="button" id="tl-fit" class="btn icon" title="适应 Fit (0)" aria-label="适应"><svg class="ico"><use href="#i-fit"/></svg></button>
+          </div>
+          <span id="tl-hint" class="muted hint">滚轮缩放 · Shift+滚轮/拖动平移 · 轴上拖选放大 · 双击复位</span>
+          <span id="tl-count" class="muted count"></span>
+        </div>
+        <div id="tl-legend" class="legend" aria-label="图例 Legend"></div>
+        <div id="tl-scroll" class="tl-scroll" tabindex="0" aria-label="时间线 Timeline：+/- 缩放，方向键平移，0 适应">
+          <svg id="tl-svg" class="tl-svg" role="img" aria-label="Agent 甘特图 Gantt chart"></svg>
+          <div id="tl-spacer" class="tl-spacer"></div>
+          <div id="tl-empty" class="tl-empty" hidden></div>
+        </div>
+      </section>
+
+      <!-- 3. Pods -->
+      <section id="view-pods" class="view" role="tabpanel" aria-labelledby="tab-pods" hidden>
+        <div class="toolbar">
+          <label class="fld">站点 <select id="p-site" aria-label="站点 Site"><option value="">全部 All</option></select></label>
+          <label class="fld">Phase <select id="p-phase" aria-label="Phase">
+            <option value="">全部 All</option><option value="Running">Running</option><option value="Pending">Pending</option>
+            <option value="Succeeded">Succeeded</option><option value="Failed">Failed</option><option value="bad">异常 Unhealthy</option>
+          </select></label>
+          <label class="chk"><input type="checkbox" id="p-touched"> 仅被 agent 触碰 <small>touched</small></label>
+          <input id="p-q" class="search" type="search" placeholder="搜索 pod / node / 容器 / agent…" aria-label="搜索 Search" autocomplete="off" spellcheck="false">
+          <button type="button" id="p-refresh" class="btn" title="从 hub 重新读取 api/pods"><svg class="ico"><use href="#i-refresh"/></svg> 刷新</button>
+          <span id="p-count" class="muted count"></span>
+        </div>
+        <div class="scroll tablewrap" id="pods-wrap">
+          <table class="grid pods" aria-label="Pods">
+            <thead><tr>
+              <th>Pod</th><th>Phase</th><th>Ready</th><th class="num">重启</th><th>Node</th><th>Age</th><th>容器 Containers</th><th class="num">GPU</th><th>被谁触碰 Touched by</th><th>最近 Last</th><th>操作 Ops</th>
+            </tr></thead>
+            <tbody id="pods-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 4. 文件 Files -->
+      <section id="view-files" class="view" role="tabpanel" aria-labelledby="tab-files" hidden>
+        <div class="toolbar">
+          <label class="fld">主机 <select id="fl-host" aria-label="主机 Host"><option value="">全部 All</option></select></label>
+          <label class="fld">Agent <select id="fl-agent" aria-label="Agent"><option value="">全部 All</option></select></label>
+          <div class="seg" id="fl-ops" role="group" aria-label="操作 Operations">
+            <button type="button" class="btn op-r" data-op="r" aria-pressed="false" title="读取 / 列出 / 搜索">r</button>
+            <button type="button" class="btn op-w" data-op="w" aria-pressed="false" title="写入 Write">w</button>
+            <button type="button" class="btn op-e" data-op="e" aria-pressed="false" title="编辑 / 删除 Edit">e</button>
+          </div>
+          <input id="fl-q" class="search" type="search" placeholder="路径包含… path contains" aria-label="路径过滤 Path filter" autocomplete="off" spellcheck="false">
+          <span id="fl-count" class="muted count"></span>
+        </div>
+        <div class="split">
+          <div class="scroll tablewrap files-list" id="files-wrap">
+            <table class="grid files" aria-label="Files">
+              <thead><tr><th>路径 Path</th><th>主机 Host</th><th class="num">r</th><th class="num">w</th><th class="num">e</th><th>最近 Last</th><th>Agents</th></tr></thead>
+              <tbody id="files-body"></tbody>
+            </table>
+          </div>
+          <div class="preview" id="file-preview" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- 5. 动态 Feed -->
+      <section id="view-feed" class="view" role="tabpanel" aria-labelledby="tab-feed" hidden>
+        <div class="toolbar">
+          <button type="button" id="fd-pause" class="btn toggle" aria-pressed="false"><svg class="ico"><use href="#i-pause"/></svg> <span>暂停 Pause</span></button>
+          <div class="seg" id="fd-kinds" role="group" aria-label="Agent 类型 Kind">
+            <button type="button" class="kfilter k-dsh" data-kind="dsh" aria-pressed="false" title="DeepSeek Harness"><span class="kb k-dsh">D</span></button>
+            <button type="button" class="kfilter k-claude" data-kind="claude" aria-pressed="false" title="Claude Code"><span class="kb k-claude">C</span></button>
+            <button type="button" class="kfilter k-codex" data-kind="codex" aria-pressed="false" title="Codex"><span class="kb k-codex">X</span></button>
+            <button type="button" class="kfilter k-omp" data-kind="omp" aria-pressed="false" title="Oh My Pi"><span class="kb k-omp">O</span></button>
+          </div>
+          <label class="fld">类别 <select id="fd-cat" aria-label="类别 Category"><option value="">全部 All</option></select></label>
+          <label class="chk"><input type="checkbox" id="fd-err"> 仅错误 <small>errors</small></label>
+          <input id="fd-q" class="search" type="search" placeholder="过滤 预览 / 目标 / agent / 主机…" aria-label="过滤 Filter" autocomplete="off" spellcheck="false">
+          <span id="fd-count" class="muted count"></span>
+        </div>
+        <div id="feed-list" class="feed scroll" role="log" aria-live="off" aria-label="动态 Feed"></div>
+      </section>
+
+    </main>
+
+    <aside id="drawer" class="drawer" hidden aria-label="详情 Details"></aside>
+  </div>
+</div>
+
+<div id="tip" class="tip" role="tooltip" hidden></div>
+<script src="app.js" defer></script>
+</body>
+</html>

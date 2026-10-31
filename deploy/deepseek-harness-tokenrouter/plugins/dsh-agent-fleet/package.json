@@ -1,0 +1,45 @@
+{
+  "name": "@local/dsh-agent-fleet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent Fleet: live multi-host, multi-cluster view of DSH / Claude Code / Codex / Oh My Pi agents, their subagents, ACP children, pods and files",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "agent-fleet": "bin/agent-fleet.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./lib/*": "./lib/*"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build:collector": "node tools/build-collector.mjs"
+  }
+}

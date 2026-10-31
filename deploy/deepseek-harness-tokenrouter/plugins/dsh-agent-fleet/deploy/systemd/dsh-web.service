@@ -1,0 +1,19 @@
+# DeepSeek Harness Web on server-bochao-01 (systemd --user), loopback only; browsers reach it through the edge at
+# http://10.0.60.98:443/dsh/. --trusted-host admits the edge's Host header; DSH compares Origin with Host.
+# Placeholders: @@DSH@@ = dsh launcher wrapper (loads ~/.config/agent-fleet/agents.env).
+[Unit]
+Description=DeepSeek Harness Web (behind the Agent Fleet edge at /dsh/)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DSH_HOME=%h/.dsh
+Environment=PATH=%h/agent-fleet/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h
+ExecStart=@@DSH@@ --profile web --host 127.0.0.1 --port 3080 --no-open --public-url http://10.0.60.98:443/dsh/ --trusted-host 10.0.60.98:443 --trusted-host 10.0.60.98
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

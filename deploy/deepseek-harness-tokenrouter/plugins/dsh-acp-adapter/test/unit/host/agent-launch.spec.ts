@@ -148,3 +148,12 @@ describe('Codex subprocess loopback MCP routing', () => {
     },
   )
 })
+
+describe('Agent Fleet launch attribution', () => {
+  it('names the launching DSH session without touching the profile environment', async () => {
+    const profile = config({ KEEP: 'yes' })
+    const launch = await prepareAgentLaunch('claude', profile, '/workspace', subprocess, undefined, undefined, 'session-1234')
+    expect(launch.env).toEqual({ KEEP: 'yes', AGENT_FLEET_VIA: 'dsh:session-1234' })
+    expect(profile.env).toEqual({ KEEP: 'yes' })
+  })
+})

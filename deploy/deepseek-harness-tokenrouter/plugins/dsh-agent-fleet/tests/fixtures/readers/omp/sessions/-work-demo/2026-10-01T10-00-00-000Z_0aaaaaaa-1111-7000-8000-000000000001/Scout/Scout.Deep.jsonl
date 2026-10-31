@@ -1,0 +1,6 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-10-01T10:00:09.000Z","pad":"    "}
+{"type":"session","version":3,"id":"0aaaaaaa-4444-7000-8000-000000000004","timestamp":"2026-10-01T10:00:09.000Z","cwd":"/work/demo","parentSession":"0aaaaaaa-9999-7000-8000-000000000009"}
+{"type":"model_change","id":"mc9000","parentId":null,"timestamp":"2026-10-01T10:00:09.050Z","runtime":{"version":"18.0.0"},"model":"acme/model-b"}
+{"type":"session_init","id":"si9000","parentId":null,"timestamp":"2026-10-01T10:00:09.060Z","agent":"scout","task":"Complete assignment thoroughly","resolvedModel":"acme/model-b:max","tools":["read"],"spawns":"*"}
+{"type":"message","id":"m9200","parentId":null,"timestamp":"2026-10-01T10:00:09.200Z","runtime":{"version":"18.0.0"},"message":{"timestamp":1790848809200,"role":"user","content":[{"type":"text","text":"Dig into the parser"}],"attribution":"agent"}}
+{"type":"message","id":"m10000","parentId":null,"timestamp":"2026-10-01T10:00:10.000Z","runtime":{"version":"18.0.0"},"message":{"timestamp":1790848809300,"role":"assistant","content":[{"type":"text","text":"Parser digested"}],"model":"model-a","provider":"acme","stopReason":"stop","usage":{"input":10,"output":20,"cacheRead":300,"cacheWrite":40,"totalTokens":370,"cost":{"total":0.5}},"duration":2900,"ttft":800}}
