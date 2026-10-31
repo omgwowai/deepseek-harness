@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HUB_URL, panelBase, panelLocation, panelNonceLocation, resolveConfig, tokenGoesInUrl } from "./lib/plugin/config.mjs";
+import { HUB_URL, credentialGoesInUrl, panelBase, panelLocation, resolveConfig } from "./lib/plugin/config.mjs";
 import { startEmbedded } from "./lib/plugin/embedded.mjs";
 import { resolveFamily } from "./lib/plugin/graph.mjs";
 import { createEmbeddedHub, createHttpHub, tokenReader, withSnapshotCache } from "./lib/plugin/hub-client.mjs";
@@ -64,10 +64,10 @@ function sessionIdOf(payload) {
 const TOKEN_HEADER = "x-agent-fleet-token";
 
 /**
- * Mints the panel's one-time URL credential: POST /api/session-nonce with the hub token. The browser that loads
- * `<panelBase>?nonce=…` gets the HttpOnly cookie and a 302 to the bare panel, so the raw token never enters a URL, a
- * fragment or page storage. Remote mode talks to hubUrl (default 127.0.0.1:7840); embedded mode to the local hub
- * port this process listens on (startEmbedded passes settings.httpPort to startHub).
+ * Mints the panel's one-time URL credential: POST /api/session-nonce with the hub token. The panel loaded from
+ * `<panelBase>#nonce=…` redeems it once for a session key it keeps in memory (POST /api/session), so the raw token
+ * never enters a URL, a fragment or page storage. Remote mode talks to hubUrl (default 127.0.0.1:7840); embedded mode
+ * to the local hub port this process listens on (startEmbedded passes settings.httpPort to startHub).
  */
 async function mintPanelNonce(settings, token) {
   const root = settings.mode === "embedded" ? `http://127.0.0.1:${settings.httpPort}` : (settings.hubUrl ?? HUB_URL);
@@ -165,9 +165,8 @@ export function apply(ctx, config, deps = {}) {
     const sessionId = sessionIdOf(payload);
     await ready;
     const base = panelBase(settings);
-    if (!tokenGoesInUrl(base)) return { url: panelLocation(base, { sessionId }), mode: settings.mode };
-    const nonce = await mintPanelNonce(settings, await localToken());
-    return { url: panelNonceLocation(base, { nonce, sessionId }), mode: settings.mode };
+    const nonce = credentialGoesInUrl(base) ? await mintPanelNonce(settings, await localToken()) : "";
+    return { url: panelLocation(base, { nonce, sessionId }), mode: settings.mode };
   });
 
   registerShellEnv(ctx, log);

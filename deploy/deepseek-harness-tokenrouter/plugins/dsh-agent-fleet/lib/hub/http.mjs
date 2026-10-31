@@ -1,10 +1,12 @@
 // Hub HTTP server (loopback only): the panel's static files, the JSON API (`GET /api/<method>`), the SSE delta
-// stream (`GET /api/stream`), the cookie exchanges (`GET /?token=…`, `GET /?nonce=…` → Set-Cookie + 302) and the
-// one-time nonce mint behind the panel's URL (`POST /api/session-nonce`).
+// stream (`GET /api/stream`), the panel credentials (`POST /api/session-nonce` mints the plugin's one-time nonce,
+// `POST /api/session` redeems it for a panel session key) and the manual cookie exchange (`GET /?token=…` →
+// Set-Cookie + 302).
 //
-// Public: /api/health (liveness only: `{ok, version}`) and the panel shell (index.html / app.js / app.css hold no
-// fleet data, and the cookie exchange has to be able to load them before it has any credentials). Everything else
-// needs the token; `panel/fixtures/**` is never served at all (see serveStatic). With a base prefix (`--base /fleet`)
+// Public: /api/health (liveness only: `{ok, version}`), the panel shell (index.html / app.js / app.css hold no fleet
+// data, and the page has to load before it holds any credential) and the nonce redemption (the nonce is the
+// credential). Everything else needs the token or a panel session key; `panel/fixtures/**` is never served at all
+// (see serveStatic). With a base prefix (`--base /fleet`)
 // every route also answers under that prefix. No CORS, no framing headers (DSH embeds the panel in an iframe), never
 // a query string or credential in logs.
 import { createServer } from "node:http";
@@ -12,7 +14,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { HUB_METHODS } from "../protocol.mjs";
 import { ApiError } from "./api.mjs";
-import { isLoopbackAddress } from "./auth.mjs";
+import { isLoopbackAddress, NONCE_HEADER } from "./auth.mjs";
 
 const LOOPBACK_BIND = new Set(["127.0.0.1", "::1", "localhost"]);
 const MIME = {
@@ -152,25 +154,25 @@ export function startHttpServer({ host = "127.0.0.1", port, base = "", auth, api
       if (path.startsWith(`${prefix}/`)) path = path.slice(prefix.length);
     }
 
-    // Every route is a read except this mint: it hands out a one-time URL credential and also sets the cookie, so a
-    // panel that received its token in the fragment can exchange it and survive a reload without storing it.
-    const minting = request.method === "POST" && path === "/api/session-nonce";
-    if (!minting && request.method !== "GET" && request.method !== "HEAD") return sendJson(request, response, 405, { error: "method not allowed" }, { allow: "GET, HEAD" });
-    if (minting) {
+    // Every route is a read except two body-less POSTs: the nonce mint (the token itself, never a session key) hands
+    // out the panel's one-time credential and also sets the cookie, so a page holding a fragment token survives a
+    // reload; the redemption (the nonce) trades that credential for the session key the panel sends as a header and
+    // sets the same cookie (auth.mjs openSession).
+    const posting = request.method === "POST" && (path === "/api/session-nonce" || path === "/api/session");
+    if (!posting && request.method !== "GET" && request.method !== "HEAD") return sendJson(request, response, 405, { error: "method not allowed" }, { allow: "GET, HEAD" });
+    if (posting) {
       request.resume();
-      if (!auth.authenticate(request)) {
+      if (path === "/api/session") {
+        const session = auth.openSession(request.headers[NONCE_HEADER]);
+        if (session === null) return sendJson(request, response, 401, { error: "invalid or expired nonce" });
+        return sendJson(request, response, 200, { session }, { "set-cookie": auth.cookie() });
+      }
+      if (!auth.holdsToken(request)) {
         return sendJson(request, response, 401, { error: "unauthorized: send the token as Authorization: Bearer, x-agent-fleet-token or the agent_fleet cookie" }, { "www-authenticate": 'Bearer realm="agent-fleet"' });
       }
       return sendJson(request, response, 200, auth.mintNonce(), { "set-cookie": auth.cookie() });
     }
 
-    if (path === "/" && url.searchParams.has("nonce")) {                    // one-time exchange (the plugin's panel-url)
-      const nonce = url.searchParams.get("nonce");
-      if (!auth.consumeNonce(nonce)) return sendJson(request, response, 401, { error: "invalid or expired nonce" });
-      url.searchParams.delete("nonce");
-      const rest = url.searchParams.size === 0 ? "" : `?${url.searchParams}`;
-      return respond(request, response, 302, "", { location: `./${rest}`, "set-cookie": auth.cookie() });
-    }
     if (path === "/" && url.searchParams.has("token")) {                    // cookie exchange (manual entry)
       if (!auth.accepts(url.searchParams.get("token"))) return sendJson(request, response, 401, { error: "invalid token" });
       url.searchParams.delete("token");

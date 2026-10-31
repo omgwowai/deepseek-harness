@@ -38,11 +38,15 @@ auto-reconnect) and `setOnline(true)` heals it.
 | `api/file?host=H&path=P` | `FilePreview` |
 | `api/query?target=pod\|file&category=a,b&since=ms&limit=N` | `{items:[{agent, event}]}`; used to complete the pod/file touch index beyond what the feed carried. |
 | `api/hosts` | `{hosts: Host[]}` (not required; hosts arrive in the snapshot and deltas). |
+| `POST api/session` (header `x-agent-fleet-nonce`) | `{session}`: the panel session key for the plugin's `#nonce=…`; `401` for a spent or expired nonce. |
 
-Errors are `{error}` with an HTTP status; `401` shows an "unauthorized" banner. A token in the URL fragment
-(`#token=…`) is moved into `sessionStorage`, removed from the address bar and sent as `x-agent-fleet-token`; the
-stream then uses `fetch` instead of `EventSource` (which cannot set headers). With a cookie (set by `/?token=`) the
-plain `EventSource` is used.
+Errors are `{error}` with an HTTP status; `401` shows an "unauthorized" banner. A credential in the URL fragment is
+removed from the address bar and kept in page memory only (never `sessionStorage`/`localStorage`): `#nonce=…` (the
+plugin's panel URL) is redeemed once with `POST api/session` for a session key, `#token=…` (manual entry) is used as
+is and also exchanged for the HttpOnly cookie. Either goes out as `x-agent-fleet-token`, and the stream then uses
+`fetch` instead of `EventSource` (which cannot set headers). Without one the page relies on the cookie (set by
+`/?token=`) and the plain `EventSource`. The header is what works when the panel is an iframe of another site (the
+desktop app's dsh-app:// page), where the browser withholds the SameSite cookie.
 
 ## Behaviour notes
 

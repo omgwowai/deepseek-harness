@@ -65,10 +65,12 @@ test("URL hash round-trips agent keys and ignores junk", () => {
   assert.deepEqual([...back.kinds], ["claude", "omp"]);
   assert.equal(back.q, "foo bar");
   assert.equal(back.focus, "ses-1");
-  const junk = P.parseHash("#view=nonsense&kind=dsh,martian,codex&token=t0k");
+  const junk = P.parseHash("#view=nonsense&kind=dsh,martian,codex&token=t0k&nonce=n0");
   assert.equal(junk.view, null);
   assert.deepEqual([...junk.kinds], ["dsh", "codex"]);
   assert.equal(junk.token, "t0k");
+  assert.equal(junk.nonce, "n0");
+  assert.doesNotMatch(P.buildHash(junk), /t0k|n0|token|nonce/, "rewriting the hash drops the credentials from the address bar");
   assert.equal(P.parseHash("").view, null);
 });
 
@@ -219,24 +221,6 @@ test("fleet rows: the signature ignores the clock, the time cells are refreshed 
   assert.match(html, /<span class="muted" data-live="since" data-t="1500000">8m20s<\/span>/, "live counter carries its start time");
   assert.notEqual(P.agentRowHtml(a, { ...row, now: 5_600_000 }), html, "the rendered time advances without a rebuild");
   assert.doesNotMatch(P.agentRowHtml({ ...a, status: "waiting", live: { ...a.live, since: null } }, { ...row, now: 2_000_000 }), /data-live="since"/, "no counter without a live start");
-});
-
-// Regression (F7): the fragment token used to be persisted in sessionStorage, where any same-origin script can read it.
-// It must stay in memory and be exchanged once for the hub's HttpOnly cookie instead.
-test("panel: the fragment token is exchanged for the HttpOnly cookie and never stored", async () => {
-  const calls = [];
-  const stub = (url, init) => { calls.push({ url, init }); return Promise.resolve({ ok: true }); };
-  await P.sessionNonceRequest("deadbeef", stub, "/fleet/");
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "/fleet/api/session-nonce");
-  assert.equal(calls[0].init.method, "POST");
-  assert.deepEqual(plain(calls[0].init.headers), { "x-agent-fleet-token": "deadbeef" });
-  assert.equal(calls[0].init.credentials, "same-origin", "the browser only stores Set-Cookie for a same-origin request");
-  assert.equal(calls[0].init.cache, "no-store");
-  const src = readFileSync(panelDir + "app.js", "utf8");
-  assert.doesNotMatch(src, /(sessionStorage|localStorage)\s*\.\s*(set|get)Item/, "the token must never be persisted");
-  assert.doesNotMatch(src, /(sessionStorage|localStorage)\s*\[/, "the token must never be persisted");
-  assert.match(src, /S\.token = '';\s+\/\/ memory only/, "boot starts with no token and relies on the cookie");
 });
 
 /* ───────────── demo fixture ───────────── */

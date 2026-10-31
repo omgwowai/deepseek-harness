@@ -113,13 +113,19 @@ Runtime: Node ≥ 22.15 (`zlib.createZstdDecompress`, `node:sqlite` with ≥ 22.
   `GET /api/pods`, `GET /api/pod?key=K` (pod + touches + recent kube events), `GET /api/file?host=H&path=P`
   (proxied to that host's collector, or `kubectl exec cat` for pods with no collector), `GET /api/query?…`
   (tool search: `kind,site,host,category,target,text,since,limit`), `GET /api/hosts`, `GET /api/health`,
-  `POST /api/session-nonce`.
+  `POST /api/session-nonce`, `POST /api/session`.
   Auth: token in `~/.config/agent-fleet/token` (0600, 64 hex). Accepted as `Authorization: Bearer`, header
-  `x-agent-fleet-token`, or cookie `agent_fleet=…` (set by `GET /?token=…` or by the one-time `GET /?nonce=…`; both
-  302 to `/` with `cache-control: no-store` and `referrer-policy: no-referrer`). `/api/health` is open but answers
+  `x-agent-fleet-token`, or cookie `agent_fleet=…` (set by `GET /?token=…`, which 302s to `/` with
+  `cache-control: no-store` and `referrer-policy: no-referrer`). `/api/health` is open but answers
   liveness only (`{ok, version}`, still 200); the full body (ports, hostId, upstream, kube states) needs the token.
-  `POST /api/session-nonce` (token) mints a single-use 60 s nonce for the panel URL, so the raw token never enters a
-  URL, a fragment or page storage. Host header policy: loopback names and `--public-host` names only;
+  Panel sessions: `POST /api/session-nonce` (the token itself) mints a single-use 60 s nonce for the plugin's panel
+  URL (`#nonce=…`, fragment only); the panel redeems it once with `POST /api/session` (header `x-agent-fleet-nonce`)
+  for a session key (`{session}`, 32 base64url characters, kept in page memory) that it sends as
+  `x-agent-fleet-token`. A session key reads everything the token reads but cannot mint nonces; the hub keeps up to
+  256 (least recently used go first) until it restarts. Both POSTs also set the cookie for same-site pages. The header
+  is what the desktop app needs: its dsh-app:// page embeds the loopback hub in an iframe, where the browser withholds
+  the SameSite cookie. The raw token never enters a URL, a fragment or page storage. Host header policy: loopback
+  names and `--public-host` names only;
   `x-forwarded-host` opens a name only if that name is one of them, and a Host that is neither answers 403 (the
   deployed hub passes `--public-host 10.0.60.98` because the edge forwards that Host).
   When `--base /fleet` is set, every route also answers under that prefix and the panel uses relative URLs.
@@ -182,8 +188,8 @@ A bare prefix (`/fleet`, `/dsh`) answers 302 (not 301) to the trailing-slash for
   counts), `list` (filters: site, host, kind, status, role, text, since), `family` (by key or DSH session id),
   `agent` (one agent + recent events), `pods` / `pod`, `files` (files touched by an agent or by everyone),
   `file` (preview one file via collector), `query` (tool-call search). Output: compact JSON + text render.
-* Browser: sidebar panel + `main` page "Agent Fleet" (iframe of the panel served by the hub; the URL carries a
-  one-time `?nonce=…` — with `#focus=…` when a session is given — that the hub turns into the HttpOnly cookie)
+* Browser: sidebar panel + `main` page "Agent Fleet" (iframe of the panel served by the hub; the URL fragment carries
+  a one-time `#nonce=…`, plus `&focus=…` when a session is given, that the panel redeems for its session key)
   and session tab `conversation.view` id `agent-fleet` that opens the panel focused on the current session's family.
 
 ## Panel (`panel/`)
@@ -206,8 +212,9 @@ URL hash state: `#view=timeline&key=<agentKey>`, `#focus=<dshSessionId>`.
   (iptables already restricts 443 to 10.0.0.0/8 and 192.168.0.0/16).
 * Tokens: the API token (`~/.config/agent-fleet/token`), the ingest token (`ingest-token`, sent only in `hello`) and
   the Mac's copies (`upstream-token`, `upstream-ingest-token`), all 0600. A token never rides in a URL that gets
-  logged: the plugin's panel URL carries a single-use 60 s `?nonce=…` (`POST /api/session-nonce`) that the hub
-  exchanges for the HttpOnly cookie, and a manual `#token=` fragment is exchanged for the same cookie.
+  logged: the plugin's panel URL carries a single-use 60 s `#nonce=…` in the fragment that the panel redeems for an
+  in-memory session key (`POST /api/session`), and a manual `#token=` fragment stays in page memory and is exchanged
+  for the HttpOnly cookie.
 * Collector redacts previews, command lines and file content (`lib/redact.mjs`); refuses `isSecretPath`.
 * Kubeconfig copy on the server at `~/.config/agent-fleet/kubeconfig.yaml` (0600); never logged, never sent.
 * File preview is read-only; no endpoint writes, kills or execs anything user-controlled. Pod file reads pass the

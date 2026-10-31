@@ -96,8 +96,9 @@ curl -s http://127.0.0.1:7899/api/health
 - `--no-local` skips the in-process collector, so the hub starts with no hosts.
 - The token file is created with mode `0600` when missing; `/api/health` is public as liveness only (`{ok, version}`,
   still 200) and the panel shell is public, every other `api/*` route needs the token (`x-agent-fleet-token`,
-  `Authorization: Bearer`, or the cookie set by `GET /?token=…`; the plugin's panel URL carries a one-time `?nonce=…`
-  that sets the same cookie instead of the token). The full health body needs the token as well.
+  `Authorization: Bearer`, or the cookie set by `GET /?token=…`) or a panel session key: the plugin's panel URL carries
+  a one-time `#nonce=…` that the panel redeems (`POST /api/session`) for a key it keeps in memory and sends as
+  `x-agent-fleet-token`. The full health body needs the token as well.
 - The Host header is checked: loopback names and the `--public-host` names only; anything else answers 403. Behind the
   edge the browser's Host is the edge's, so the deployed hub passes `--public-host 10.0.60.98`.
 - Open `http://127.0.0.1:7899/` for the panel; the first visit takes the token in the fragment

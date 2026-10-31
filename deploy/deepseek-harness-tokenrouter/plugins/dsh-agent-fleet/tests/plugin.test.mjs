@@ -264,19 +264,19 @@ describe("host plugin in remote mode", () => {
     assert.match(down.error.message, /unreachable at http:\/\/127\.0\.0\.1:\d+.*is the hub running/);
   });
 
-  test("panel-url: same-origin /fleet/ and loopback hubs get a one-time nonce, other hosts never, validation", async () => {
+  test("panel-url: same-origin /fleet/ and loopback hubs get a one-time nonce in the fragment, other hosts never, validation", async () => {
     const dir = scratch("panel"), tokenFile = writeToken(dir);
     const hub = await startStubHub({ "session-nonce": () => ({ nonce: "n1", expiresAt: NOW + 60_000 }) });
     try {
       const remote = await loadPlugin({ mode: "remote", hubUrl: hub.url, tokenFile }, { home: dir });
-      assert.equal((await rpc(remote, "agent-fleet/panel-url", {})).body.result.value.url, "/fleet/?nonce=n1");
-      assert.equal((await rpc(remote, "agent-fleet/panel-url", { sessionId: DSH_ID })).body.result.value.url, `/fleet/?nonce=n1#focus=${DSH_ID}`, "a root-relative panel is on the DSH page's own origin");
+      assert.equal((await rpc(remote, "agent-fleet/panel-url", {})).body.result.value.url, "/fleet/#nonce=n1");
+      assert.equal((await rpc(remote, "agent-fleet/panel-url", { sessionId: DSH_ID })).body.result.value.url, `/fleet/#nonce=n1&focus=${DSH_ID}`, "a root-relative panel is on the DSH page's own origin");
       assert.equal(hub.calls.filter(call => call.method === "session-nonce").length, 2, "each panel URL mints its own single-use nonce");
       assert.equal(hub.calls.find(call => call.method === "session-nonce").token, TOKEN, "the nonce is minted with the hub token in a header, never in a URL");
       const direct = await loadPlugin({ mode: "remote", hubUrl: hub.url, tokenFile, panelUrl: "http://127.0.0.1:7840/" }, { home: dir });
       assert.equal((await rpc(direct, "agent-fleet/panel-url", { sessionId: "session-a b" })).body.result.error.message, "invalid DSH session id");
       const loopback = (await rpc(direct, "agent-fleet/panel-url", { sessionId: DSH_ID })).body.result.value.url;
-      assert.equal(loopback, `http://127.0.0.1:7840/?nonce=n1#focus=${DSH_ID}`);
+      assert.equal(loopback, `http://127.0.0.1:7840/#nonce=n1&focus=${DSH_ID}`);
       assert.ok(!loopback.includes(TOKEN), "the hub token appears nowhere in the URL");
       const external = await loadPlugin({ mode: "remote", hubUrl: hub.url, tokenFile, panelUrl: "https://fleet.example.test/panel/" }, { home: dir });
       const url = (await rpc(external, "agent-fleet/panel-url", {})).body.result.value.url;
@@ -410,7 +410,7 @@ describe("embedded mode (desktop)", () => {
     await failing.dispose();
   });
 
-  test("panel-url points at the local hub with a one-time nonce in the query", async () => {
+  test("panel-url points at the local hub with a one-time nonce in the fragment", async () => {
     const dir = scratch("embedded-panel"), tokenFile = join(dir, "token");
     writeFileSync(tokenFile, `${TOKEN}\n`);
     const stub = await startStubHub({ "session-nonce": () => ({ nonce: "n2", expiresAt: NOW + 60_000 }) });
@@ -418,7 +418,7 @@ describe("embedded mode (desktop)", () => {
     try {
       const ctx = await loadPlugin({ mode: "embedded", tokenFile, httpPort: port }, { home: dir, deps: { loadEmbedded: async () => embeddedDeps().deps } });
       const url = (await rpc(ctx, "agent-fleet/panel-url", { sessionId: DSH_ID })).body.result.value.url;
-      assert.equal(url, `http://127.0.0.1:${port}/?nonce=n2#focus=${DSH_ID}`, "the nonce is minted from this process's own hub port, not the panel base");
+      assert.equal(url, `http://127.0.0.1:${port}/#nonce=n2&focus=${DSH_ID}`, "the nonce is minted from this process's own hub port, not the panel base");
       assert.ok(!url.includes(TOKEN));
       await ctx.dispose();
     } finally { await stub.close(); }
@@ -768,13 +768,13 @@ describe("client.js", () => {
     client.exports.apply(client.ctx);
     const page = client.slots.registrations.find(entry => entry.options.name === "main");
     const loads = [];
-    const loadPanel = signal => { loads.push(signal); return Promise.resolve({ url: "http://127.0.0.1:7846/#token=t&focus=s" }); };
+    const loadPanel = signal => { loads.push(signal); return Promise.resolve({ url: "http://127.0.0.1:7846/#nonce=n&focus=s" }); };
     const mounted = client.runtime.mount(page.component, {});
     const body = client.runtime.mount(mounted.tree.type, { ...mounted.tree.props, loadPanel });
     await settle();
     const iframe = find(body.tree, node => node.type === "iframe");
     assert.ok(iframe, "iframe rendered once the URL is known");
-    assert.equal(iframe.props.src, "http://127.0.0.1:7846/#token=t&focus=s");
+    assert.equal(iframe.props.src, "http://127.0.0.1:7846/#nonce=n&focus=s");
     assert.equal(iframe.props.sandbox, "allow-scripts allow-same-origin allow-forms");
     assert.equal(iframe.props.referrerPolicy, "no-referrer");
     const panelWindow = { name: "panel" };

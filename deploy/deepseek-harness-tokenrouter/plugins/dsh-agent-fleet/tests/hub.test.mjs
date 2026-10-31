@@ -740,9 +740,10 @@ describe("auth and HTTP surface", () => {
     assert.equal((await fetch(`${url}/api/hosts`, { headers: { cookie: "agent_fleet=wrong" } })).status, 401);
   });
 
-  test("session nonce: an authenticated POST mints a one-time URL credential that sets the cookie once", async t => {
+  test("panel session: the token mints a one-time nonce, the nonce buys one session key that works as a header", async t => {
     const { url, token } = await startTestHub(t, { http: { base: "/fleet" } });
-    const mint = headers => fetch(`${url}/api/session-nonce`, { method: "POST", headers, redirect: "manual" });
+    const post = (path, headers) => fetch(`${url}${path}`, { method: "POST", headers, redirect: "manual" });
+    const mint = headers => post("/api/session-nonce", headers);
 
     const anonymous = await mint({});
     assert.equal(anonymous.status, 401, "no token, no nonce");
@@ -757,40 +758,53 @@ describe("auth and HTTP surface", () => {
     assert.ok(minted.expiresAt > Date.now());
     assert.equal(first.headers.get("set-cookie"), `agent_fleet=${token}; HttpOnly; SameSite=Strict; Path=/`, "the mint also stores the cookie, so a fragment token survives a reload");
 
-    const exchange = await fetch(`${url}/?nonce=${minted.nonce}&focus=abc`, { redirect: "manual" });
-    assert.equal(exchange.status, 302);
-    assert.equal(exchange.headers.get("location"), "./?focus=abc", "the nonce is dropped from the URL, other parameters stay");
-    assert.equal(exchange.headers.get("cache-control"), "no-store");
-    assert.equal(exchange.headers.get("referrer-policy"), "no-referrer");
-    const cookie = exchange.headers.get("set-cookie");
-    assert.equal(cookie, `agent_fleet=${token}; HttpOnly; SameSite=Strict; Path=/`);
-    assert.equal((await fetch(`${url}/api/hosts`, { headers: { cookie: cookie.split(";")[0] } })).status, 200, "the panel then talks with the cookie alone");
+    const redeemed = await post("/api/session", { "x-agent-fleet-nonce": minted.nonce });
+    assert.equal(redeemed.status, 200);
+    assert.equal(redeemed.headers.get("cache-control"), "no-store");
+    assert.equal(redeemed.headers.get("set-cookie"), `agent_fleet=${token}; HttpOnly; SameSite=Strict; Path=/`, "a same-site page also gets the cookie");
+    const { session } = await redeemed.json();
+    assert.match(session, /^[A-Za-z0-9_-]{32}$/);
+    assert.notEqual(session, token);
+    // An iframe of another site (the desktop app's dsh-app:// page) never sends the SameSite cookie: the key alone has to do.
+    assert.equal((await fetch(`${url}/api/hosts`, { headers: { "x-agent-fleet-token": session } })).status, 200, "the session key authenticates as a header");
+    assert.equal((await fetch(`${url}/api/hosts`, { headers: { authorization: `Bearer ${session}` } })).status, 200);
+    const stream = await fetch(`${url}/api/stream`, { headers: { "x-agent-fleet-token": session } });
+    assert.equal(stream.status, 200, "and opens the SSE stream");
+    await stream.body.cancel();
+    assert.equal((await mint({ "x-agent-fleet-token": session })).status, 401, "a session key reads; it cannot mint nonces");
 
-    assert.equal((await fetch(`${url}/?nonce=${minted.nonce}`, { redirect: "manual" })).status, 401, "single use");
-    assert.equal((await fetch(`${url}/?nonce=nope`, { redirect: "manual" })).status, 401);
-
+    assert.equal((await post("/api/session", { "x-agent-fleet-nonce": minted.nonce })).status, 401, "single use");
+    assert.equal((await post("/api/session", { "x-agent-fleet-nonce": "nope" })).status, 401);
+    assert.equal((await post("/api/session", {})).status, 401);
     const underBase = (await (await mint({ "x-agent-fleet-token": token })).json()).nonce;
-    const prefixed = await fetch(`${url}/fleet/?nonce=${underBase}`, { redirect: "manual" });
-    assert.equal(prefixed.status, 302, "the edge strips /fleet, so the exchange answers under the base too");
-    assert.equal(prefixed.headers.get("location"), "./");
+    assert.equal((await post("/fleet/api/session", { "x-agent-fleet-nonce": underBase })).status, 200, "the edge strips /fleet, so the redemption answers under the base too");
     assert.equal((await fetch(`${url}/api/session-nonce`, { headers: { "x-agent-fleet-token": token } })).status, 404, "GET mints nothing");
   });
 
-  test("nonces expire, are single use and stay bounded", () => {
+  test("nonces expire, are single use and stay bounded; session keys are capped, least recently used first", () => {
     let now = 1000;
-    const auth = createAuth({ token: "t".repeat(64), nonceTtlMs: 50, nonceLimit: 2, now: () => now });
+    const auth = createAuth({ token: "t".repeat(64), nonceTtlMs: 50, nonceLimit: 2, sessionLimit: 2, now: () => now });
+    const as = key => ({ headers: { "x-agent-fleet-token": key } });
     const once = auth.mintNonce();
-    assert.equal(auth.consumeNonce(once.nonce), true);
-    assert.equal(auth.consumeNonce(once.nonce), false, "single use");
-    assert.equal(auth.consumeNonce(""), false);
-    assert.equal(auth.consumeNonce(undefined), false);
+    const key = auth.openSession(once.nonce);
+    assert.match(key, /^[A-Za-z0-9_-]{32}$/);
+    assert.equal(auth.authenticate(as(key)), true);
+    assert.equal(auth.holdsToken(as(key)), false, "a session key is not the token");
+    assert.equal(auth.holdsToken(as("t".repeat(64))), true);
+    assert.equal(auth.openSession(once.nonce), null, "single use");
+    assert.equal(auth.openSession(""), null);
+    assert.equal(auth.openSession(undefined), null);
     const late = auth.mintNonce();
     now += 51;
-    assert.equal(auth.consumeNonce(late.nonce), false, "expired");
+    assert.equal(auth.openSession(late.nonce), null, "expired");
     const a = auth.mintNonce(), b = auth.mintNonce(), c = auth.mintNonce();
-    assert.equal(auth.consumeNonce(a.nonce), false, "the oldest pending nonce was evicted at the limit");
-    assert.equal(auth.consumeNonce(b.nonce), true);
-    assert.equal(auth.consumeNonce(c.nonce), true);
+    assert.equal(auth.openSession(a.nonce), null, "the oldest pending nonce was evicted at the limit");
+    const older = auth.openSession(b.nonce);
+    assert.equal(auth.authenticate(as(key)), true, "a key in use moves to the back");
+    const newest = auth.openSession(c.nonce);
+    assert.equal(auth.authenticate(as(older)), false, "at the cap the least recently used key goes first");
+    assert.equal(auth.authenticate(as(key)), true);
+    assert.equal(auth.authenticate(as(newest)), true);
   });
 
   test("Host header: loopback names and configured public hosts pass; X-Forwarded-Host opens nothing else", async t => {

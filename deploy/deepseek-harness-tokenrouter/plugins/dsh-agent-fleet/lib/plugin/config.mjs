@@ -137,26 +137,18 @@ export function panelBase(settings) {
 }
 
 /**
- * The token rides in the URL fragment (never sent to a server, never logged) when the browser reaches the hub directly on
- * loopback, or on the DSH page's own origin (a root-relative URL such as `/fleet/` behind the edge). Never for another host.
+ * The panel URL may carry a credential (the one-time nonce) when the browser reaches the hub directly on loopback, or
+ * on the DSH page's own origin (a root-relative URL such as `/fleet/` behind the edge). Never for another host.
  */
-export const tokenGoesInUrl = base => LOOPBACK_URL.test(base) || (base.startsWith("/") && !base.startsWith("//"));
-
-/** `<base>#token=…&focus=<dsh session id>` */
-export function panelLocation(base, { token = "", sessionId } = {}) {
-  const parts = [];
-  if (token !== "" && tokenGoesInUrl(base)) parts.push(`token=${encodeURIComponent(token)}`);
-  if (sessionId !== undefined) parts.push(`focus=${encodeURIComponent(sessionId)}`);
-  return parts.length === 0 ? base : `${base}#${parts.join("&")}`;
-}
+export const credentialGoesInUrl = base => LOOPBACK_URL.test(base) || (base.startsWith("/") && !base.startsWith("//"));
 
 /**
- * The panel URL that carries a credential: `<base>?nonce=…` (the hub consumes it, sets the HttpOnly cookie and
- * 302s to `<base>`) plus the optional focus fragment. Same rule as tokenGoesInUrl: only loopback hubs and the
- * DSH page's own origin get one.
+ * `<base>#nonce=…&focus=<dsh session id>`. Both ride in the fragment, which never reaches a server or a log: the panel
+ * redeems the nonce once for a session key it keeps in memory (`POST api/session`) and scrubs its address bar.
  */
-export function panelNonceLocation(base, { nonce = "", sessionId } = {}) {
-  const query = nonce === "" ? "" : `?nonce=${encodeURIComponent(nonce)}`;
-  const hash = sessionId === undefined ? "" : `#focus=${encodeURIComponent(sessionId)}`;
-  return `${base}${query}${hash}`;
+export function panelLocation(base, { nonce = "", sessionId } = {}) {
+  const parts = [];
+  if (nonce !== "" && credentialGoesInUrl(base)) parts.push(`nonce=${encodeURIComponent(nonce)}`);
+  if (sessionId !== undefined) parts.push(`focus=${encodeURIComponent(sessionId)}`);
+  return parts.length === 0 ? base : `${base}#${parts.join("&")}`;
 }

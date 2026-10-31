@@ -1,7 +1,7 @@
 // Browser half of Agent Fleet (loaded by DSH's module loader; the server half is index.js).
 //   · "Agent Fleet" in the sidebar → a full-height page that iframes the hub's panel
 //   · "Agent Fleet" tab beside Chat / Trajectory of a session → the same panel focused on that session's family
-// The iframe URL comes from the host's `agent-fleet/panel-url` RPC (one-time `?nonce=` in the query, never the token).
+// The iframe URL comes from the host's `agent-fleet/panel-url` RPC (a one-time `#nonce=` in the fragment, never the token).
 window.__ModuleLoader__.load({
   id: "@local/dsh-agent-fleet",
   factory: require => {

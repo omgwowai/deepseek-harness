@@ -282,7 +282,7 @@ function parseHash(hash) {
     view: VIEWS.includes(view) ? view : null,
     key: p.get('key') || '', site: p.get('site') || '', q: p.get('q') || '', focus: p.get('focus') || '',
     kinds: (p.get('kind') || '').split(',').filter((k) => KINDS.includes(k)),
-    pod: p.get('pod') || '', file: p.get('file') || '', token: p.get('token') || '',
+    pod: p.get('pod') || '', file: p.get('file') || '', token: p.get('token') || '', nonce: p.get('nonce') || '',
   };
 }
 function buildHash(st) {
@@ -344,27 +344,12 @@ function agentRowHtml(a, o) {
 
 const agentRowModel = (a, o) => ({ sig: agentRowSig(a, o), html: agentRowHtml(a, o) });
 
-/**
- * Exchanges the fragment token for the hub's HttpOnly session cookie: one `POST api/session-nonce` carrying the token
- * in the header. The token itself is never written to sessionStorage/localStorage (a same-origin script could read it)
- * and never to a URL; the cookie is what survives a reload. `fetchImpl`/`apiBase` are injected so tests can assert the
- * exact request. Never throws: a hub without the endpoint (405) simply leaves the page on its in-memory token.
- */
-function sessionNonceRequest(token, fetchImpl, apiBase) {
-  return fetchImpl(`${apiBase}api/session-nonce`, {
-    method: 'POST',
-    headers: token ? { 'x-agent-fleet-token': token } : {},
-    credentials: 'same-origin',
-    cache: 'no-store',
-  });
-}
-
 if (typeof document === 'undefined') {   // loaded by tests: expose the pure part and stop
   globalThis.__fleetPure = {
     KINDS, SITES, CATS, NAMESPACE, SITE_LABEL, STATUS_LABEL, ROLE_LABEL, CAT_LABEL, GAP_MS, GAP_VIRT, siteOfCluster, podKeyOfTarget, fileKeyOfTarget,
     splitFileKey, fileOpClass, fmtDur, fmtAge, fmtNum, fmtBytes, agentTitle, containerClass, buildGraph, rootOf, subtree, resolveFocus,
     packLanes, makeAxis, pickStep, tickTimes, bucketSpans, visibleSegments, createSseParser, parseHash, buildHash, summarizeTouches, esc, clip, clipPx,
-    ico, kindBadge, statusDot, agentRowSig, agentRowHtml, agentRowModel, isActive, sessionNonceRequest,
+    ico, kindBadge, statusDot, agentRowSig, agentRowHtml, agentRowModel, isActive,
   };
   return;
 }
@@ -2222,7 +2207,11 @@ function initEvents() {
   const norm = (h) => buildHash(parseHash(h));
   window.addEventListener('hashchange', () => {
     const h = parseHash(location.hash);
-    if (adoptToken(h)) { applyHash(h); S.hashSelf = null; writeHash(false); connect(); scheduleRender('all'); return; }
+    if (h.token || h.nonce) {                               // a new credential: off the address bar first, then reconnect with it
+      applyHash(h); S.hashSelf = null; writeHash(false); scheduleRender('all');
+      adoptCredential(h).then(connect);
+      return;
+    }
     if (location.hash === S.hashSelf || (S.hashSelf && norm(location.hash) === norm(S.hashSelf))) return;
     applyHash(h); scheduleRender('all');
   });
@@ -2231,25 +2220,32 @@ function initEvents() {
 }
 
 /**
- * A token in the URL fragment lives in this page's memory only and is exchanged for the HttpOnly cookie: nothing is
- * stored where a same-origin script could read it, and a reload authenticates with the cookie alone. The caller scrubs
- * the address bar.
+ * The credential a URL fragment carries stays in this page's memory and goes out as the `x-agent-fleet-token`
+ * header. It is never written to sessionStorage/localStorage (a same-origin script could read it there) or back into
+ * a URL; the caller scrubs the address bar.
+ *   #token=…  manual entry: used as is, and exchanged for the hub's HttpOnly cookie so a reload survives.
+ *   #nonce=…  the DSH plugin's panel URL: redeemed once (`POST api/session`) for a panel session key.
+ * The header is what works in the desktop app, which embeds the loopback hub in an iframe of its dsh-app:// page: the
+ * browser keeps the SameSite cookie out of that third-party frame. A spent or expired nonce leaves the page on the
+ * cookie, which still serves a same-site reload.
  */
-function adoptToken(h) {
-  if (!h.token) return false;
-  S.token = h.token;
-  keepCookie();
-  return true;
+async function adoptCredential(h) {
+  if (h.token) {
+    S.token = h.token;
+    postCredential('session-nonce', { 'x-agent-fleet-token': h.token });   // only its Set-Cookie matters
+    return;
+  }
+  const res = await postCredential('session', { 'x-agent-fleet-nonce': h.nonce });
+  const body = res && res.ok ? await res.json().catch(() => null) : null;
+  if (body && typeof body.session === 'string' && body.session !== '') S.token = body.session;
 }
-/** Best effort: the header authenticates this page already, the cookie is what survives a reload. */
-function keepCookie() {
-  try { sessionNonceRequest(S.token, (url, init) => fetch(url, init), API_BASE).catch(() => { /* no cookie: this page keeps the token */ }); }
-  catch { /* no fetch: this page keeps the token */ }
+/** Body-less POST to one of the hub's credential routes; null when the hub cannot be reached. */
+function postCredential(route, headers) {
+  return fetch(`${API_BASE}api/${route}`, { method: 'POST', headers, credentials: 'same-origin', cache: 'no-store' }).catch(() => null);
 }
 async function boot() {
   const h = parseHash(location.hash);
   S.token = '';                                             // memory only: never sessionStorage/localStorage
-  adoptToken(h);
   const qs = new URLSearchParams(location.search);
   initTimeline(); initEvents();
   if (qs.get('demo')) {
@@ -2257,12 +2253,14 @@ async function boot() {
     window.__fleet = { S, TL, demo: S.demo, draw: tlDraw };       // review / test hook, only present in ?demo=1
   }
   applyHash(h);
-  if (h.token) { S.hashSelf = null; writeHash(false); }       // never leave the token in the address bar
+  const credential = Boolean(h.token || h.nonce);
+  if (credential) { S.hashSelf = null; writeHash(false); }  // never leave a credential in the address bar
   syncControls();
   renderConn();
-  if (S.demo || S.conn.state !== 'down') connect();
   setInterval(() => { if (S.loaded) scheduleRender('tick'); else renderTop(); }, 1000);
   setInterval(() => { if (S.conn.state === 'down') renderConn(); }, 1000);
+  if (credential && !S.demo) await adoptCredential(h);
+  if (S.demo || S.conn.state !== 'down') connect();
 }
 
 /* ───────────────────────── 7. demo hub (?demo=1) ───────────────────────── */

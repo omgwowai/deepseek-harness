@@ -207,7 +207,7 @@ Agent DAG 在本机看会话家族，会话遥测让网关那边也能看到同�
 | Files | 被碰过的文件，按路径归并；点开是只读预览 |
 | Feed | 整个 fleet 的工具调用实时流 |
 
-面板的状态都在 URL hash 里（`#view=timeline&key=<agent key>`）；远程面板地址是 `http://10.0.60.98:443/fleet/`。插件打开面板时给的是 `/fleet/?nonce=…`（要定位会话时再加 `#focus=…`）：hub 把一次性 nonce 换成 HttpOnly cookie 并 302 到裸面板，所以原始 token 不进 URL、fragment 或页面存储。手动进入时仍然可以用 `#token=<token>`（只留在页面内存里，同样换成 cookie），`/?token=<token>` 也是一次性换 cookie。桌面应用用的是它自己 hub 的地址。
+面板的状态都在 URL hash 里（`#view=timeline&key=<agent key>`）；远程面板地址是 `http://10.0.60.98:443/fleet/`。插件打开面板时给的是 `/fleet/#nonce=…`（要定位会话时再加 `&focus=…`）：面板用这个一次性 nonce 向 hub 换一把会话密钥（`POST api/session`），只留在页面内存里，之后每个请求都放在 `x-agent-fleet-token` 头里发出，所以原始 token 不进 URL、fragment 或页面存储。用请求头而不用 cookie，是因为桌面应用把本机 hub 嵌在 dsh-app:// 页面的 iframe 里，浏览器不给这种跨站 iframe 发 SameSite cookie。手动进入时仍然可以用 `#token=<token>`（只留在页面内存里，同时换成 HttpOnly cookie），`/?token=<token>` 也是一次性换 cookie。桌面应用用的是它自己 hub 的地址。
 
 **延迟。** 实测（2026-10-31）：在各站点的会话文件里追加一行工具调用，到它出现在浏览器经 edge 订阅的 `/fleet/api/stream` 上，每个站点 60 个样本（时钟偏差已校正）：
 
@@ -360,7 +360,7 @@ ssh bochao_li@10.0.60.98 'journalctl --user -u dsh-web.service --no-pager | grep
 **安全模型。**
 
 - hub、collector、DSH Web 都只监听 `127.0.0.1`；唯一对外监听是 edge 的 `10.0.60.98:443`（iptables 已把 443 限制在内网网段）。
-- API token 在 `~/.config/agent-fleet/token`（0600，64 位十六进制），`x-agent-fleet-token`、`Authorization: Bearer` 或 cookie 都接受；`/api/health` 不带 token 只回 `{ok, version}`（存活检查），带 token 才有端口、hosts、upstream、kube 明细；面板外壳公开，其余接口都要 token。插件给面板的 URL 带一次性的 `?nonce=…`（`POST /api/session-nonce` 换取，60 s 内单次有效），hub 换成 HttpOnly cookie 后 302 到裸面板，所以原始 token 不进 URL、fragment 或页面存储；手动 `#token=` 入口仍然可用，也是换成同一个 cookie。hub 和 edge 的访问日志不记 query 和 cookie；Host 头只接受回环名和 `--public-host` 列出的名字，其余回 403（服务器 unit 带 `--public-host 10.0.60.98`，因为 edge 转发过去的 Host 就是它）。
+- API token 在 `~/.config/agent-fleet/token`（0600，64 位十六进制），`x-agent-fleet-token`、`Authorization: Bearer` 或 cookie 都接受；`/api/health` 不带 token 只回 `{ok, version}`（存活检查），带 token 才有端口、hosts、upstream、kube 明细；面板外壳公开，其余接口都要 token 或面板会话密钥。插件给面板的 URL 在 fragment 里带一次性的 `#nonce=…`（`POST /api/session-nonce` 用 token 换取，60 s 内单次有效），面板用它换一把会话密钥（`POST /api/session`），只放在内存和请求头里；会话密钥能读 token 能读的全部内容，但不能再换 nonce，hub 最多保留 256 把（最久没用的先淘汰），hub 重启后全部失效。所以原始 token 不进 URL、fragment 或页面存储；手动 `#token=` 入口仍然可用，换成 HttpOnly cookie。hub 和 edge 的访问日志不记 query 和 cookie；Host 头只接受回环名和 `--public-host` 列出的名字，其余回 403（服务器 unit 带 `--public-host 10.0.60.98`，因为 edge 转发过去的 Host 就是它）。
 - collector 的 ingest 端口另有一把 token（`--ingest-token-file`，默认文件 `~/.config/agent-fleet/ingest-token`，0600），走 TCP ingest 的 collector 在 `hello` 里带上，hub 做常量时间比较；hub 自己拨的通道（`kubectl exec`、`--dial-ssh`、进程内 collector）视为可信。
 - collector 的文件预览、命令行和文件内容都过 `lib/redact.mjs`；看起来是密钥的路径直接拒绝；预览只读、256 KiB 上限、二进制不返回正文。
 - kubeconfig 在服务器 `~/.config/agent-fleet/kubeconfig.yaml`（0600），不写日志、不发给任何 collector。
@@ -391,7 +391,7 @@ node bin/agent-fleet.mjs status --url http://127.0.0.1:7846
 | 主机一直 `connecting` / `offline` | 手动试 `ssh -W 127.0.0.1:7841 bochao_li@10.0.60.98`；hub 的 ingest 是否在 7841 |
 | 某个集群报错 | `kube` 里该站点的 `status` / `error`；context 名是 `chengdu`、`weihai`、`ulanqab-iron`、`ulanqab-osmium`，`kubectl` 要在 PATH 上 |
 | Pod 没有 collector | Pod 有没有 `agent-fleet.omgwow.ai/collect=true`；Pod 里 `node --version` 是否 ≥ 22.15；`/tmp/agent-fleet/collector.mjs` 是否推送过 |
-| 面板提示未授权 | token 过期或没带：用 `#token=…` 或 `/?token=…` 重新换 cookie |
+| 面板提示未授权 | 插件打开的面板：hub 重启过，会话密钥失效，重新打开 Agent Fleet 页面或页签即可；手动打开的面板：用 `#token=…` 或 `/?token=…` 重新换 cookie |
 | 443 打不开 | `deploy/deploy-server.sh status`；`journalctl -u agent-fleet-edge.service`；需要回退时 `deploy/deploy-server.sh rollback` |
 | DSH Web 打不开 | `journalctl --user -u dsh-web.service`；启动地址按上面的 `grep "dsh web:"` 取 |
 
