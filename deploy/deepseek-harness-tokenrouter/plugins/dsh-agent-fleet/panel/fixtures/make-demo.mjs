@@ -497,7 +497,7 @@ const AGENT_ROWS = [
   { tag: "A1", kind: "dsh", host: MAC, role: "main", title: "重构 agent fleet 面板", start: 47 * M, status: "running", model: DSHM, effort: "high", n: 105, pace: "slow", prof: "macui", pend: "acp", turns: 1, quiet: true, steer: [0.35, 0.72], acp: { provider: "codex-acp", kind: "codex", tag: "A1a" } },
   { tag: "A1a", kind: "codex", host: MAC, role: "main", title: "Implement Fleet view refactor (ACP)", start: 46 * M, status: "running", model: CODEX, effort: "high", n: 130, pace: "slow", prof: "macui", pend: "tool", turns: 7, parent: { tag: "A1", via: "acp", exact: true, call: "acp-turn-3" }, ctxGrowth: 4200, compact: 0.55 },
   { tag: "A1a-1", kind: "codex", host: MAC, role: "subagent", name: "explorer", title: "explorer", desc: "explorer · /root/explorer", start: 21 * M, end: 17 * M, status: "done", model: CODEX, effort: "medium", n: 46, pace: "fast", prof: "macui", turns: 1, parent: { tag: "A1a", via: "file", exact: true, call: "spawn" } },
-  { tag: "A1a-2", kind: "codex", host: MAC, role: "subagent", name: "worker", title: "worker", desc: "worker · /root/worker", start: 6 * M, status: "running", model: CODEX, effort: "medium", n: 40, pace: "fast", prof: "macui", pend: "model", turns: 1, parent: { tag: "A1a", via: "file", exact: true, call: "spawn" } },
+  { tag: "A1a-2", kind: "codex", host: MAC, role: "subagent", name: "worker", title: "worker", desc: "worker · /root/worker", start: 6 * M, status: "running", model: CODEX, effort: "medium", n: 40, pace: "fast", prof: "macui", pend: "tool", turns: 1, parent: { tag: "A1a", via: "file", exact: true, call: "spawn" } },
   { tag: "P1", kind: "dsh", host: MAC, role: "projection", name: "explorer", title: "explorer", desc: "DSH mirror of the ACP subagent explorer", start: 21 * M - 1800, end: 17 * M - 1800, noUsage: true, status: "done", model: DSHM, effort: "medium", n: 26, pace: "fast", prof: "macui", turns: 1, parent: { tag: "A1", via: "acp", exact: true, call: null } },
   { tag: "A2", kind: "claude", host: MAC, role: "main", title: "修复 cordis 插件加载失败", start: 3.2 * H, last: 9 * M, status: "idle", model: OPUS, effort: "high", n: 66, pace: "slow", prof: "maccordis", turns: 5, wins: [[192 * M, 160 * M], [112 * M, 101 * M], [63 * M, 49 * M], [47 * M, 41 * M], [28 * M, 9 * M]], live: { alive: true, pid: 4121 } },
   { tag: "A2a", kind: "claude", host: MAC, role: "subagent", name: "Explore", title: "Explore cordis plugin resolution", desc: "Explore how cordis resolves plugin entry points", start: 2.82 * H, end: 2.75 * H, status: "done", model: SONNET, effort: "medium", n: 30, pace: "fast", prof: "maccordis", turns: 1, parent: { tag: "A2", via: "file", exact: true, call: "spawn" } },
@@ -604,9 +604,11 @@ const PACE = {
 const kb = (site, ctx = CTX[site]) => `kubectl --context ${ctx} -n ${NS}`;
 const podT = (site, op, name, ctx, container) => ({ type: "pod", op, site, cluster: ctx, namespace: NS, name, ...(container && { container }) });
 function kget(site, o = {}) {
-  const ctx = o.ctx ?? CTX[site];
-  return { act: "bash", cat: "k8s", cmd: `${kb(site, ctx)} get pods${o.sel ? ` -l ${o.sel}` : ""}${o.wide ? " -o wide" : ""}`,
-    targets: [{ type: "k8s", op: "get", site, cluster: ctx, namespace: NS, resource: "pod" }], dur: [520, 1900] };
+  const ctx = o.ctx ?? CTX[site], res = o.res ?? "pod";
+  const plural = { pod: "pods", deployment: "deployments", statefulset: "statefulsets", job: "jobs", node: "nodes" }[res] ?? res;
+  // same shape lib/targets.mjs emits: a selector is reported as `selector`, never as a name
+  return { act: "bash", cat: "k8s", cmd: `${kb(site, ctx)} get ${plural}${o.name ? ` ${o.name}` : ""}${o.sel ? ` -l ${o.sel}` : ""}${o.wide ? " -o wide" : ""}`,
+    targets: [{ type: "k8s", op: "get", site, cluster: ctx, namespace: NS, resource: res, ...(o.name && { name: o.name }), ...(o.sel && !o.name && { selector: o.sel }) }], dur: [520, 1900] };
 }
 function kpod(site, verb, name, o = {}) {
   const ctx = o.ctx ?? CTX[site], base = kb(site, ctx);
@@ -625,6 +627,33 @@ function kssh(host, inner, o = {}) {
 
 const R = MAC_ROOT, V = SRV_ROOT, BN = "/data/bench", WS = "/workspace";
 const OBS = "/Users/lbc/Documents/Obsidian/notes", WT = "/Users/lbc/Desktop/work/TokenRouterNew";
+
+// Git work trees per host (Contract B): the hub resolves one Repo per directory a file target names, so every
+// fixture path that is meant to sit inside a repo must be under one of these roots. Paths outside any root
+// (~/.dsh, ~/.config, /tmp, /home/bochao_li/monitor, /data/agent-fleet) become directory anchors instead.
+// mac's agent-fleet checkout is a linked worktree of the same remote the server has a plain checkout of: the
+// panel groups repos by remote, so that pair must collapse into one group. iron's checkout is detached (head,
+// no branch) while it bisects the shard boundary bug.
+const REPO_ROWS = {
+  [MAC]: [
+    { root: R, remote: "github.com/omgwowai/deepseek-harness", branch: "feat/agent-fleet-20261030", worktree: true },
+    { root: WT, remote: "github.com/omgwowai/TokenRouter", branch: "main" },
+    { root: OBS, remote: "github.com/omgwowai/obsidian-notes", branch: "main" },
+  ],
+  [SRV]: [{ root: V, remote: "github.com/omgwowai/deepseek-harness", branch: "feat/agent-fleet-20261030" }],
+  [SG]: [{ root: BN, remote: "github.com/omgwowai/bench", branch: "main" }],
+  [CDM]: [{ root: WS, remote: "github.com/omgwowai/megatron-lm", branch: "main" }],
+  [WHD]: [{ root: WS, remote: "github.com/omgwowai/vllm-serve", branch: "main" }],
+  [IRD]: [{ root: WS, remote: "github.com/omgwowai/data-pipeline", head: "7d3a91c0b4e2" }],
+  [OSDEV]: [{ root: WS, remote: "github.com/omgwowai/ckpt-eval", branch: "feat/step-12000" }],
+};
+
+function buildRepos() {
+  return Object.fromEntries(Object.entries(REPO_ROWS).map(([host, list]) => [host, list.map((r) => ({
+    root: r.root, remote: r.remote,
+    ...(r.branch && { branch: r.branch }), ...(r.head && { head: r.head }), ...(r.worktree && { worktree: true }),
+  }))]));
+}
 
 /** Per-profile pools. files/edits/writes: [weight, path]; greps: [pattern, path]; globs: [pattern, dir]; cmds: [weight, text, opts]. */
 const POOLS = {
@@ -975,12 +1004,14 @@ const SPECIALS = {
   A1a: [
     [0.58, MSG("explorer", "Report only file:line pairs for every parent/child derivation; do not edit anything.")],
     [0.74, sh("git diff --stat", { dur: [60, 300] })],
+    [0.82, sh("cat /Users/lbc/Documents/Obsidian/notes/projects/agent-fleet.md", { targets: [fT("read", MAC, `${OBS}/projects/agent-fleet.md`)], dur: [20, 90] })],
     [0.93, MSG("worker", "Also cover the cycle-guard case in tests/panel.test.mjs before you run the suite.")],
   ],
   "A1a-1": [[0.4, sh('rg -n "parent\\.key|links" panel/app.js', { targets: [fT("search", MAC, `${MAC_ROOT}/panel/app.js`)], dur: [40, 260] })]],
   A2: [
     [0.30, sh("tail -n 60 ~/.dsh/logs/plugin-load.log", { targets: [fT("read", MAC, "/Users/lbc/.dsh/logs/plugin-load.log")], dur: [25, 110] })],
     [0.52, sh("cat deploy/agent-fleet.env | sed 's/=.*/=…/'", { targets: [fT("read", MAC, `${MAC_ROOT}/deploy/agent-fleet.env`)], dur: [20, 90] })],
+    [0.93, kssh("server-bochao-01", "journalctl --user -u dsh -n 120 --no-pager | tail -30", { dur: [700, 3200] })],
   ],
   A3: [[0.5, sh("node --test tests/jsonl.test.mjs", { targets: [fT("exec", MAC, `${MAC_ROOT}/tests/jsonl.test.mjs`)], dur: [3200, 9800], err: 0.5, errText: "✖ jsonl: zstd frame split across reads (1 failed)" })]],
   A5: [
@@ -993,15 +1024,28 @@ const SPECIALS = {
     [0.21, kpod("os", "exec", "osmium-dev-0", { inner: "ls -la /tmp/agent-fleet", more: [fT("list", POD("os", "osmium-dev-0"), "/tmp/agent-fleet")] })],
     [0.26, kcp("os", "osmium-dev-0", "dist/agent-fleet-collector.mjs", "/tmp/agent-fleet/collector.mjs")],
     [0.31, kget("chengdu", { wide: true })],
+    [0.34, kget("chengdu", { sel: "app=cd-train" })],
     [0.36, kssh("sg-compute", "ls /data/bench", { more: [fT("list", SG, "/data/bench")] })],
+    [0.38, kpod("chengdu", "exec", "cd-train-master-0", { inner: "nvidia-smi -L" })],
     [0.42, kget("iron")],
+    [0.45, kpod("weihai", "exec", "wh-dev-0", { inner: "nvidia-smi -L" })],
+    [0.48, kpod("iron", "exec", "iron-dev-0", { inner: "nvidia-smi -L" })],
     [0.50, kpod("os", "get", "osmium-train-0", { wide: true })],
+    [0.53, kpod("weihai", "logs", "wh-dev-0", { tail: 80 })],
+    [0.55, kpod("weihai", "get", "wh-dev-0", { wide: true })],
     [0.58, sh("export API_TOKEN=‹redacted› && curl -s -H \"Authorization: Bearer $API_TOKEN\" http://127.0.0.1:7840/api/snapshot | jq '.hosts | length'", { dur: [120, 640] })],
     [0.63, sh("rm -f /home/bochao_li/agent-fleet/tmp/old-run.log", { targets: [fT("delete", SRV, `${SRV_ROOT}/tmp/old-run.log`)], dur: [20, 90] })],
     [0.68, sh("test -s ~/.config/agent-fleet/token && echo token-ok", { targets: [fT("read", SRV, "/home/bochao_li/.config/agent-fleet/token")], dur: [15, 60] })],
+    [0.70, kget("iron", { res: "job", name: "iron-b300-job", wide: true })],
+    [0.72, kget("os", { res: "deployment", name: "osmium-infer" })],
     [0.74, kpod("os", "exec", "osmium-train-0", { inner: "nvidia-smi -L" })],
+    [0.76, kget("weihai", { res: "statefulset", name: "wh-dev" })],
     [0.80, kssh("sg-compute", "tail -n 20 /data/bench/results/results.json", { more: [fT("read", SG, "/data/bench/results/results.json")] })],
+    [0.84, kpod("os", "logs", "osmium-dev-0", { tail: 60 })],
+    [0.86, { act: "bash", cat: "remote", cmd: "scp -P 2222 dist/agent-fleet-collector.mjs bochao_li@ci-runner-02:/data/agent-fleet/collector.mjs",
+      targets: [{ type: "host", op: "scp", host: "ci-runner-02", site: siteOfSshTarget("ci-runner-02") }, fT("read", SRV, `${V}/dist/agent-fleet-collector.mjs`)], dur: [900, 3400] }],
     [0.90, MSG("write-edge-tests", "Add a case for the /fleet prefix with a trailing slash; keep the fake backend on 18443.")],
+    [0.92, kget("os", { sel: "agent-fleet.omgwow.ai/collect=true" })],
   ],
   B1a: [
     [0.25, kget("os")],
@@ -1019,11 +1063,17 @@ const SPECIALS = {
     [0.46, kpod("iron", "logs", "iron-b300-job-0", { tail: 60, since: "2m", dur: [22000, 38000] })],
     [0.64, kpod("iron", "logs", "iron-b300-job-0", { tail: 60, since: "2m" })],
     [0.78, kget("iron", { wide: true })],
+    [0.90, kpod("iron", "get", "iron-b300-job-0", { wide: true })],
   ],
   B4: [
     [0.55, sh("kubectl --context ulanqab-osmium -n mc-bochao-li apply --dry-run=server -f deploy/k8s/agent-fleet-collector-sts.yaml", { cat: "k8s", dur: [900, 2600], fail: true, errText: "error: error validating \"deploy/k8s/agent-fleet-collector-sts.yaml\": unknown field \"spec.template.spec.containers[0].collect\"", targets: [fT("read", SRV, `${SRV_ROOT}/deploy/k8s/agent-fleet-collector-sts.yaml`), { type: "k8s", op: "apply", site: "os", cluster: "ulanqab-osmium", namespace: NS }] })],
   ],
-  S1: [[0.22, sh("df -h /data", { dur: [20, 90] })]],
+  S1: [
+    [0.22, sh("df -h /data", { dur: [20, 90] })],
+    [0.40, { act: "bash", cat: "remote", cmd: "scp results/results.json server-bochao-01:/data/agent-fleet/bench-results.json", dur: [700, 2600],
+      targets: [{ type: "host", op: "scp", host: "server-bochao-01", site: siteOfSshTarget("server-bochao-01") }, fT("read", SG, `${BN}/results/results.json`)] }],
+    [0.62, sh("tail -n 40 /data/agent-fleet/edge.log", { targets: [fT("read", SG, "/data/agent-fleet/edge.log")], dur: [20, 110] })],
+  ],
   D1: [
     [0.08, kget("chengdu")],
     [0.18, kpod("chengdu", "logs", "cd-infer-5d7c9-zz4kd", { tail: 80, dur: [21000, 44000] })],
@@ -1031,9 +1081,12 @@ const SPECIALS = {
     [0.44, kpod("chengdu", "logs", "cd-preprocess-8xk2q", { tail: 40, fail: true, errText: NOTFOUND("cd-preprocess-8xk2q"), exit: 1 })],
     [0.58, kpod("chengdu", "logs", "cd-infer-5d7c9-zz4kd", { tail: 80, c: "vllm" })],
     [0.76, kpod("chengdu", "logs", "cd-infer-5d7c9-zz4kd", { tail: 40, since: "5m" })],
+    [0.86, kget("chengdu", { res: "statefulset", name: "cd-train-master" })],
+    [0.92, kpod("chengdu", "exec", "cd-train-worker-1", { inner: "nvidia-smi -L" })],
   ],
   D1a: [
     [0.20, kpod("chengdu", "describe", "cd-infer-5d7c9-zz4kd")],
+    [0.40, kpod("chengdu", "get", "cd-infer-5d7c9-zz4kd", { wide: true })],
     [0.55, kpod("chengdu", "logs", "cd-infer-5d7c9-zz4kd", { tail: 50, c: "vllm" })],
   ],
   D2: [[0.45, kpod("chengdu", "exec", "cd-train-worker-1", { inner: "env | grep NCCL", dur: [500, 1600] })]],
@@ -1042,6 +1095,8 @@ const SPECIALS = {
     [0.34, kpod("weihai", "get", "wh-prefill-3", { wide: true })],
     [0.52, kpod("weihai", "describe", "wh-prefill-3")],
     [0.72, kpod("weihai", "get", "wh-prefill-3", { wide: true })],
+    [0.86, kpod("weihai", "logs", "wh-dev-0", { tail: 80 })],
+    [0.93, kpod("weihai", "exec", "wh-dev-0", { inner: "nvidia-smi --query-gpu=memory.used,memory.total --format=csv" })],
   ],
   E1: [
     [0.30, kpod("iron", "logs", "iron-b300-job-0", { tail: 200 })],
@@ -1071,6 +1126,7 @@ const SPECIALS = {
 /** The tool a running agent is in the middle of right now (pend: "tool"). */
 const PEND = {
   A1a: sh("node --test tests/panel.test.mjs", { targets: [fT("exec", MAC, `${MAC_ROOT}/tests/panel.test.mjs`)] }),
+  "A1a-2": { name: NAMES.codex.edit, cat: "edit", preview: "apply_patch: update tests/panel.test.mjs (+18 −4)", targets: [fT("edit", MAC, `${MAC_ROOT}/tests/panel.test.mjs`)], dur: [12, 160] },
   B1b: sh("node --test tests/edge.test.mjs", { targets: [fT("exec", SRV, `${SRV_ROOT}/tests/edge.test.mjs`)] }),
   B3a1: kpod("iron", "exec", "iron-b300-job-0", { inner: "nvidia-smi dmon -c 30 -s u" }),
   S1a: sh("bash run_bench.sh ifeval", { targets: [fT("exec", SG, `${BN}/run_bench.sh`)] }),
@@ -1339,17 +1395,16 @@ function addChatter(A, ev) {
   ts.forEach((t, i) => ev.push({ id: "", type: "message", t: Math.round(snapIn(A, t)), peer: spec.peer, text: clip(spec.texts[i % spec.texts.length], LIMITS.textChars) }));
 }
 
-/** DSH relays the ACP agent's activity as messages: one per finished tool call (about nine in ten). */
+/** DSH sessions bound over ACP and the native child whose tool calls they mirror (about six in ten). */
 const RELAY = { A1: "A1a", B3: "B3a" };
-const relayText = (e) => (e.category === "edit" || e.category === "write" ? `edited: ${e.preview}` : e.category === "read" ? `read: ${e.preview}` : e.category === "spawn" ? `spawned: ${e.preview}` : `ran: ${e.preview}`);
+/** DSH mirrors the ACP child's finished tool calls into its own transcript: same id, same time, same targets.
+ *  The panel therefore sees one call under two agents and must count it once when the ACP child is present. */
 function addRelay(A, ev, child, childEv) {
-  const r = makeRng("relay/" + A.tag), peer = child.kind === "codex" ? "codex-acp" : "omp-acp";
-  const cand = childEv.filter((e) => (e.type === "tool" || e.type === "spawn") && e.t > child.startAbs + 4000);
+  const r = makeRng("relay/" + A.tag);
+  const cand = childEv.filter((e) => e.type === "tool" && e.status !== "pending" && e.t > child.startAbs + 4000);
   cand.forEach((e, i) => {
     if (i < cand.length - 1 && !r.chance(0.62)) return;
-    const pend = e.status === "pending";
-    const t = Math.min(NOW - 300, pend ? e.t + r.int(300, 900) : e.t + (e.duration ?? 0) + r.int(250, 1200));
-    ev.push({ id: "", type: "message", t, peer, text: clip(pend ? `running: ${e.preview}` : relayText(e), 200) });
+    ev.push({ ...e, targets: e.targets && JSON.parse(JSON.stringify(e.targets)) });   // the mirror owns its targets
   });
 }
 
@@ -1401,6 +1456,66 @@ function finalize(A, ev) {
       contextTokens: lastCtx, contextWindow: win,
     };
   return ev;
+}
+
+// ───────────────────────────────────────────── line counts on file targets (Contract A) ─────────────────────────────────────────────
+// Counts are always derived from the same event they describe: an edit's preview already states (+added −removed),
+// so lines reuse those numbers; a read tool reports how many lines it returned; shell commands only count when the
+// call reads exactly one file and writes nothing (tail/sed/cat). Binary reads (file, sha256sum on safetensors) and
+// search/list/exec/delete carry no lines at all. Sessions recorded before line counting existed (and a few recent
+// ones from collectors that were not upgraded) have no lines: the panel must fall back there.
+const LINES_SINCE = NOW - 2.5 * H;
+const BINARY_PATH = /\.(?:safetensors|bin|pt|pth|gguf|onnx|png|jpe?g|gif|webp|ico|zip|gz|zst|zstd|tar|tgz|pdf|so|dylib|dll|pyc|whl)$/i;
+const LINE_CMD = /^(?:sudo\s+)?(?:tail|cat|head|less|more|bat)\b|^sed\s+-n\b/;
+const EDIT_COUNTS = /\(\+(\d+)\s*−\s*(\d+)\)/;
+
+function lineCountForRead(path, r) {
+  const base = path.split("/").pop() ?? "";
+  if (/\.(?:log|out|txt)$/i.test(base)) return r.int(40, 320);
+  if (/\.(?:jsonl|ndjson)$/i.test(base)) return r.int(20, 160);
+  if (/\.(?:json|ya?ml|toml|ini|cfg|env)$/i.test(base)) return r.int(9, 80);
+  if (/\.(?:md|mdx|rst)$/i.test(base)) return r.int(20, 180);
+  return r.int(24, 420);
+}
+
+function shellReadCount(cmd, r) {
+  const tail = /(?:--tail[= ]|\btail\s+-n\s*|\btail\s+-)(\d+)/.exec(cmd);
+  if (tail) return clamp(Number(tail[1]), 1, 1000000);
+  const sed = /sed\s+-n\s*['"]?(\d+),(\d+)p/.exec(cmd);
+  if (sed) return clamp(Number(sed[2]) - Number(sed[1]) + 1, 1, 1000000);
+  return r.int(18, 260);
+}
+
+function addLines(A, events) {
+  for (const e of events) {
+    if (!e.targets || !e.targets.length || e.t < LINES_SINCE) continue;
+    const files = e.targets.filter((t) => t.type === "file");
+    if (!files.length) continue;
+    // Seeded by the event id alone: an ACP mirror carries the child's id and must therefore report the same counts.
+    const r = makeRng(`lines/${e.id}`);
+    if (r.chance(0.06)) continue;                                     // a collector without line counting
+    const edits = files.filter((t) => t.op === "edit");
+    const writes = files.filter((t) => t.op === "write");
+    const reads = files.filter((t) => t.op === "read" && !BINARY_PATH.test(t.path));
+    const onlyFile = files.length === 1 && reads.length === 1 && !edits.length && !writes.length;
+    const cmd = e.category === "shell" || e.category === "k8s" || e.category === "remote" ? String(e.preview ?? "") : "";
+    for (const t of edits) {
+      const m = EDIT_COUNTS.exec(String(e.preview ?? ""));
+      t.lines = m
+        ? { added: clamp(Number(m[1]), 0, 10000000), removed: clamp(Number(m[2]), 0, 10000000) }
+        : { added: r.int(1, 60), removed: r.int(0, 30) };
+    }
+    for (const t of writes) {
+      const bulk = /^(?:cp|scp|rsync|install)\b/.test(cmd) || /\bcp\b[^\n]*:/.test(cmd);
+      t.lines = { added: bulk ? r.int(120, 720) : r.int(5, 260) };    // cp write is the whole collector bundle
+    }
+    for (const t of reads) {
+      let n = null;
+      if (e.category === "read") { if (e.status !== "pending") n = lineCountForRead(t.path, r); }
+      else if (onlyFile && LINE_CMD.test(cmd)) n = shellReadCount(cmd, r);
+      if (n !== null) t.lines = { read: n };
+    }
+  }
 }
 
 // ───────────────────────────────────────────── assembly ─────────────────────────────────────────────
@@ -1483,7 +1598,11 @@ export function buildDemo() {
   const P1 = byTag.get("P1");
   P1.ev = mirrorOf(P1, byTag.get("A1a-1"), byTag.get("A1a-1").ev);
   P1.T1 = P1.endAbs;
-  for (const A of list) A.events = finalize(A, A.ev).map(ordered);
+  for (const A of list) {
+    A.events = finalize(A, A.ev);
+    addLines(A, A.events);
+    A.events = A.events.map(ordered);
+  }
 
   const agents = list.map((A) => buildRecord(A, byTag));
   const links = list.filter((A) => A.parent).map((A) => {
@@ -1500,7 +1619,7 @@ export function buildDemo() {
   const snapshot = {
     cursor: 4182, now: NOW,
     hub: { version: "0.1.0", startedAt: NOW - 6 * H, hostId: SRV },
-    hosts: buildHosts(agents), agents, links, pods: buildPods(), feed,
+    hosts: buildHosts(agents), agents, links, pods: buildPods(), feed, repos: buildRepos(),
   };
   return { meta: { now: NOW, note: "synthetic" }, snapshot, events, files: buildFiles(), podEvents: buildPodEvents(), _list: list };
 }
@@ -1515,16 +1634,20 @@ function serialize(demo) {
 }
 
 function summary(demo, bytes) {
-  const { agents, hosts, pods, links, feed } = demo.snapshot;
+  const { agents, hosts, pods, links, feed, repos } = demo.snapshot;
   const tally = (f) => { const m = {}; for (const a of agents) m[f(a)] = (m[f(a)] ?? 0) + 1; return Object.entries(m).map(([k, v]) => `${k}=${v}`).join(" "); };
   const evs = Object.values(demo.events), total = evs.reduce((n, l) => n + l.length, 0);
   const tools = evs.flat().filter((e) => e.type === "tool" || e.type === "spawn");
   const failed = tools.filter((e) => e.status === "error").length;
+  const fileTargets = evs.flat().flatMap((e) => e.targets ?? []).filter((t) => t.type === "file");
+  const withLines = fileTargets.filter((t) => t.lines).length;
+  const repoCount = Object.values(repos).reduce((n, l) => n + l.length, 0);
   return [
     `agents ${agents.length} | kind: ${tally((a) => a.kind)}`,
     `site: ${tally((a) => a.site)}`,
     `status: ${tally((a) => a.status)} | role: ${tally((a) => a.role)}`,
     `hosts ${hosts.length} | pods ${pods.length} | links ${links.length} | feed ${feed.length} | files ${Object.keys(demo.files).length} | podEvents ${Object.keys(demo.podEvents).length}`,
+    `repos ${repoCount} on ${Object.keys(repos).length} hosts | file targets ${withLines}/${fileTargets.length} with lines`,
     `events ${total} (tools+spawns ${tools.length}, failed ${failed}) | demo.json ${bytes} bytes (${(bytes / 1024).toFixed(1)} KiB)`,
   ].join("\n");
 }

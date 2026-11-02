@@ -295,6 +295,8 @@ td.zero { color: var(--fg3); opacity: .5; }
 .erow .nm b { font-weight: 600; margin-right: 6px; color: var(--cc, var(--fg)); }
 .erow .nm span { color: var(--fg2); }
 .erow .du { color: var(--fg3); font-variant-numeric: tabular-nums; font-size: 11px; }
+.erow.egrow { grid-template-columns: 58px 16px 132px minmax(0, 1fr) auto; }
+.erow.egrow .ag { display: flex; align-items: center; min-width: 0; overflow: hidden; }
 .erow.pending .du { color: var(--warn); } .erow.error .nm span { color: var(--bad); }
 .evd { background: var(--bg2); border: 1px solid var(--line2); border-radius: 5px; margin: 6px 10px; padding: 6px 8px; }
 .evd pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font: 11px/1.45 var(--mono); max-height: 160px; overflow: auto; background: var(--bg); border-radius: 3px; padding: 4px 6px; }
@@ -351,6 +353,55 @@ td.zero { color: var(--fg3); opacity: .5; }
 .tl-svg .sdot.s-running { fill: var(--good); animation: none; } .tl-svg .sdot.s-waiting { fill: var(--warn); } .tl-svg .sdot.s-idle { fill: var(--fg3); } .tl-svg .sdot.s-done { fill: none; stroke: var(--good); stroke-width: 1.6; }
 .tl-svg .sdot.s-error { fill: var(--bad); } .tl-svg .sdot.s-interrupted { fill: none; stroke: var(--warn); stroke-width: 1.6; } .tl-svg .sdot.s-stale, .tl-svg .sdot.s-unknown { fill: none; stroke: var(--fg3); stroke-width: 1.2; }
 .tl-empty { position: absolute; inset: 40px 0 0 0; display: grid; place-items: center; color: var(--fg3); pointer-events: none; text-align: center; }
+
+/* ---- interaction graph ---- */
+.gv-head { display: grid; grid-template-columns: var(--gv-side, 36%) 1fr var(--gv-side, 36%); gap: 8px; padding: 3px 8px; font-size: 11px; color: var(--fg2); background: var(--bg1); border-bottom: 1px solid var(--line); flex: none; }
+.gv-head .mid { text-align: center; color: var(--fg3); }
+.gv-head .rt { text-align: right; }
+.gv-wrap { flex: 1; min-height: 0; display: flex; }
+.gv-scroll { flex: 1; min-height: 0; overflow: auto; position: relative; background: var(--bg); }
+.gv-svg { display: block; min-width: 100%; user-select: none; }
+.gv-svg text { font: 11px var(--font); fill: var(--fg); }
+.gv-svg .gnode { cursor: pointer; }
+.gv-svg .gnode .rowbg, .gv-svg .gmore .rowbg { fill: transparent; }
+.gv-svg .gnode:hover .rowbg { fill: var(--hover); }
+.gv-svg .gnode.gsel .rowbg { fill: var(--sel); }
+.gv-svg .gmore { pointer-events: none; }
+.gv-svg .gtitle { font-weight: 500; }
+.gv-svg .gdim { fill: var(--fg3); font-size: 10.5px; }
+.gv-svg .gcount { fill: var(--fg2); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.gv-svg .gonline { fill: var(--good); font-size: 10.5px; }
+.gv-svg .gbad { fill: var(--bad); font-size: 10.5px; }
+.gv-svg .gkb { fill: var(--k, var(--fg3)); }
+.gv-svg .gkbt { fill: #fff; font: 700 8.5px/1 var(--mono); pointer-events: none; }
+.gv-svg .gpill { fill: var(--bg3); }
+.gv-svg .gpill-t { fill: var(--fg2); font-size: 9.5px; pointer-events: none; }
+.gv-svg .gtag { fill: var(--accent); font-size: 9.5px; font-weight: 600; }
+.gv-svg .gico { fill: none; stroke: var(--fg3); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.gv-svg .gcaret { fill: none; stroke: var(--fg3); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.gv-svg .gcaret-hit { cursor: pointer; }
+.gv-svg .gsep { stroke: var(--line); stroke-dasharray: 2 4; }
+.gv-svg .ge { fill: none; stroke-linecap: round; opacity: .78; }
+.gv-svg .ge-k8s { stroke: var(--c-k8s); } .gv-svg .ge-remote { stroke: var(--c-remote); } .gv-svg .ge-shell { stroke: var(--c-shell); }
+.gv-svg .ge-read { stroke: var(--c-read); } .gv-svg .ge-write { stroke: var(--c-write); } .gv-svg .ge-edit { stroke: var(--c-edit); }
+.gv-svg .ge.dim { opacity: .1; }
+.gv-svg .ge.hot { opacity: 1; }
+.gv-svg .ge.pend { stroke-dasharray: 5 3; animation: gdash 1s linear infinite; }
+.gv-svg .gehit { fill: none; stroke: transparent; cursor: pointer; }
+.gv-svg .glabel { font: 10px var(--mono); fill: var(--fg2); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; pointer-events: none; }
+.gv-svg .glabel.on { fill: var(--fg); font-weight: 700; }
+.gv-svg .gphase { fill: var(--fg3); }
+.gv-svg .gphase.ph-Running { fill: var(--good); } .gv-svg .gphase.ph-Pending { fill: var(--warn); }
+.gv-svg .gphase.ph-Succeeded { fill: var(--info); } .gv-svg .gphase.ph-Failed { fill: var(--bad); }
+.gv-svg .sdot.s-running { fill: var(--good); } .gv-svg .sdot.s-waiting { fill: var(--warn); } .gv-svg .sdot.s-idle { fill: var(--fg3); }
+.gv-svg .sdot.s-done { fill: none; stroke: var(--good); stroke-width: 1.6; } .gv-svg .sdot.s-error { fill: var(--bad); }
+.gv-svg .sdot.s-interrupted { fill: none; stroke: var(--warn); stroke-width: 1.6; } .gv-svg .sdot.s-stale, .gv-svg .sdot.s-unknown { fill: none; stroke: var(--fg3); stroke-width: 1.2; }
+.gv-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--fg3); pointer-events: none; text-align: center; padding: 24px; }
+@keyframes gdash { to { stroke-dashoffset: -16; } }
+@media (prefers-reduced-motion: reduce) { .gv-svg .ge.pend { animation: none; } }
+@media (max-width: 720px) { .gv-head { display: none; } }
+td.lines { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td.lines .lr { color: var(--c-read); } td.lines .la { color: var(--good); } td.lines .ld { color: var(--bad); }
 
 /* ---- tooltip ---- */
 .tip { position: fixed; z-index: 100; max-width: 460px; background: var(--bg3); color: var(--fg); border: 1px solid var(--line2); border-radius: 5px; padding: 5px 8px; box-shadow: var(--shadow); pointer-events: none; font-size: 11.5px; line-height: 1.45; }

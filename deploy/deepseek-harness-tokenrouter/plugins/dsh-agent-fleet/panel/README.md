@@ -36,7 +36,8 @@ auto-reconnect) and `setOnline(true)` heals it.
 | `api/pods` | `{pods: Pod[]}` |
 | `api/pod?key=K` | `{pod, touches:[{agent,event,t,op,category,name?,preview?}], events:[{type,reason,message,count,firstSeen,lastSeen}]}` |
 | `api/file?host=H&path=P` | `FilePreview` |
-| `api/query?target=pod\|file&category=a,b&since=ms&limit=N` | `{items:[{agent, event}]}`; used to complete the pod/file touch index beyond what the feed carried. |
+| `api/query?target=pod\|k8s\|host\|file&category=a,b&since=ms&limit=N` | `{items:[{agent, event}], total}`; `total` counts every match, so the graph can flag a result truncated at the limit. The graph view issues one `target` per request (an old hub silently matches nothing for a CSV list) plus one `category=shell` request; a full window load on open/enlargement, a 30 s incremental load (previous start − 60 s) afterwards. |
+| `snapshot.repos` / `Delta.repos` | `{[hostId]: Repo[]}` git work trees per host (Contract B, `Repo = {root, remote?, branch?, head?, worktree?}`). Missing host = not resolved yet; `[]` = none. The file graph groups files by the deepest root and groups checkouts of the same remote. Older hubs omit it; the graph then falls back to directory anchors. |
 | `api/hosts` | `{hosts: Host[]}` (not required; hosts arrive in the snapshot and deltas). |
 | `POST api/session` (header `x-agent-fleet-nonce`) | `{session}`: the panel session key for the plugin's `#nonce=…`; `401` for a spent or expired nonce. |
 
@@ -50,9 +51,10 @@ desktop app's dsh-app:// page), where the browser withholds the SameSite cookie.
 
 ## Behaviour notes
 
-* **State** is one store (`S`): hosts/agents/pods keyed maps, `links`, per-agent event stores (sorted lists + id maps,
-  upserted by event id so a pending tool turns into a finished one), pod/file touch indexes derived from event targets,
-  feed. Deltas mutate the store and schedule one render (≤ 8/s). Lists are reconciled by key (`reconcile`) so rows are
+* **State** is one store (`S`): hosts/agents/pods keyed maps, `links`, `repos` (`{[host]: Repo[]}` from the snapshot and
+  `Delta.repos`), per-agent event stores (sorted lists + id maps, upserted by event id so a pending tool turns into a
+  finished one), pod/file touch indexes derived from event targets (a file touch keeps the target's `lines`), feed.
+  Deltas mutate the store and schedule one render (≤ 8/s). Lists are reconciled by key (`reconcile`) so rows are
   reused, not rebuilt; a row's HTML is only rebuilt when its signature changes.
 * **Clock**: `snapshot.now` and every delta's `now` are folded into `S.clockOffset`, so "age", the now-line and pending
   durations follow the hub clock even when the browser clock is skewed.
@@ -64,9 +66,28 @@ desktop app's dsh-app:// page), where the browser withholds the SameSite cookie.
   hover/click do not need DOM nodes. Redraw: 1 Hz tick while the view is open plus on data change; zoom/pan/brush redraw
   on `requestAnimationFrame`. The "active axis" collapses 1-minute-bucket gaps longer than 15 min to 90 s.
 * **Hash**: `#view=…&key=…&site=…&kind=…&q=…&focus=<dshSessionId>`; `focus` resolves to the DSH session, else the native
-  session bound to it over ACP, and selects its family root.
+  session bound to it over ACP, and selects its family root. The graph view adds `g=env|files&win=5m|30m|2h|24h`
+  (defaults `env`, `30m`).
+* **Interaction graph** (`#view=graph`): two bipartite graphs over the tool calls of a window. Left: agent families from
+  `links` + parent hints, level 1 = family roots aggregating their subtree; expanding a node shows its direct children
+  (each still aggregating its own subtree) while the expanded node keeps only its own calls. Projections are skipped; a
+  DSH session bound over ACP whose child agent is present mirrors the child's tool events and is skipped. Right:
+  `env` groups by site (fleet SITES, other clusters, then `外部 external`) with pod/k8s/host/container leaves; `files`
+  groups by git repo (deepest root, checkouts of the same remote grouped) or a directory anchor (deepest agent cwd,
+  else home + two segments, else the first two segments), then a compressed directory tree. Local shell calls with no
+  remote target count on the agent's own host (toggle). Edges aggregate by the deepest visible node on each side
+  (calls, agents, ops, line totals from Contract A, pending, recency) and labels ride their bezier, greedy-placed
+  outward from the midpoint; a hovered/selected node's labels all show while other edges dim. Clicking an agent opens
+  the agent drawer, a pod the pod drawer, a file the Files view, and an edge an edge drawer whose calls open the agent
+  at that event. The model is cached by store versions, window, mode and filters; drawing is throttled to ~1 Hz.
+  Window loads are per target type (`pod`, `k8s`, `host`, `file`) plus `category=shell`, full on open/enlargement and
+  incremental every 30 s from the previous successful start − 60 s (bandwidth over the slow uplink); a query whose
+  `total` exceeds its items shows the “部分数据” note. Older hubs without `repos` or `lines` fall back to anchors and
+  op counts.
 
 ## Tests
 
 `node --test tests/panel.test.mjs` loads `app.js` in a DOM-less `vm` context (it then only exports its pure helpers) and
-checks the helpers, the drift against `lib/protocol.mjs`, and the structure of `fixtures/demo.json`.
+checks the helpers, the interaction-graph model (`graphModel`/`graphVisible`: subtree aggregation, ACP dedup, env and
+file resources, path compression, window/filter rules, edge label placement), the drift against `lib/protocol.mjs`, and
+the structure of `fixtures/demo.json`.

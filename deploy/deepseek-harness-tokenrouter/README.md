@@ -193,7 +193,8 @@ Agent DAG 在本机看会话家族，会话遥测让网关那边也能看到同�
 - 关系：主会话 → 原生子代理；DSH 会话 → ACP 子代理 → 该子代理自己的子代理。ACP 绑定从 DSH 的 `sidecar.sqlite` 读，父会话按原生会话 id 精确挂接。
 - 跨主机 / 跨集群启动：agent 用 `kubectl exec <pod> -- omp …` 或 `ssh <host> claude …` 起的会话，按命令行的目标和时间窗挂到发起它的 agent 下面；带 `AGENT_FLEET_PARENT` 环境变量的按变量精确挂接。DSH 自己为 ACP 子进程设 `AGENT_FLEET_VIA=dsh:<会话 id>`（见 `dsh-acp-adapter` 的 `FORK.md`）。
 - Pod：agent 碰过的 Pod 都会列出来（即使没有 collector），还能看它的容器、kube 事件和哪些调用碰过它。
-- 文件：工具调用里出现的路径（读、写、改、搜）按主机和路径归并，可以点开预览。预览只读、脱敏，上限 256 KiB。
+- 文件：工具调用里出现的路径（读、写、改、搜）按主机和路径归并，可以点开预览。预览只读、脱敏，上限 256 KiB。每次调用还记下读了、加了、删了多少行：先按调用参数算（写入的内容、hashline 的 `PUT`/`CUT` 行、patch 的 `+`/`-` 行、读取的行号范围），结果回来后换成结果里的精确数（OMP 的 diff 和行号、Claude 的 `numLines` / `structuredPatch`、DSH 结果里的 `meta.lines` / `meta.diffs`、Codex 和其他 agent 只读一个文件的 shell 命令的输出行数）；算不出来的就不写，不估。
+- 代码仓库：hub 让各主机的 collector 判断这些文件在哪个 git 工作区里（只读 `.git`，不调用 git），拿到根目录、remote（只留 `host/path`，去掉凭据）、分支或游离的 commit。同一个 remote 在不同机器上的 checkout 归成一个仓库。
 
 **面板。**
 
@@ -203,9 +204,18 @@ Agent DAG 在本机看会话家族，会话遥测让网关那边也能看到同�
 |---|---|
 | Fleet | 站点 → 主机 / Pod → agent 树，跨主机的子节点标 `↗` |
 | Timeline | 类似 Agent DAG 的甘特图：一条泳道一个 agent，工具调用按类别着色，带 spawn / return 连线 |
+| 交互图 Graph | 两张二分图，左边是 agent，右边是它们碰过的东西，边上写实时的交互量（见下文） |
 | Pods | 被 agent 碰过的 Pod，按站点分；相位、节点、容器、kube 事件、谁碰过 |
-| Files | 被碰过的文件，按路径归并；点开是只读预览 |
+| Files | 被碰过的文件，按路径归并，带读 / 加 / 删的行数；点开是只读预览 |
 | Feed | 整个 fleet 的工具调用实时流 |
+
+**交互图。** 在「交互图 Graph」页签里切换两张二分图，时间窗口可选 5 分钟 / 30 分钟 / 2 小时 / 24 小时，地址是 `#view=graph&g=env|files&win=…`：
+
+- **运行环境（Env）：** 右边第一层是站点（本机 Mac、server-bochao-01、sg-compute、成都、威海、iron、os，以及不认识的「外部」），展开是具体的 Pod、kubectl 资源（`deployment/…`、`pods -l …`）、ssh 到的主机；agent 在本机跑的 shell 命令记在它自己的主机上（「本机执行」可关）。边上写调用次数，同一条边上有多个 agent 时写 agent 数；Pod 行写「最近一分钟在交互的 agent 数 / 窗口内的 agent 数」，Pod 里自己跑的 agent 也算。
+- **文件 / 仓库（Files）：** 右边第一层是 git 仓库（`owner/repo @ 分支`，同一个 remote 在多台机器上的 checkout 合成一个，展开再分 checkout），不在仓库里的文件挂在 agent 的工作目录或 home 下的目录上；再往下是压缩过的目录树，一直到文件。边上写调用次数和行数，例如 `14× r820 +120 −30`（读 820 行、加 120 行、删 30 行）；没有行数时写操作次数（`5r 2e`）。
+- **左边**第一层是会话家族的根，展开是子代理、ACP 子代理、它在别的主机或 Pod 上起的 agent。折叠的节点汇总整棵子树（`Σ`），展开后只保留它自己的调用，边跟着落到最深的可见节点。
+- 进行中的调用画虚线，15 秒内有新调用的边高亮；鼠标停在一个节点上只显示它的边和标签。点 agent 打开它的详情，点 Pod 打开 Pod 详情，点文件跳到 Files 预览，点边打开这条边上的全部调用。
+- 面板打开时按目标类型各查一次窗口内的调用，之后每 30 秒只补增量，再加上实时流里的新事件，所以一次新调用 1–2 秒内出现在图上。老版本的 hub 没有 `repos` 或行数时，文件按目录归组、边上只写操作次数。
 
 面板的状态都在 URL hash 里（`#view=timeline&key=<agent key>`）；远程面板地址是 `http://10.0.60.98:443/fleet/`。插件打开面板时给的是 `/fleet/#nonce=…`（要定位会话时再加 `&focus=…`）：面板用这个一次性 nonce 向 hub 换一把会话密钥（`POST api/session`），只留在页面内存里，之后每个请求都放在 `x-agent-fleet-token` 头里发出，所以原始 token 不进 URL、fragment 或页面存储。用请求头而不用 cookie，是因为桌面应用把本机 hub 嵌在 dsh-app:// 页面的 iframe 里，浏览器不给这种跨站 iframe 发 SameSite cookie。手动进入时仍然可以用 `#token=<token>`（只留在页面内存里，同时换成 HttpOnly cookie），`/?token=<token>` 也是一次性换 cookie。桌面应用用的是它自己 hub 的地址。
 
@@ -247,7 +257,7 @@ Agent DAG 在本机看会话家族，会话遥测让网关那边也能看到同�
 | `family` | 一个 agent 所在的整棵树（根、子代理、ACP 子代理、跨主机启动的 agent） |
 | `agent` | 单个 agent 的记录和最近事件，可向前翻页 |
 | `pods` / `pod` | 被碰过的 Pod 列表 / 单个 Pod 的容器、碰过它的调用和 kube 事件 |
-| `files` / `file` | 文件清单（按 agent 或全部）/ 预览一个文件 |
+| `files` / `file` | 文件清单（按 agent 或全部，含每种操作的调用次数和读 / 加 / 删的行数）/ 预览一个文件 |
 | `query` | 按类别、目标类型、站点、关键字搜工具调用 |
 
 **架构。**

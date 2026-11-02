@@ -7,7 +7,7 @@
 // isSeeded?}` comes first; a seeded session (a fork) carries a copy of its parent's rows up to `session/end-seed`.
 // `parentSession` names the parent by directory name (with its `session-` prefix when it has one).
 import { existsSync } from "node:fs";
-import { Session, makeReader, parseJson, partsText, sampleText, exitCodeFromText, clip } from "./base.mjs";
+import { Session, makeReader, parseJson, partsText, sampleText, exitCodeFromText, clip, withinCountLimit } from "./base.mjs";
 
 export const kind = "dsh";
 
@@ -15,6 +15,64 @@ const CURRENT = "session.v4.jsonl.zstd";
 const LEGACY = "session.jsonl.zstd";
 const SPAWNED_ID = /started subagent ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 const AGENT_NOTICES = new Set(["agent-message", "subagent-settled", "subagent-report"]);
+
+// Result-derived line counts (Contract A). DSH 0.2.x writes the structured result next to the text: a read's
+// `meta.lines` holds the rows it returned and an edit's `meta.diffs` the replaced text of each file, which is exact.
+// Results without `meta` fall back to the text: a read that returns a `[path#TAG]` header (the tag is a content hash,
+// not file content) followed by the rows as `N:`, where an elided gap is a line holding only `…`. That header path is
+// often relative or a URL, so its count is carried without a path and lands on the call's single file target.
+const READ_HEADER = /^\[[^\]\n]+#[0-9A-Fa-f]{2,8}\]$/;
+const READ_ROW = /^\d+:/;
+
+/** `[{read}]` when `text` is a read listing (numbered rows after the header), else undefined. */
+function dshFileLines(text) {
+  if (!withinCountLimit(text)) return undefined;
+  let header = false, read = 0;
+  for (const row of text.split("\n")) {
+    if (!header) {
+      if (row.trim() === "") continue;
+      if (!READ_HEADER.test(row.trim())) return undefined;
+      header = true;
+    } else if (READ_ROW.test(row)) read++;
+  }
+  return read > 0 ? [{ read }] : undefined;
+}
+
+/** Rows of a text with the line semantics of `countLines`: one final "\n" ends the last row, it adds no row. */
+const rowsOf = text => (text === "" ? [] : (text.endsWith("\n") ? text.slice(0, -1) : text).split("\n"));
+
+/** Lines that differ between two texts once their common leading and trailing lines are set aside. */
+function changedLines(before, after) {
+  const a = rowsOf(before), b = rowsOf(after);
+  let head = 0;
+  while (head < a.length && head < b.length && a[head] === b[head]) head++;
+  let tail = 0;
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++;
+  return { added: b.length - head - tail, removed: a.length - head - tail };
+}
+
+/** `fileLines` entries from a result's `meta`: `{path?, read}` for a read, `{path?, added, removed}` per edited file. */
+function metaFileLines(meta) {
+  if (meta === null || typeof meta !== "object") return undefined;
+  const own = typeof meta.path === "string" && meta.path !== "" ? meta.path : undefined;
+  const out = [];
+  if (Array.isArray(meta.lines)) out.push({ ...(own && { path: own }), read: meta.lines.length });
+  if (Array.isArray(meta.diffs)) {
+    const byPath = new Map();
+    for (const diff of meta.diffs) {
+      if (diff === null || typeof diff !== "object" || typeof diff.oldText !== "string" || typeof diff.newText !== "string") continue;
+      if (!withinCountLimit(diff.oldText) || !withinCountLimit(diff.newText)) continue;
+      const path = typeof diff.path === "string" && diff.path !== "" ? diff.path : own;
+      const { added, removed } = changedLines(diff.oldText, diff.newText);
+      const sum = byPath.get(path) ?? { added: 0, removed: 0 };
+      sum.added += added;
+      sum.removed += removed;
+      byPath.set(path, sum);
+    }
+    for (const [path, sum] of byPath) out.push({ ...(path && { path }), ...sum });
+  }
+  return out.length > 0 ? out : undefined;
+}
 
 /**
  * @returns {{kind: "dsh", id: string, role: "main"|"projection"} | null}
@@ -75,10 +133,12 @@ export function createReader({ file, host, site, now }) {
 
   const toolResult = (d, t) => {
     const msg = d.message ?? {};
-    const text = sampleText(msg.content);
+    const full = partsText(msg.content);
+    const text = sampleText(full);
     const spawned = SPAWNED_ID.exec(text.slice(0, 200))?.[1];
     s.toolEnd(t, msg.toolCallId, {
       isError: msg.isError === true, exitCode: exitCodeFromText(text.slice(0, 600)), text,
+      resultText: full, fileLines: metaFileLines(d.meta) ?? dshFileLines(full),
       childIds: spawned ? [spawned] : undefined,
     });
   };

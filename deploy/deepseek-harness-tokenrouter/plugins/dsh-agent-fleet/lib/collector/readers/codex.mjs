@@ -16,6 +16,25 @@ const ROLLOUT = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a
 const INJECTED_USER = /^\s*(?:<environment_context>|<user_instructions>|<INSTRUCTIONS>|<turn_aborted>|<user_action>|# AGENTS\.md)/;
 const USAGE_KEYS = ["input", "output", "cacheRead", "cacheWrite", "reasoning"];
 const DUPLICATE_PROMPT_MS = 5000;
+// A tool output is a short header (chunk id, wall time, exit code, token count) followed by the command's own output.
+const OUTPUT_HEADER = /(?:^|\n)Output:\n/;
+
+/**
+ * The command output of a `function_call_output`: everything after the `Output:` header, else the text itself.
+ * Code mode (`exec`, Codex 0.16x) sends that body as a JSON envelope `{chunk_id, exit_code, output, …}` in a second
+ * content part; then `output` is the command's own output and `exitCode` its exit code.
+ * @returns {{body: string, exitCode?: number}}
+ */
+function codexOutput(text) {
+  if (typeof text !== "string") return { body: "" };
+  const match = OUTPUT_HEADER.exec(text);
+  const body = match ? text.slice(match.index + match[0].length) : text;
+  const trimmed = body.trim();
+  if (!trimmed.startsWith("{")) return { body };
+  const envelope = parseJson(trimmed);
+  if (envelope === null || typeof envelope !== "object" || typeof envelope.output !== "string" || !("exit_code" in envelope)) return { body };
+  return { body: envelope.output, exitCode: Number.isInteger(envelope.exit_code) ? envelope.exit_code : undefined };
+}
 
 /** @returns {{kind: "codex", id: string, role: "main"} | null}  the role is refined from the rollout's own header */
 export function match(path) {
@@ -124,7 +143,8 @@ export function createReader({ file, host, site, now }) {
   const toolOutput = (p, t) => {
     const text = typeof p.output === "string" ? p.output : partsText(p.output);
     const head = text.slice(0, 600);
-    const code = /Process exited with code (-?\d+)/.exec(head)?.[1] ?? parseJson(text)?.metadata?.exit_code;
+    const output = codexOutput(text);
+    const code = /Process exited with code (-?\d+)/.exec(head)?.[1] ?? parseJson(text)?.metadata?.exit_code ?? output.exitCode;
     let childIds;
     if (s.spawns.has(p.call_id)) {
       const spawned = parseJson(text);
@@ -132,7 +152,9 @@ export function createReader({ file, host, site, now }) {
       if (typeof id === "string") childIds = [id];
     }
     inputAt = t;
-    s.toolEnd(t, p.call_id, { exitCode: code === undefined ? undefined : Number(code), text: head, childIds });
+    s.toolEnd(t, p.call_id, {
+      exitCode: code === undefined ? undefined : Number(code), text: head, resultText: output.body, childIds,
+    });
   };
 
   const message = (p, t) => {

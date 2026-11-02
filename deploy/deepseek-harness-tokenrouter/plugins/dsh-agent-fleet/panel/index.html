@@ -52,6 +52,7 @@
     <nav class="tabs" id="tabs" role="tablist" aria-label="视图 Views">
       <button type="button" role="tab" id="tab-fleet" data-view="fleet" aria-controls="view-fleet">网络 <small>Fleet</small></button>
       <button type="button" role="tab" id="tab-timeline" data-view="timeline" aria-controls="view-timeline">时间线 <small>Timeline</small></button>
+      <button type="button" role="tab" id="tab-graph" data-view="graph" aria-controls="view-graph">交互图 <small>Graph</small></button>
       <button type="button" role="tab" id="tab-pods" data-view="pods" aria-controls="view-pods">Pods</button>
       <button type="button" role="tab" id="tab-files" data-view="files" aria-controls="view-files">文件 <small>Files</small></button>
       <button type="button" role="tab" id="tab-feed" data-view="feed" aria-controls="view-feed">动态 <small>Feed</small></button>
@@ -123,7 +124,45 @@
         </div>
       </section>
 
-      <!-- 3. Pods -->
+      <!-- 3. 交互图 Graph -->
+      <section id="view-graph" class="view" role="tabpanel" aria-labelledby="tab-graph" hidden>
+        <div class="toolbar">
+          <div class="seg" id="gv-mode" role="group" aria-label="图模式 Graph mode">
+            <button type="button" class="btn" data-gmode="env" aria-pressed="true">运行环境 <small>Env</small></button>
+            <button type="button" class="btn" data-gmode="files" aria-pressed="false">文件/仓库 <small>Files</small></button>
+          </div>
+          <div class="seg" id="gv-wins" role="group" aria-label="时间窗口 Window">
+            <button type="button" class="btn" data-gwin="5m">5m</button>
+            <button type="button" class="btn" data-gwin="30m" aria-pressed="true">30m</button>
+            <button type="button" class="btn" data-gwin="2h">2h</button>
+            <button type="button" class="btn" data-gwin="24h">24h</button>
+          </div>
+          <label class="chk" id="gv-local-wrap" title="把没有远端目标的 shell 调用算作 agent 自己主机上的交互 · local executions"><input type="checkbox" id="gv-local" checked> 本机执行 <small>local exec</small></label>
+          <label class="chk" title="只显示子树里有运行中 agent 的家族 · families with a running agent"><input type="checkbox" id="gv-running"> 只看运行中 <small>running</small></label>
+          <input id="gv-q" class="search" type="search" placeholder="过滤 agent / 资源…" aria-label="过滤 Filter" autocomplete="off" spellcheck="false">
+          <div class="seg" role="group" aria-label="展开 Expand">
+            <button type="button" id="gv-expand-l" class="btn" title="展开左侧全部 agent · expand all agents">左展开</button>
+            <button type="button" id="gv-collapse-l" class="btn" title="折叠左侧全部 · collapse agents">左折叠</button>
+            <button type="button" id="gv-expand-r" class="btn" title="展开右侧全部资源 · expand all resources">右展开</button>
+            <button type="button" id="gv-collapse-r" class="btn" title="折叠右侧全部 · collapse resources">右折叠</button>
+          </div>
+          <span id="gv-note" class="muted hint"></span>
+          <span id="gv-sum" class="muted count"></span>
+        </div>
+        <div class="gv-head" id="gv-head" aria-hidden="true">
+          <div><b>Agents</b> <span class="muted" id="gv-lcount"></span></div>
+          <div class="mid">交互量 Interactions</div>
+          <div class="rt"><span class="muted" id="gv-rcount"></span> <b>资源 Resources</b></div>
+        </div>
+        <div class="gv-wrap" id="gv-wrap">
+          <div class="gv-scroll" id="gv-scroll">
+            <svg id="gv-svg" class="gv-svg" role="img" aria-label="Agent 交互二分图 Bipartite interaction graph"></svg>
+            <div id="gv-empty" class="gv-empty" hidden></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Pods -->
       <section id="view-pods" class="view" role="tabpanel" aria-labelledby="tab-pods" hidden>
         <div class="toolbar">
           <label class="fld">站点 <select id="p-site" aria-label="站点 Site"><option value="">全部 All</option></select></label>
@@ -146,7 +185,7 @@
         </div>
       </section>
 
-      <!-- 4. 文件 Files -->
+      <!-- 5. 文件 Files -->
       <section id="view-files" class="view" role="tabpanel" aria-labelledby="tab-files" hidden>
         <div class="toolbar">
           <label class="fld">主机 <select id="fl-host" aria-label="主机 Host"><option value="">全部 All</option></select></label>
@@ -162,7 +201,7 @@
         <div class="split">
           <div class="scroll tablewrap files-list" id="files-wrap">
             <table class="grid files" aria-label="Files">
-              <thead><tr><th>路径 Path</th><th>主机 Host</th><th class="num">r</th><th class="num">w</th><th class="num">e</th><th>最近 Last</th><th>Agents</th></tr></thead>
+              <thead><tr><th>路径 Path</th><th>主机 Host</th><th class="num">r</th><th class="num">w</th><th class="num">e</th><th class="num" title="读取 / 新增 / 删除的行数 · lines read / added / removed">行 Lines</th><th>最近 Last</th><th>Agents</th></tr></thead>
               <tbody id="files-body"></tbody>
             </table>
           </div>
@@ -170,7 +209,7 @@
         </div>
       </section>
 
-      <!-- 5. 动态 Feed -->
+      <!-- 6. 动态 Feed -->
       <section id="view-feed" class="view" role="tabpanel" aria-labelledby="tab-feed" hidden>
         <div class="toolbar">
           <button type="button" id="fd-pause" class="btn toggle" aria-pressed="false"><svg class="ico"><use href="#i-pause"/></svg> <span>暂停 Pause</span></button>

@@ -247,6 +247,21 @@ test("heartbeat stats, ping and unknown requests", async () => {
   } finally { h.stop(); }
 });
 
+test("repo.resolve maps a directory to its work tree over the collector request path", async () => {
+  const h = startHarness();
+  try {
+    const repo = newDir("repo");
+    mkdirSync(join(repo, ".git"));
+    writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(repo, ".git", "config"), '[remote "origin"]\n\turl = https://user:token@github.com/o/r.git\n');
+    const inside = join(repo, "src");
+    mkdirSync(inside);
+    const reply = await h.collector.handleRequest("repo.resolve", { dirs: [inside], roots: [repo] });
+    assert.equal(reply.dirs[inside], repo);
+    assert.deepEqual(reply.repos, [{ root: repo, remote: "github.com/o/r", branch: "main" }]);
+  } finally { h.stop(); }
+});
+
 test("ACP: the DSH session gets acp, the native session gets parent dsh — whichever side appears first", async () => {
   const dshRoot = newDir("dsh"), ompRoot = newDir("omp");
   const sidecarPath = join(dshRoot, "..", `dsh-acp-${counter++}`, "sidecar.sqlite");

@@ -251,6 +251,283 @@ test("panel credentials: the plugin's #nonce becomes a session key that reads th
   assert.equal(await P.redeemCredential(P.parseHash("#nonce=n"), cookieless, root), "", "an unreachable hub is not an exception");
 });
 
+/* ───────────── interaction graphs (?view=graph) ───────────── */
+
+const gEv = (id, t, over = {}) => ({ id, type: "tool", t, status: "ok", category: "read", ...over });
+const gTouch = (agent, event) => ({ agent, event });
+const gHosts = (list = [["mac", "mac"]]) => new Map(list.map(([id, site]) => [id, { id, site, status: "online" }]));
+const gModel = (over) => P.graphModel({ mode: "env", winStart: 0, now: 60_000, hosts: gHosts(), ...over });
+const gLabels = (nodes) => plain(nodes.map((n) => n.label));
+
+test("graph: a collapsed root sums its subtree, an expanded root keeps only its own calls", () => {
+  const A = agent("h#omp:a", { status: "running", startedAt: 1000 });
+  const B = agent("h#omp:b", { startedAt: 2000, parent: { key: "h#omp:a", via: "file", exact: true } });
+  const agents = agentMap([A, B]);
+  const links = [{ from: "h#omp:a", to: "h#omp:b", via: "file", exact: true, toolCallId: "s1", crossHost: false, crossSite: false }];
+  const host = { type: "host", host: "mac", op: "ssh" };
+  const events = [
+    gTouch("h#omp:a", gEv("a1", 10_000, { category: "remote", targets: [host] })),
+    gTouch("h#omp:b", gEv("b1", 11_000, { category: "remote", targets: [host] })),
+    gTouch("h#omp:b", gEv("b2", 12_000, { category: "remote", targets: [host] })),
+  ];
+  const m = gModel({ agents, links, events });
+  assert.equal(m.left.roots.length, 1);
+  assert.equal(m.left.roots[0].agg.calls, 3);
+  assert.equal(m.left.roots[0].own.calls, 1, "the root's own tool call");
+  assert.equal(m.left.roots[0].desc, 1);
+
+  const collapsed = P.graphVisible(m, new Set(), new Set());
+  assert.equal(collapsed.edges.length, 1, "one edge between the root and the collapsed site");
+  assert.equal(collapsed.edges[0].calls, 3);
+  assert.equal(collapsed.edges[0].agents, 2);
+  assert.equal(collapsed.edges[0].rightNode.kind, "site");
+  assert.equal(collapsed.edges[0].dominantClass, "remote", "host targets are the remote colour");
+
+  const expanded = P.graphVisible(m, new Set(["h#omp:a"]), new Set());
+  const byLeft = new Map(expanded.edges.map((e) => [e.left, e]));
+  assert.equal(expanded.edges.length, 2);
+  assert.equal(byLeft.get("h#omp:a").calls, 1, "the expanded parent carries only its own call");
+  assert.equal(byLeft.get("h#omp:b").calls, 2);
+});
+
+test("graph: ACP mirrors and projection records are skipped", () => {
+  const dsh = agent("h#dsh:s1", { kind: "dsh", id: "s1", acp: { provider: "codex-acp", kind: "codex", id: "c1" }, startedAt: 1000 });
+  const codex = agent("h#codex:c1", { kind: "codex", id: "c1", startedAt: 2000, parent: { key: "h#dsh:s1", kind: "dsh", id: "s1", via: "acp", exact: true } });
+  const proj = agent("h#dsh:s1-proj", { kind: "dsh", id: "s1", role: "projection", startedAt: 1000 });
+  const agents = agentMap([dsh, codex, proj]);
+  const file = (path) => ({ type: "file", host: "h", path, op: "read", lines: { read: 5 } });
+  const events = [
+    gTouch(dsh.key, gEv("mirror-1", 10_000, { targets: [file("/w/a/x.mjs")] })),   // same id as the child's call
+    gTouch(codex.key, gEv("mirror-1", 10_000, { targets: [file("/w/a/x.mjs")] })),
+    gTouch(dsh.key, gEv("own-1", 10_500, { targets: [file("/w/a/y.mjs")] })),      // a native DSH tool, still skipped
+    gTouch(codex.key, gEv("child-2", 11_000, { targets: [file("/w/a/y.mjs")] })),
+    gTouch(proj.key, gEv("proj-1", 11_500, { targets: [file("/w/a/x.mjs")] })),
+  ];
+  const m = gModel({ mode: "files", agents, links: [{ from: dsh.key, to: codex.key, via: "acp", exact: true, crossHost: false, crossSite: false }], events });
+  assert.equal(m.left.byKey.has(proj.key), false, "projection agents have no node");
+  assert.equal(m.left.byKey.get(dsh.key).own.calls, 0, "the DSH session's tool events are mirrors, not interactions");
+  assert.equal(m.left.byKey.get(codex.key).own.calls, 2);
+  assert.equal(m.records.length, 2, "the projection event and the DSH mirrors are dropped");
+  assert.ok(m.left.byKey.get(codex.key).kids.length === 0);
+});
+
+test("graph env: pod nodes meet an agent inside the pod and an agent exec-ing into it", () => {
+  const hostPod = "k8s/os/osmium-dev-0";
+  const inside = agent(`${hostPod}#omp:in`, { host: hostPod, site: "os", status: "running", startedAt: 1000 });
+  const outside = agent("mac#claude:out", { host: "mac", site: "mac", startedAt: 2000 });
+  const agents = agentMap([inside, outside]);
+  const pods = new Map([["os/mc-bochao-li/osmium-dev-0", { key: "os/mc-bochao-li/osmium-dev-0", site: "os", namespace: "mc-bochao-li", name: "osmium-dev-0", phase: "Running" }]]);
+  const events = [
+    gTouch(inside.key, gEv("in1", 10_000, { category: "shell", targets: [] })),                       // local exec inside the pod
+    gTouch(outside.key, gEv("out1", 11_000, { category: "k8s", targets: [{ type: "pod", site: "os", namespace: "mc-bochao-li", name: "osmium-dev-0", op: "exec" }] })),
+  ];
+  const m = gModel({ agents, events, pods, now: 20_000 });
+  const site = m.right.roots.find((n) => n.meta.site === "os");
+  const pod = site.kids.find((n) => n.kind === "pod");
+  assert.equal(pod.label, "os/mc-bochao-li/osmium-dev-0");
+  assert.equal(pod.podAgents, 2, "both agents meet at one pod node");
+  assert.equal(pod.podActive, 2);
+  assert.equal(m.records.filter((r) => r.resKey === pod.key).length, 2);
+
+  const off = gModel({ agents, events, pods, now: 20_000, localExec: false });
+  const podOff = off.right.roots.find((n) => n.meta.site === "os").kids.find((n) => n.kind === "pod");
+  assert.equal(podOff.podAgents, 1, "the local-exec toggle removes the in-pod interaction");
+  assert.equal(off.records.length, 1);
+});
+
+test("graph env: local exec maps to the agent's own host or container", () => {
+  const ssh = agent("sg-compute#omp:a", { host: "sg-compute", site: "sg-compute" });
+  const box = agent("mac#omp:b", { host: "mac", site: "mac", container: "harness-home" });
+  const events = [
+    gTouch(ssh.key, gEv("s1", 10_000, { category: "shell", targets: [{ type: "file", host: "sg-compute", path: "/data/bench/x", op: "read" }] })),
+    gTouch(box.key, gEv("b1", 11_000, { category: "shell", targets: [] })),
+    gTouch(ssh.key, gEv("s2", 12_000, { category: "shell", targets: [{ type: "host", host: "sg-compute", op: "ssh" }] })),
+  ];
+  const m = gModel({ agents: agentMap([ssh, box]), events, hosts: gHosts([["mac", "mac"], ["sg-compute", "sg-compute"]]) });
+  const sg = m.right.roots.find((n) => n.meta.site === "sg-compute");
+  assert.deepEqual(gLabels(sg.kids), ["sg-compute"], "a local shell counts on the host node");
+  const mac = m.right.roots.find((n) => n.meta.site === "mac");
+  assert.equal(mac.kids[0].kind, "container");
+  assert.equal(mac.kids[0].label, "容器 harness-home");
+  assert.equal(m.records.length, 3, "the remote ssh call is a real host interaction, not local exec");
+  const off = gModel({ agents: agentMap([ssh, box]), events, localExec: false });
+  assert.equal(off.records.length, 1, "switching off local exec keeps only the explicit host target");
+});
+
+test("graph env: k8s, host and external leaves", () => {
+  const a = agent("mac#omp:a", { host: "mac", site: "mac" });
+  const events = [
+    gTouch(a.key, gEv("k1", 10_000, { category: "k8s", targets: [{ type: "k8s", site: "chengdu", resource: "pod", selector: "app=cd-train", op: "get" }] })),
+    gTouch(a.key, gEv("k2", 11_000, { category: "k8s", targets: [{ type: "k8s", site: "os", resource: "deployment", name: "x", op: "get" }] })),
+    gTouch(a.key, gEv("h1", 12_000, { category: "remote", targets: [{ type: "host", host: "sg-compute", op: "ssh" }] })),
+    gTouch(a.key, gEv("h2", 13_000, { category: "remote", targets: [{ type: "host", host: "ci-runner-02", op: "scp" }] })),
+    gTouch(a.key, gEv("h3", 14_000, { category: "remote", targets: [{ type: "agent", op: "launch", kind: "claude", site: "os", pod: "osmium-dev-0" }] })),
+    gTouch(a.key, gEv("k3", 14_500, { category: "k8s", targets: [{ type: "k8s", site: "os", resource: "pod", op: "get" }] })),
+  ];
+  const pods = new Map([["os/mc-bochao-li/osmium-dev-0", { key: "os/mc-bochao-li/osmium-dev-0", site: "os", namespace: "mc-bochao-li", name: "osmium-dev-0" }]]);
+  const m = gModel({ agents: agentMap([a]), events, pods });
+  const bySite = new Map(m.right.roots.map((n) => [n.meta.site, n]));
+  assert.deepEqual(gLabels(bySite.get("chengdu").kids), ["pods -l app=cd-train"]);
+  assert.deepEqual(gLabels(bySite.get("os").kids), ["os/mc-bochao-li/osmium-dev-0", "deployment/x", "pods（未指名）"], "the launch target is the pod node; an unnamed get is still visible");
+  assert.deepEqual(gLabels(bySite.get("sg-compute").kids), ["sg-compute"]);
+  const ext = m.right.roots[m.right.roots.length - 1];
+  assert.equal(ext.meta.site, "external");
+  assert.equal(ext.label, "外部 external");
+  assert.deepEqual(gLabels(ext.kids), ["ci-runner-02"]);
+  const order = m.right.roots.map((n) => n.meta.site);
+  assert.deepEqual(plain(order.slice(0, 3)), ["sg-compute", "chengdu", "os"], "fleet SITES order first, external last");
+  assert.equal(order[order.length - 1], "external");
+});
+
+test("graph files: deepest repo root, same-remote checkouts, anchors and path compression", () => {
+  const a = agent("mac#omp:a", { host: "mac", site: "mac", cwd: "/Users/lbc/Desktop/work/agent-fleet" });
+  const b = agent("server-bochao-01#omp:b", { host: "server-bochao-01", site: "server-bochao-01" });
+  const c = agent("k8s/iron/iron-dev-0#codex:c", { host: "k8s/iron/iron-dev-0", site: "iron" });
+  const agents = agentMap([a, b, c]);
+  const repoMap = {
+    mac: [{ root: "/w" }, { root: "/w/a", remote: "github.com/o/deep", branch: "dev" }],
+    "server-bochao-01": [{ root: "/s/a", remote: "github.com/o/deep", branch: "main" }],
+    "k8s/iron/iron-dev-0": [{ root: "/workspace", head: "abcdef123456" }],
+  };
+  const f = (host, path, over = {}) => ({ type: "file", host, path, op: "read", ...over });
+  const events = [
+    gTouch(a.key, gEv("f1", 10_000, { targets: [f("mac", "/w/a/lib/hub/index.mjs", { lines: { read: 40 } })] })),
+    gTouch(a.key, gEv("f2", 11_000, { targets: [f("mac", "/w/a/lib/hub/a.mjs", { op: "edit", lines: { added: 3, removed: 1 } })] })),
+    gTouch(b.key, gEv("f3", 12_000, { targets: [f("server-bochao-01", "/s/a/x.txt", { lines: { added: 5 } })] })),
+    gTouch(c.key, gEv("f4", 13_000, { targets: [f("k8s/iron/iron-dev-0", "/workspace/train.py")] })),
+    gTouch(a.key, gEv("f5", 14_000, { targets: [f("mac", "/Users/lbc/Desktop/work/agent-fleet/panel/app.js")] })),
+    gTouch(a.key, gEv("f8", 14_500, { targets: [f("mac", "/Users/lbc/Desktop/work/agent-fleet/tests/x.mjs")] })),
+    gTouch(a.key, gEv("f6", 15_000, { targets: [f("mac", "/Users/lbc/Documents/Obsidian/notes/n.md")] })),
+    gTouch(a.key, gEv("f7", 16_000, { targets: [f("mac", "/tmp/agent-fleet/x.log")] })),
+  ];
+  const m = gModel({ mode: "files", agents, events, repoMap });
+  const repo = m.right.roots.find((n) => n.kind === "repo" && n.label.includes("deep"));
+  assert.equal(repo.label, "o/deep @ 2 branches", "same remote, two branches");
+  assert.equal(repo.kids.length, 2, "one checkout per root");
+  const macCo = repo.kids.find((k) => k.meta.host === "mac");
+  assert.match(macCo.label, /^dev · mac · w\/a$/);
+  assert.deepEqual(gLabels(macCo.kids), ["lib/hub"], "the single-child lib/ directory compresses with hub");
+  assert.deepEqual(gLabels(macCo.kids[0].kids), ["a.mjs", "index.mjs"]);
+  const serverCo = repo.kids.find((k) => k.meta.host === "server-bochao-01");
+  assert.match(serverCo.label, /^main · server-bochao-01 · s\/a$/);
+  const iron = m.right.roots.find((n) => n.kind === "repo" && n.meta.host === undefined && n.label.startsWith("workspace"));
+  assert.equal(iron.label, "workspace @ abcdef1", "a detached repo shows the head prefix");
+  const anchors = m.right.roots.filter((n) => n.kind === "anchor");
+  const anchorLabels = anchors.map((n) => n.label);
+  assert.ok(anchorLabels.includes("/Users/lbc/Desktop/work/agent-fleet"), "the deepest agent cwd anchors its files");
+  assert.ok(anchorLabels.includes("/Users/lbc/Documents/Obsidian"), "home + two segments");
+  assert.ok(anchorLabels.includes("/tmp/agent-fleet"), "first two segments outside home");
+  const home = anchors.find((n) => n.label === "/Users/lbc/Documents/Obsidian");
+  assert.deepEqual(gLabels(home.kids), ["notes"]);
+  assert.deepEqual(gLabels(home.kids[0].kids), ["n.md"]);
+  const cwdAnchor = anchors.find((n) => n.label === "/Users/lbc/Desktop/work/agent-fleet");
+  assert.deepEqual(gLabels(cwdAnchor.kids), ["panel", "tests"], "two subtrees keep the cwd anchor uncompressed");
+});
+
+test("graph files: a directory with its own touches breaks path compression", () => {
+  const a = agent("mac#omp:a", { host: "mac" });
+  const repoMap = { mac: [{ root: "/w/a", remote: "github.com/o/r", branch: "main" }] };
+  const events = [
+    gTouch(a.key, gEv("d1", 10_000, { targets: [{ type: "file", host: "mac", path: "/w/a/lib/hub/index.mjs", op: "read" }] })),
+    gTouch(a.key, gEv("d2", 11_000, { targets: [{ type: "file", host: "mac", path: "/w/a/lib/hub", op: "list" }] })),
+  ];
+  const m = gModel({ mode: "files", agents: agentMap([a]), events, repoMap });
+  const lib = m.right.roots[0].kids[0];                    // one checkout → no checkout level; the group's child is lib
+  assert.equal(lib.label, "lib");
+  assert.equal(lib.kids[0].label, "hub");
+  assert.equal(lib.kids[0].own.calls, 1, "the list target counts on the directory itself");
+  assert.deepEqual(gLabels(lib.kids[0].kids), ["index.mjs"]);
+});
+
+test("graph: window filter, line totals per edge and the op fallback label", () => {
+  const a = agent("mac#omp:a", { host: "mac" });
+  const file = (path, lines) => ({ type: "file", host: "mac", path, op: lines && lines.added ? "edit" : "read", ...(lines ? { lines } : {}) });
+  const events = [
+    gTouch(a.key, gEv("old", 9_000, { targets: [file("/w/a/old.mjs", { read: 99 })] })),
+    gTouch(a.key, gEv("r1", 10_000, { targets: [file("/w/a/x.mjs", { read: 10 })] })),
+    gTouch(a.key, gEv("e1", 11_000, { targets: [file("/w/a/x.mjs", { added: 2, removed: 1 })] })),
+    gTouch(a.key, gEv("g1", 12_000, { category: "search", targets: [file("/w/a/dir", null)] })),
+  ];
+  const m = gModel({ mode: "files", agents: agentMap([a]), events, winStart: 10_000, repoMap: { mac: [{ root: "/w/a", remote: "github.com/o/r", branch: "main" }] } });
+  assert.equal(m.records.length, 3, "the event before the window is dropped");
+  const v = P.graphVisible(m, new Set(), new Set(m.right.roots.map((n) => n.key)));
+  const edge = v.edges.find((e) => e.right === "F:mac:/w/a/x.mjs");
+  assert.deepEqual(plain(edge.lines), { read: 10, added: 2, removed: 1 });
+  assert.equal(P.graphEdgeLabel("files", edge), "2× r10 +2 −1");
+  assert.equal(edge.dominantClass, "edit", "a read/edit tie is coloured by the edit class (e > w > r)");
+  const dirEdge = v.edges.find((e) => e.rightNode.label === "dir");
+  assert.equal(P.graphEdgeLabel("files", dirEdge), "1× 1r", "no lines → op classes");
+  assert.equal(dirEdge.dominantClass, "read", "file edges use the CSS class names, not the raw op class");
+  const wm = gModel({ mode: "files", agents: agentMap([a]), events: [gTouch(a.key, gEv("w1", 12_500, { targets: [{ type: "file", host: "mac", path: "/w/a/w.mjs", op: "write", lines: { added: 4 } }] }))], repoMap: { mac: [{ root: "/w/a", remote: "github.com/o/r", branch: "main" }] } });
+  const wv = P.graphVisible(wm, new Set(), new Set(wm.right.roots.map((n) => n.key)));
+  assert.equal(wv.edges[0].dominantClass, "write");
+  assert.equal(P.graphEdgeLabel("files", wv.edges[0]), "1× +4");
+  assert.equal(P.edgeLinesText({ read: 820 }), "r820");
+  assert.equal(P.edgeLinesText({ added: 12, removed: 3 }), "+12 −3");
+  assert.equal(P.edgeLinesText(null), "");
+});
+
+test("graph: text and running filters", () => {
+  const run = agent("mac#omp:run", { host: "mac", status: "running", title: "fleet panel" });
+  const done = agent("mac#omp:done", { host: "mac", status: "done", title: "checkpoint eval", startedAt: 500 });
+  const kids = agent("mac#omp:kid", { host: "mac", status: "done", title: "lint sweep", startedAt: 600, parent: { key: "mac#omp:run", via: "file", exact: true } });
+  const agents = agentMap([run, done, kids]);
+  const links = [{ from: "mac#omp:run", to: "mac#omp:kid", via: "file", exact: true, crossHost: false, crossSite: false }];
+  const host = { type: "host", host: "mac", op: "ssh" };
+  const events = [gTouch(run.key, gEv("r1", 10_000, { targets: [host] })), gTouch(done.key, gEv("d1", 11_000, { targets: [host] })), gTouch(kids.key, gEv("k1", 12_000, { targets: [host] }))];
+  const all = gModel({ agents, links, events });
+  assert.equal(all.left.roots.length, 2);
+  const onlyRun = gModel({ agents, links, events, runningOnly: true });
+  assert.deepEqual(plain(gLabels(onlyRun.left.roots)), ["fleet panel"], "the running family keeps its done child");
+  assert.equal(onlyRun.left.byKey.has(kids.key), true);
+  const q = gModel({ agents, links, events, q: "lint" });
+  assert.deepEqual(plain(gLabels(q.left.roots)), ["fleet panel"], "a matching child keeps its ancestor");
+  assert.equal(q.left.byKey.has(done.key), false);
+});
+
+test("graph: label placement rides each curve, keeps labels apart and hides what does not fit", () => {
+  const mk = (key, y0, y1, rank, w = 40) => ({ key, text: key, w, x0: 100, y0, x1: 900, y1, dx: 300, rank, calls: 1 });
+  const items = [mk("a", 100, 100, 3), mk("b", 100, 100, 2), mk("c", 100, 160, 1)];
+  const p = P.placeCurveLabels(items, { minX: 90, maxX: 910, minY: 0, maxY: 400, lineH: 12, gap: 3 });
+  const placed = items.map((i) => p.get(i.key)).filter((x) => !x.hidden);
+  assert.equal(placed.length, 3);
+  for (let i = 0; i < placed.length; i++) for (let j = i + 1; j < placed.length; j++) {
+    const a = placed[i], b = placed[j];
+    assert.ok(a.bx1 + 3 < b.bx0 || b.bx1 + 3 < a.bx0 || a.by1 + 3 < b.by0 || b.by1 + 3 < a.by0, "label boxes never overlap");
+  }
+  assert.equal(p.get("c").t, 0.5, "the highest-ranked label gets the curve midpoint");
+  assert.ok(Math.abs(p.get("a").y - 100) < 1e-9, "a horizontal curve keeps its labels on the line");
+  assert.ok(p.get("c").y > 100 && p.get("c").y < 160, "a slanted curve puts the label on the edge");
+  assert.equal(p.get("a").t, 0.38, "the loser of the midpoint slides along its own curve");
+
+  const many = Array.from({ length: 10 }, (_, i) => mk("k" + i, 100, 100, i));
+  const q = P.placeCurveLabels(many, { minX: 90, maxX: 910, minY: 0, maxY: 400, lineH: 12, gap: 3 });
+  const shown = many.map((i) => q.get(i.key)).filter((x) => !x.hidden);
+  assert.ok(shown.length >= 3 && shown.length < 10, "only the free spots are used");
+  for (const s of shown) assert.ok(s.bx0 >= 90 && s.bx1 <= 910 && s.by0 >= 0 && s.by1 <= 400, "labels stay inside the column");
+  assert.ok(many.some((i) => q.get(i.key).hidden), "no room → hidden (hover still shows it)");
+});
+
+test("graph: hash round-trips mode and window, touch summaries sum line counts", () => {
+  const h = P.buildHash({ view: "graph", g: "files", win: "2h" });
+  assert.match(h, /^#view=graph&g=files&win=2h/);
+  assert.deepEqual([P.parseHash(h).g, P.parseHash(h).win], ["files", "2h"]);
+  assert.deepEqual([P.parseHash("#view=graph").g, P.parseHash("#view=graph").win], ["env", "30m"], "defaults");
+  assert.equal(P.parseHash("#view=graph&g=nope&win=9h").g, "env");
+  assert.equal(P.parseHash("#view=graph&g=nope&win=9h").win, "30m");
+  assert.doesNotMatch(P.buildHash({ view: "timeline", g: "files", win: "24h" }), /g=files|win=24h/);
+
+  const m = new Map([
+    ["a|1", { agent: "A", t: 100, op: "read", lines: { read: 40 } }],
+    ["a|2", { agent: "A", t: 300, op: "edit", lines: { added: 3, removed: 1 } }],
+    ["b|1", { agent: "B", t: 200, op: "search" }],
+  ]);
+  const s = P.summarizeTouches(m);
+  assert.deepEqual(plain(s.lines), { read: 40, added: 3, removed: 1 });
+  assert.equal(P.targetLinesText({ op: "edit", lines: { added: 12, removed: 3 } }), "+12 −3");
+  assert.equal(P.targetLinesText({ op: "read", lines: { read: 120 } }), "r120");
+});
+
 /* ───────────── demo fixture ───────────── */
 
 const demo = JSON.parse(readFileSync(panelDir + "fixtures/demo.json", "utf8"));

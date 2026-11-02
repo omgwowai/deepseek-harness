@@ -2,6 +2,7 @@
 //
 //   classifyTool({kind, name, input, cwd, host, site, home?}) → {category, preview, targets}
 //   parseCommand(cmd, {cwd, host, site, home?})              → {category, targets}   (cmd: string, or argv array)
+//   countLines(text)                                         → number                (Contract A row count)
 //
 // Pure and synchronous (no I/O); neither function throws. `host`/`site` say where the call ran, so file targets carry
 // `host` and agent launches `site`; pass `home` (os.homedir()) so `~/x` resolves, else it is derived from `cwd`.
@@ -12,6 +13,9 @@
 // need a known cwd, and files in a pod without a fleet site or in a deployment (no host id) are dropped. kubectl falls
 // back to NAMESPACE for fleet clusters. A label selector (-l) is reported as `selector` on a k8s target (never as a name).
 // Previews are one line, secrets redacted, ≤ LIMITS.previewChars; heredoc bodies and stdin text never reach them.
+// File targets may carry `lines` (Contract A: {read?, added?, removed?}) derived from the call's arguments — write
+// content, hashline PUT/CUT rows, patch rows, read ranges and limits. Counts never change category, preview or target
+// order; the readers replace them with exact result-derived counts when the tool result arrives.
 
 import { posix } from "node:path";
 import { LIMITS, NAMESPACE, podHostId, siteOfCluster, siteOfSshTarget } from "./protocol.mjs";
@@ -29,6 +33,19 @@ const oneLine = t => t.replace(/\s+/g, " ").trim();
 const dyn = w => typeof w !== "string" || w.includes(DYN);
 const V = list => new Set(list.split(" ").filter(Boolean));
 const pv = t => redactText(oneLine(String(t ?? "").slice(0, 4000)), LIMITS.previewChars);
+
+/**
+ * Lines in a block of text (Contract A): 0 for a non-string or "", otherwise the number of "\n" plus 1, unless the
+ * text ends with "\n". Counted in place (no split) because tool arguments can be hundreds of kilobytes.
+ * @param {unknown} text
+ * @returns {number}
+ */
+export function countLines(text) {
+  if (typeof text !== "string" || text === "") return 0;
+  let n = 1;
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) n++;
+  return text.endsWith("\n") ? n - 1 : n;
+}
 
 // ───────────────────────────────────────────── shell lexer ─────────────────────────────────────────────
 // lexShell(text) → Stmt[]; Stmt = {words, redirs, nested}. Words are unquoted; `$VAR` stays as VAR…END markers so
@@ -269,17 +286,46 @@ function rootScope(o) {
 }
 const cloneScope = s => ({ ...s, env: new Map(s.env) });
 const remoteScope = (host, site, pod, cwd) => ({ host, site, cwd, home: undefined, env: new Map(), remote: true, pod });
-const newCtx = () => ({ targets: [], keys: new Set(), spawn: false, k8s: false, remote: false, patch: null, depth: 0, steps: 0, chars: 0 });
+const newCtx = () => ({ targets: [], index: new Map(), spawn: false, k8s: false, remote: false, patch: null, depth: 0, steps: 0, chars: 0 });
 
 function T(type, fields) {
   const t = { type };
   for (const k in fields) { const v = fields[k]; if (v !== undefined && v !== "") t[k] = v; }
   return t;
 }
+const LINE_KEYS = ["read", "added", "removed"];
+// Contract A `lines`: only the parts the arguments determine, as non-negative integers. A count of 0 is dropped
+// (it reports no activity) and an object without parts disappears.
+function lineCounts(parts) {
+  const out = {};
+  for (const k of LINE_KEYS) {
+    const n = parts?.[k];
+    if (Number.isFinite(n) && n > 0) out[k] = Math.floor(n);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+// Two sources for one target (two hashline blocks for a file, two sections of one patch) add up. A part only one
+// side knows stays known: an unknown part never erases a counted one.
+function sumLines(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const out = {};
+  for (const k of LINE_KEYS) {
+    const x = a[k], y = b[k];
+    if (x === undefined) { if (y !== undefined) out[k] = y; }
+    else out[k] = y === undefined ? x : x + y;
+  }
+  return out;
+}
 function push(ctx, t) {
   const key = [t.type, t.op, t.host, t.path ?? t.url ?? t.name, t.selector, t.site, t.cluster, t.namespace, t.container, t.resource, t.kind, t.pod].join("\u0001");
-  if (ctx.keys.has(key) || ctx.targets.length >= 256) return;
-  ctx.keys.add(key);
+  const at = ctx.index.get(key);
+  if (at) {
+    if (t.lines) at.lines = sumLines(at.lines, t.lines);
+    return;
+  }
+  if (ctx.targets.length >= 256) return;
+  ctx.index.set(key, t);
   ctx.targets.push(t);
 }
 // Over the cap, non-file targets win (they are few and structural); files keep their order.
@@ -327,11 +373,14 @@ function braces(word) {
   }
   return out;
 }
-function addFile(ctx, scope, word, op) {
+function addFile(ctx, scope, word, op, lines) {
   if (dyn(word) || word.length > 4096 || word.includes("{}") || (scope.remote && scope.host == null) || !plausible(word)) return;
-  for (const w of braces(word)) {
+  // Counts describe reading, writing and editing a file; a delete/list/search/exec target has none.
+  const known = op === "read" || op === "write" || op === "edit" ? lines : undefined;
+  const expanded = braces(word);
+  for (const w of expanded) {
     const path = resolvePath(w, scope);
-    if (path) push(ctx, T("file", { op, host: scope.host, path }));
+    if (path) push(ctx, T("file", { op, host: scope.host, path, lines: expanded.length === 1 ? known : undefined }));
   }
 }
 function addUrl(ctx, u) {
@@ -1129,12 +1178,26 @@ const HANDLERS = new Map(Object.entries({
 // ───────────────────────────────────────────── patches ─────────────────────────────────────────────
 
 // Codex apply_patch: `*** Add File: p`, `*** Update File: p` (+ `*** Move to: q`), `*** Delete File: p`.
+// `lines` comes from the section's rows: `+` added, `-` removed, never the `*** ` directives or `@@` hunk headers.
+// Add File can only add and Delete File knows no row count. A `Move to:` keeps its counts on the source target: the
+// update section describes the text moved out, and the destination is reported as a plain write.
 function parsePatch(text) {
   const ops = [];
+  let cur = null;
   for (const line of String(text).split("\n")) {
     let m;
-    if ((m = /^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/.exec(line))) ops.push({ action: m[1], path: m[2] });
-    else if ((m = /^\*\*\* Move to:\s*(.+?)\s*$/.exec(line)) && ops.length) ops[ops.length - 1].moveTo = m[1];
+    if ((m = /^\*\*\* (Add|Update|Delete) File:\s*(.+?)\s*$/.exec(line))) { cur = { action: m[1], path: m[2], added: 0, removed: 0 }; ops.push(cur); continue; }
+    if ((m = /^\*\*\* Move to:\s*(.+?)\s*$/.exec(line))) { if (cur) cur.moveTo = m[1]; continue; }
+    if (!cur || line.startsWith("*** ") || line.startsWith("@@")) continue;
+    if (cur.action === "Delete") continue;
+    if (line.startsWith("+")) cur.added += 1;
+    else if (line.startsWith("-")) cur.removed += 1;
+  }
+  for (const o of ops) {
+    const known = lineCounts(o);
+    if (known) o.lines = known;
+    delete o.added;
+    delete o.removed;
   }
   return ops;
 }
@@ -1142,7 +1205,7 @@ function applyPatch(ctx, scope, ops) {
   if (ops.length === 0) return;
   ctx.patch = [...(ctx.patch ?? []), ...ops];
   for (const o of ops) {
-    addFile(ctx, scope, o.path, o.action === "Add" ? "write" : o.action === "Delete" ? "delete" : "edit");
+    addFile(ctx, scope, o.path, o.action === "Add" ? "write" : o.action === "Delete" ? "delete" : "edit", o.lines);
     if (o.moveTo) addFile(ctx, scope, o.moveTo, "write");
   }
 }
@@ -1265,28 +1328,46 @@ function stripSelectors(p) {
   for (let n = 0; n < 3 && SELECTOR.test(p); n++) p = p.replace(SELECTOR, "");
   return p;
 }
+// `read` lines a path selector asks for (Contract A): `:50-80` → 31, `:50+20` and `:-20` → 20, a comma list sums
+// (`:5-16,960-973` → 26). An open range (`:50`, `:50-`) and `:raw`/`:img`/`:conflicts` name no row count, so they
+// stay unknown rather than guessing.
+function selectorLines(p) {
+  let total = 0;
+  for (let n = 0; n < 3; n++) {
+    const m = SELECTOR.exec(p);
+    if (!m) break;
+    p = p.slice(0, m.index);
+    for (const part of m[0].slice(1).split(",")) {
+      let s;
+      if ((s = /^(\d+)-(\d+)$/.exec(part))) total += Number(s[2]) >= Number(s[1]) ? Number(s[2]) - Number(s[1]) + 1 : 0;
+      else if ((s = /^(\d+)\+(\d+)$/.exec(part))) total += Number(s[2]);
+      else if ((s = /^-(\d+)$/.exec(part))) total += Number(s[1]);
+    }
+  }
+  return total > 0 ? total : undefined;
+}
 const safeDecode = s => { try { return decodeURI(s); } catch { return s; } };
 // A path argument of a tool: real files and ssh:// become file targets, http(s) a url, other schemes (agent://, local://,
 // artifact://, skill://, history://, xd://, …) nothing.
-function toolPath(ctx, scope, raw, op) {
+function toolPath(ctx, scope, raw, op, lines) {
   const p = typeof raw === "string" ? raw.trim() : "";
   if (!p) return;
   const m = URL_RE.test(p) ? /^([a-z][a-z0-9+.-]*):\/\/(.*)$/is.exec(p) : null;
   if (m) {
     const scheme = m[1].toLowerCase();
     if (scheme === "http" || scheme === "https") addUrl(ctx, p);
-    else if (scheme === "file") addFile(ctx, scope, stripSelectors(safeDecode(m[2])), op);
+    else if (scheme === "file") addFile(ctx, scope, stripSelectors(safeDecode(m[2])), op, lines);
     else if (scheme === "ssh") {
       const u = REMOTE_URL.exec(stripSelectors(p));
       if (u) {
         const remote = remoteHost(ctx, (u[1] ? u[1] + "@" : "") + u[2], "ssh");
-        if (u[3]) addFile(ctx, remote, u[3], op);
+        if (u[3]) addFile(ctx, remote, u[3], op, lines);
       }
     }
     return;
   }
   const clean = stripSelectors(p);
-  addFile(ctx, scope, clean, op === "read" && clean.endsWith("/") ? "list" : op);
+  addFile(ctx, scope, clean, op === "read" && clean.endsWith("/") ? "list" : op, lines);
 }
 const splitPaths = raw => (typeof raw === "string" ? raw.split(";").map(s => s.trim()).filter(Boolean) : Array.isArray(raw) ? raw.filter(x => typeof x === "string") : []);
 function rangeOf(input) {
@@ -1385,12 +1466,17 @@ function codexExec(c) {
 function readTool(c) {
   const p = pathOf(c.input);
   if (!p) return res("read", textHint(c.input) || c.tool);
-  return res("read", p + rangeOf(c.input), withCtx(c, (ctx, scope) => toolPath(ctx, scope, p, "read")));
+  // A path selector is exact; otherwise `limit` is the number of rows asked for (Claude Read). No limit and no
+  // selector → unknown; the result-derived count fills it in later.
+  const limit = isObj(c.input) && Number.isFinite(c.input.limit) && c.input.limit > 0 ? c.input.limit : undefined;
+  const lines = lineCounts({ read: selectorLines(p) ?? limit });
+  return res("read", p + rangeOf(c.input), withCtx(c, (ctx, scope) => toolPath(ctx, scope, p, "read", lines)));
 }
 function writeTool(c) {
   const p = pathOf(c.input);
   if (!p) return res("write", c.tool);
   const content = isObj(c.input) ? c.input.content : undefined;
+  const lines = typeof content === "string" ? lineCounts({ added: countLines(content) }) : undefined;
   const pseudo = /^([a-z][a-z0-9+.-]*):\/\/(.*)$/is.exec(p);
   if (pseudo) {
     const scheme = pseudo[1].toLowerCase();
@@ -1399,7 +1485,7 @@ function writeTool(c) {
     if (scheme === "proc") return res("shell", `proc ${pseudo[2]}`);
     if (scheme === "conflict") return res("edit", p);
   }
-  return res("write", p, withCtx(c, (ctx, scope) => toolPath(ctx, scope, p, "write")));
+  return res("write", p, withCtx(c, (ctx, scope) => toolPath(ctx, scope, p, "write", lines)));
 }
 // `write xd://<tool>` with JSON content calls that tool.
 function xdCall(c, device, content) {
@@ -1410,35 +1496,126 @@ function xdCall(c, device, content) {
   return classify({ ...c, name, input });
 }
 const HASHLINE_HEADER = /^\[(.+?)(?:#[0-9A-Fa-f]{2,8})?\]\s*$/;
+// A `PUT` op: `<A` / `>A` (also `>A*`) inserts before/after an anchor, `A.=B` replaces the inclusive range A..B,
+// `A` replaces one line and `A*` a whole block. An insert anchor is a line number or `$` (end of file). The suffix
+// is `:` when a `+`-prefixed body follows, or `@register` for a paste whose rows live in a register.
+const HASHLINE_PUT = /^PUT\s+(\S+)\s*(:|@\S+)\s*$/;
+const PUT_INSERT = /^([<>])(\d+|\$)(\*?)$/;
+const PUT_RANGE = /^(\d+)\.=(\d+)$/;
+const PUT_LINE = /^(\d+)(\*?)$/;
+// A `CUT`: `A.=B` deletes a known span, `A` a single line, `A*` a block whose size is unknown; a trailing
+// `@register` names the cut rows and changes nothing about the count.
+const HASHLINE_CUT = /^CUT\s+(\S+)\s*(?:@\S+)?\s*$/;
+const CUT_RANGE = /^(\d+)\.=(\d+)$/;
+const CUT_LINE = /^(\d+)(\*?)$/;
+const HASHLINE_OP = /^(?:PUT|CUT|REM|MV)\b/; // an op line ends the body rows of the preceding op
+const spanOf = (a, b) => (Number(b) >= Number(a) ? Number(b) - Number(a) + 1 : undefined);
+const plus = (total, n) => (n === undefined ? total : (total ?? 0) + n);
+
+// hashline patch text → blocks in order: `{path: string|null, op, moveTo?, lines?}`. Ops before the first
+// `[path#TAG]` header form one block with `path: null` (they apply to the tool's own `path` argument). Rows of a
+// block are summed per part; a part an op leaves unknown (a `*` block, a register paste) simply does not contribute
+// while the known parts still count. `REM` deletes the block's file (no counts), `MV` renames it (no counts).
+// The counts mean "rows replaced/inserted": the tool's own diff can be smaller when a replaced line is identical (it
+// shows as context), which is expected. OMP readers replace these counts with the diff from the result, DSH readers
+// with the result's `meta.diffs`; a result without either keeps the argument counts.
+function hashlineBlocks(text) {
+  const out = [];
+  let cur = null;
+  const start = path => { cur = { path, op: "edit", added: 0, removed: 0 }; out.push(cur); };
+  const lines = String(text).slice(0, 1_000_000).split("\n"); // bounded like the shell analyser
+  for (let k = 0; k < lines.length; k++) {
+    const line = lines[k];
+    const h = HASHLINE_HEADER.exec(line);
+    if (h) { start(h[1]); continue; }
+    if (!cur) start(null);
+    if (/^REM\b/.test(line)) { cur.op = "delete"; continue; }
+    if (/^MV\s/.test(line)) { cur.moveTo = line.slice(3).trim().replace(/^["']|["']$/g, ""); continue; }
+    const cut = HASHLINE_CUT.exec(line);
+    if (cut) {
+      const range = CUT_RANGE.exec(cut[1]), one = range ? null : CUT_LINE.exec(cut[1]);
+      if (range) cur.removed = plus(cur.removed, spanOf(range[1], range[2]));
+      else if (one?.[2] === "") cur.removed = plus(cur.removed, 1); // A cuts one line; A* has unknown size
+      continue;
+    }
+    const put = HASHLINE_PUT.exec(line);
+    if (!put) continue;
+    const ins = PUT_INSERT.exec(put[1]), range = ins ? null : PUT_RANGE.exec(put[1]);
+    const one = ins || range ? null : PUT_LINE.exec(put[1]);
+    if (!ins && !range && !one) continue;
+    let rows;
+    if (put[2] === ":") { // body rows: every "+" line up to the next op/header; other lines (a forgotten "+") are ignored
+      rows = 0;
+      while (k + 1 < lines.length && !HASHLINE_HEADER.test(lines[k + 1]) && !HASHLINE_OP.test(lines[k + 1])) {
+        k += 1;
+        if (lines[k].startsWith("+")) rows += 1; // a lone "+" is a blank row
+      }
+    }
+    if (ins) { if (rows !== undefined) cur.added = plus(cur.added, rows); continue; } // inserts remove nothing
+    if (range) cur.removed = plus(cur.removed, spanOf(range[1], range[2]));
+    else if (one[2] === "") cur.removed = plus(cur.removed, 1); // A replaces one line; A* has unknown size
+    if (rows !== undefined) cur.added = plus(cur.added, rows);
+  }
+  for (const b of out) {
+    const known = lineCounts(b);
+    if (known) b.lines = known;
+    delete b.added;
+    delete b.removed;
+  }
+  return out;
+}
+// Path-based edit arguments: Claude `Edit {old_string, new_string}`, `MultiEdit {edits: [...]}` (summed) and OMP
+// `replace` pairs. A hashline patch in the same call wins, since its ops describe the file more exactly.
+function editArgLines(i) {
+  if (!isObj(i)) return undefined;
+  const edits = Array.isArray(i.edits) ? i.edits.filter(isObj) : [];
+  const pairs = edits.length ? edits : [i];
+  let added = 0, removed = 0, known = false;
+  for (const e of pairs) {
+    if (typeof e.old_string === "string") { removed += countLines(e.old_string); known = true; }
+    if (typeof e.new_string === "string") { added += countLines(e.new_string); known = true; }
+  }
+  return known ? lineCounts({ added, removed }) : undefined;
+}
 // OMP/DSH edit input: hashline patches (`[path#TAG]` blocks with PUT/CUT/REM/MV lines) or path-based arguments.
 function editTool(c) {
   const i = isObj(c.input) ? c.input : {};
   const ctx = newCtx(), scope = rootScope(c);
   const text = typeof c.input === "string" ? c.input : typeof i.input === "string" ? i.input : "";
-  const blocks = []; // one per [path#TAG] header: its file, op (edit | delete) and rename destination
-  for (const line of text.split("\n")) {
-    const h = HASHLINE_HEADER.exec(line);
-    if (h) { blocks.push({ path: h[1], op: "edit" }); continue; }
-    const b = blocks[blocks.length - 1];
-    if (!b) continue;
-    if (/^REM\b/.test(line)) b.op = "delete";
-    else if (/^MV\s/.test(line)) b.moveTo = line.slice(3).trim().replace(/^["']|["']$/g, "");
-  }
+  const blocks = hashlineBlocks(text);
   const direct = isObj(c.input) ? pathOf({ ...c.input, input: undefined }) : undefined;
-  if (direct && !blocks.some(b => b.path === direct)) blocks.unshift({ path: direct, op: "edit" });
+  const argLines = editArgLines(i);
+  if (blocks[0]?.path === null) { // a header-less patch applies to the tool's own path
+    if (direct) {
+      blocks[0].path = direct;
+      // hashline ops describe the file exactly; only when they count nothing do old/new arguments speak for it
+      if (!blocks[0].lines) blocks[0].lines = argLines;
+    } else blocks.shift();
+  }
+  if (direct && !blocks.some(b => b.path === direct)) blocks.unshift({ path: direct, op: "edit", lines: argLines });
   for (const b of blocks) {
-    toolPath(ctx, scope, b.path, b.moveTo ? "delete" : b.op);
+    toolPath(ctx, scope, b.path, b.moveTo ? "delete" : b.op, b.lines);
     if (b.moveTo) toolPath(ctx, scope, b.moveTo, "write");
   }
   const paths = blocks.map(b => b.path);
   const shown = paths.slice(0, 3).join(", ") + (paths.length > 3 ? ` +${paths.length - 3}` : "");
   return res("edit", shown || c.tool, finish(ctx));
 }
+// str_replace_editor counts: `create` writes file_text, `str_replace` swaps old_str for new_str, `insert` adds new_str.
+function strEditorLines(i) {
+  if (i.command === "create") return typeof i.file_text === "string" ? lineCounts({ added: countLines(i.file_text) }) : undefined;
+  if (i.command === "str_replace") return lineCounts({
+    removed: typeof i.old_str === "string" ? countLines(i.old_str) : undefined,
+    added: typeof i.new_str === "string" ? countLines(i.new_str) : undefined,
+  });
+  if (i.command === "insert") return typeof i.new_str === "string" ? lineCounts({ added: countLines(i.new_str) }) : undefined;
+  return undefined;
+}
 function strEditorTool(c) { // str_replace_editor: view | create | str_replace | insert | undo_edit
   const i = isObj(c.input) ? c.input : {};
   const op = i.command === "view" ? "read" : i.command === "create" ? "write" : "edit";
   const p = pathOf(i);
-  return res(op, p ?? c.tool, p ? withCtx(c, (ctx, scope) => toolPath(ctx, scope, p, op)) : []);
+  return res(op, p ?? c.tool, p ? withCtx(c, (ctx, scope) => toolPath(ctx, scope, p, op, strEditorLines(i))) : []);
 }
 function patchTool(c) {
   const i = isObj(c.input) ? c.input : {};

@@ -11,11 +11,15 @@
 //
 // While `session.replay` is true (history copied from a parent: OMP/Claude/Codex forks, seeded DSH sessions) rows
 // only update metadata: no events, usage, counts or turn state.
+import { posix } from "node:path";
 import { LIMITS, agentKey } from "../../protocol.mjs";
 import { redactText } from "../../redact.mjs";
 import { classifyTool } from "../../targets.mjs";
 
 const USAGE_KEYS = ["input", "output", "cacheRead", "cacheWrite", "reasoning"];
+const LINE_KEYS = ["read", "added", "removed"];
+/** A result larger than this is not scanned for line counts: the hot path stays bounded on a huge dump or diff. */
+const MAX_COUNT_BYTES = 4 * 1024 * 1024;
 const MAX_READER_ERRORS = 3;
 const EFFORTS = new Set(["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 /** A response without a stop reason that looks final ends its turn once nothing followed for this long. */
@@ -100,6 +104,47 @@ const finite = value => (typeof value === "number" && Number.isFinite(value) ? v
 export function exitCodeFromText(text) {
   const match = /(?:^|\n)\s*Exit code[: ]+(-?\d+)|exited with code (-?\d+)|exit code[: ]+(-?\d+)/i.exec(text);
   return match ? Number(match[1] ?? match[2] ?? match[3]) : undefined;
+}
+
+/** True when a tool result is small enough to count lines in (readers call this before deriving counts). */
+export function withinCountLimit(text) {
+  if (typeof text !== "string" || text.length > MAX_COUNT_BYTES) return false; // UTF-8 bytes never undercut chars
+  if (text.length <= MAX_COUNT_BYTES / 4) return true; // a UTF-16 char is at most 4 UTF-8 bytes, so ≤ 4 MiB
+  return Buffer.byteLength(text) <= MAX_COUNT_BYTES;
+}
+
+/**
+ * Output lines of a shell call that read one file: the harness footer (`Wall time: 1.2 seconds`) and the blank lines
+ * around it are not file lines. Returns 0 for empty output.
+ */
+function shellOutputLines(text) {
+  const rows = typeof text === "string" ? text.split("\n") : [];
+  let end = rows.length;
+  for (;;) {
+    while (end > 0 && rows[end - 1].trim() === "") end--;
+    if (end > 0 && /^Wall time: [\d.]+ seconds?$/.test(rows[end - 1].trim())) { end--; continue; }
+    return end;
+  }
+}
+
+/**
+ * The absolute target path a tool result names, resolved like `lib/targets.mjs` does for arguments (results carry
+ * absolute paths in practice; the cwd/home rules keep a relative one attributable).
+ */
+function resolveResultPath(path, cwd) {
+  if (typeof path !== "string" || path === "" || path === "-") return undefined;
+  let p = path;
+  if (p === "~" || p.startsWith("~/")) {
+    const home = typeof cwd === "string" ? /^(\/Users\/[^/]+|\/home\/[^/]+|\/root)(?=\/|$)/.exec(cwd)?.[1] : undefined;
+    if (!home) return p === "~" ? p : "~/" + posix.normalize(p.slice(2)).replace(/\/$/, "");
+    p = home + p.slice(1);
+  } else if (p.startsWith("~")) return undefined;
+  if (!p.startsWith("/")) {
+    if (typeof cwd !== "string" || !cwd) return undefined;
+    p = posix.join(cwd, p);
+  }
+  p = posix.normalize(p);
+  return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
 }
 
 // ------------------------------------------------------------------------------------------ tool taxonomy
@@ -406,8 +451,13 @@ export class Session {
     return group[0];
   }
 
-  /** The result of a tool call arrived. `childIds` (spawn calls): record ids of the children, in call order. */
-  toolEnd(t, id, { isError = false, exitCode, text, childIds } = {}) {
+  /**
+   * The result of a tool call arrived. `childIds` (spawn calls): record ids of the children, in call order.
+   * `fileLines`: counts read from the result body (`[{path?, read?, added?, removed?}]`); `resultText`: the full,
+   * untruncated result text, used only to count a shell call that read one file. Both are optional and never touch
+   * anything but `target.lines` on targets the call already had.
+   */
+  toolEnd(t, id, { isError = false, exitCode, text, childIds, fileLines, resultText } = {}) {
     if (this.replay) return;
     this.provisionalAt = null;
     if (childIds?.length) this.setChildren(id, childIds);
@@ -425,9 +475,52 @@ export class Session {
       }
       this.mark(event);
     });
+    // `mark` above already put the events back in the dirty set: the extra counts reach the hub in the same upsert.
+    const derived = fileLines?.length ? fileLines : this.shellFileLines(group[0], failed, resultText);
+    if (derived) this.applyFileLines(group[0], derived);
     if (failed) this.counts.errors += 1;
     this.touch(t);
     this.refreshLive(t);
+  }
+
+  /**
+   * Counts from the result replace the argument-derived ones field by field (Contract A): a field the result keeps
+   * silent stays as the arguments estimated it, and a call gains no target it did not already have. An entry
+   * without `path` speaks for the call's single file target. `read` only lands on a read target, `added`/`removed`
+   * only on a write or edit target, so a search result that prints numbered rows never counts as a read.
+   */
+  applyFileLines(event, entries) {
+    const files = (Array.isArray(event?.targets) ? event.targets : []).filter(target => target?.type === "file");
+    if (files.length === 0) return;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") continue;
+      let target;
+      if (entry.path === undefined || entry.path === null) target = files.length === 1 ? files[0] : undefined;
+      else {
+        const path = resolveResultPath(entry.path, this.info.cwd);
+        if (!path) continue;
+        target = files.find(candidate => candidate.path === path);
+      }
+      if (!target) continue;
+      let lines = target.lines && typeof target.lines === "object" ? { ...target.lines } : undefined;
+      let applied = false;
+      for (const key of LINE_KEYS) {
+        const n = entry[key];
+        if (!Number.isInteger(n) || n < 0) continue;
+        if (key === "read" ? target.op !== "read" : target.op !== "write" && target.op !== "edit") continue;
+        lines = { ...(lines ?? {}), [key]: n };
+        applied = true;
+      }
+      if (applied) target.lines = lines;
+    }
+  }
+
+  /** A shell call that only read one file: the output's line count is the most exact `read` count available. */
+  shellFileLines(event, failed, output) {
+    if (failed || event?.category !== "shell" || !withinCountLimit(output)) return undefined;
+    const files = (Array.isArray(event.targets) ? event.targets : []).filter(target => target?.type === "file");
+    if (files.length !== 1 || files[0].op !== "read") return undefined;
+    return [{ read: shellOutputLines(output) }];
   }
 
   /** Name the children of a spawn call, in call order (may arrive after the call's result). */

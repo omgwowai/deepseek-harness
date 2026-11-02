@@ -1,7 +1,7 @@
 // The collector: one per machine or pod. It finds session transcripts (discovery), follows them (sessions), watches
 // the agent processes (procs) and the DSH ACP sidecar (acp), and reports to a hub through `send`:
 //   hello (once) · agent (full record, on change) · events (new or changed events) · gone · procs · heartbeat
-// Updates are coalesced for 250 ms. Requests from the hub: file.read, agent.events, ping.
+// Updates are coalesced for 250 ms. Requests from the hub: file.read, repo.resolve, agent.events, ping.
 import { hostname as osHostname, homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { LIMITS, PROTOCOL_VERSION, agentKey } from "../protocol.mjs";
@@ -9,6 +9,7 @@ import { dshIdForm, createAcp } from "./acp.mjs";
 import { createDiscovery } from "./discovery.mjs";
 import { readFilePreview } from "./files.mjs";
 import { applyLiveness, bindProcs, createProcs } from "./procs.mjs";
+import { createRepoResolver } from "./repos.mjs";
 import { normalizeRoots } from "./roots.mjs";
 import { createSessions } from "./sessions.mjs";
 import { parseDuration } from "./util.mjs";
@@ -93,6 +94,9 @@ export function startCollector({ hostInfo, roots, send, now = Date.now, since = 
   });
 
   const procsScanner = procsEnabled ? createProcs({ platform, sys, now, host: host.id, site: host.site, log }) : null;
+  // Repository discovery for file targets of this host (hub requests `repo.resolve`); the cache keeps repeated
+  // questions about the same directory cheap while a positive answer can still be stale for a minute at most.
+  const repos = createRepoResolver({ home, now });
 
   // ------------------------------------------------------------------------------------------- record assembly
   function markDirty(entry) {
@@ -273,6 +277,7 @@ export function startCollector({ hostInfo, roots, send, now = Date.now, since = 
     switch (method) {
       case "ping": return { at: now() };
       case "file.read": return readFilePreview({ path: params?.path, maxBytes: params?.maxBytes, host: host.id, home });
+      case "repo.resolve": return repos.resolve(params ?? {});
       case "agent.events": return agentEvents(params ?? {});
       default: throw coded("unsupported", `unknown collector method ${method}`);
     }

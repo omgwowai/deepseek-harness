@@ -10,6 +10,7 @@ import { createApi } from "./api.mjs";
 import { createAuth, defaultTokenFile, loadToken } from "./auth.mjs";
 import { startHttpServer } from "./http.mjs";
 import { createState } from "./state.mjs";
+import { createRepoRegistry } from "./repos.mjs";
 import { createCollectorLinks, dialCollector, startIngestServer } from "./sources/collector-link.mjs";
 import { createKubeSource } from "./sources/kube.mjs";
 import { startLocalCollector } from "./sources/local.mjs";
@@ -33,17 +34,22 @@ const BUNDLE_FILE = fileURLToPath(new URL("../../dist/agent-fleet-collector.mjs"
  * @param {object | object[]} [options.upstream]  {url, token, sshTarget?, name?}: follow other hubs
  * @param {object} [options.kube]         createKubeSource options ({kubeconfig, kubectl, sites, collectorBundle, …}); `create` swaps the factory
  * @param {{collectorOptions?: object, load?: Function}} [options.local]  run a collector in this process
+ * @param {object} [options.repos]       repo tracker tunables (batchMs, refreshMs, retryMs, unsupportedMs, …)
  * @param {(level: string, message: string) => void} [options.log]
- * @returns {Promise<{state: object, api: {request(method: string, params?: object): Promise<any>}, http: object | null, ingest: object | null,
+ * @returns {Promise<{state: object, api: {request(method: string, params?: object): Promise<any>}, repos: object, http: object | null, ingest: object | null,
  *   addCollectorChannel(transport: {readable: any, writable: any, close?: Function}, options?: {via?: string, label?: string}): object, stop(): Promise<void>}>}
  */
-export async function startHub({ hostId = "hub", version = "0.0.0", now = Date.now, http, ingest, collectors = [], upstream, kube, local, log = () => {}, staleAfterMs, coalesceMs, tickMs = 1000 } = {}) {
+export async function startHub({ hostId = "hub", version = "0.0.0", now = Date.now, http, ingest, collectors = [], upstream, kube, local, repos, log = () => {}, staleAfterMs, coalesceMs, tickMs = 1000 } = {}) {
   const state = createState({ now, hostId, version, staleAfterMs, coalesceMs });
   // The ingest credential is its own secret: a collector host must not learn the panel/file-read token. `tokenFile`
   // is created on first use exactly like the HTTP token; an explicit `token` (tests, embedded callers) wins.
   const ingestToken = ingest === undefined ? null
     : (typeof ingest.token === "string" && ingest.token !== "" ? ingest.token : (ingest.tokenFile === undefined ? null : loadToken(ingest.tokenFile)));
   const links = createCollectorLinks({ state, log, token: ingestToken, ...(ingest?.helloTimeoutMs === undefined ? {} : { helloTimeoutMs: ingest.helloTimeoutMs }) });
+  // Repo discovery follows the same links the file previews use (in-process, socket / ssh relay, kubectl exec). It is
+  // created before any collector can report, so the first file event is queued; it is stopped before the state.
+  const repoRegistry = createRepoRegistry({ state, links, now, log, ...(repos ?? {}) });
+  state.setFileTargetObserver((agentKey, event) => repoRegistry.observe(agentKey, event));
   const upstreams = new Map();
   const dials = [];
   const where = {};
@@ -53,6 +59,7 @@ export async function startHub({ hostId = "hub", version = "0.0.0", now = Date.n
     if (stopped) return;
     stopped = true;
     clearInterval(tickTimer);
+    repoRegistry.stop();
     await Promise.allSettled([...upstreams.values()].map(source => source.stop()));
     await Promise.allSettled([kubeSource?.stop(), localCollector?.stop()]);
     for (const dial of dials) dial.stop();
@@ -106,7 +113,7 @@ export async function startHub({ hostId = "hub", version = "0.0.0", now = Date.n
     for (const spec of collectors) dials.push(dialCollector({ links, ...spec, log }));
     kubeSource?.start();
     for (const source of upstreams.values()) source.start();
-    tickTimer = setInterval(() => state.tick(), tickMs);
+    tickTimer = setInterval(() => { state.tick(); repoRegistry.tick(); }, tickMs);
     tickTimer.unref();
   } catch (error) {
     await stop();
@@ -114,7 +121,7 @@ export async function startHub({ hostId = "hub", version = "0.0.0", now = Date.n
   }
 
   return {
-    state, api, upstreams,
+    state, api, upstreams, repos: repoRegistry,
     http: where.http ?? null,
     ingest: where.ingest ?? null,
     /** Serve a collector over an existing duplex ({readable, writable, close?}); the hub answers its hello. */

@@ -37,8 +37,8 @@ plugins/dsh-agent-fleet/
   lib/jsonl.mjs                  incremental JSONL / zstd-frame tail reader (readers slice)
   lib/targets.mjs                tool call → Target[] + category (targets slice)
   lib/collector/readers/{claude,codex,omp,dsh}.mjs  lib/collector/readers/index.mjs  (readers slice)
-  lib/collector/{index,discovery,procs,files,acp}.mjs       (collector slice)
-  lib/hub/{index,state,http,auth}.mjs  lib/hub/sources/{collector-link,local,upstream}.mjs  (hub slice)
+  lib/collector/{index,discovery,procs,files,acp,repos}.mjs  (collector slice)
+  lib/hub/{index,state,http,auth,repos}.mjs  lib/hub/sources/{collector-link,local,upstream}.mjs  (hub slice)
   lib/hub/sources/kube.mjs        (kube slice)
   lib/edge.mjs                    (edge slice)
   panel/{index.html,app.js,app.css} (panel slice; no build step, no framework, no external network)
@@ -65,6 +65,16 @@ Runtime: Node ≥ 22.15 (`zlib.createZstdDecompress`, `node:sqlite` with ≥ 22.
   and a static `match(path)` → `{kind, id, role} | null`. Readers turn native records into `AgentRecord` and
   `AgentEvent` (see protocol). Upserts are idempotent: an event id is stable for its transcript position; a tool event is first
   sent `pending` and re-sent with `status`/`duration` when its result arrives.
+* Line counts: a `file` target may carry `lines: {read?, added?, removed?}`, each a non-negative integer and absent
+  when the call cannot tell. `lib/targets.mjs` derives them from the call's arguments (write content, hashline
+  `PUT`/`CUT` rows, patch `+`/`-` rows, read ranges and limits, Claude `Edit`/`MultiEdit` strings). When the result
+  arrives the readers replace them field by field with result-derived counts, which are more exact: OMP `details`
+  (diff `+N|`/`-N|` rows, `displayContent.lineNumbers`), Claude `toolUseResult` (`numLines`, `structuredPatch`), DSH
+  result `meta` (`lines` returned by a read, `diffs` of an edit: changed lines once common leading/trailing lines are
+  set aside; older results: numbered rows after a `[path#TAG]` header), and the output lines of a shell call that
+  reads exactly one file and writes none (Codex code mode: the `output` of the JSON envelope, whose `exit_code`
+  also sets the call's status). The event is re-sent then, like any pending → ok upsert. `countLines(s)` is 0 for "",
+  else the number of `\n` plus 1 unless `s` ends with `\n`. Results over 4 MiB are not scanned.
 * Parent links (`ParentHint`), per kind:
   * OMP: header `parentSession` (abs path or id); nested dir `<parent-name>/<Task>.jsonl` → subagent; `task` tool
     result `details.results[].id` ↔ child task id gives `toolCallId`.
@@ -86,7 +96,14 @@ Runtime: Node ≥ 22.15 (`zlib.createZstdDecompress`, `node:sqlite` with ≥ 22.
   A process gone → `alive=false`; a session whose turn is open but whose process is gone and that has not
   written for 5 min → status `stale`.
 * `handleRequest`: `file.read {path, maxBytes}` → `FilePreview` (refuse `isSecretPath`, cap 256 KiB, binary check,
-  redact); `agent.events {key, before?, limit}` → older events for paging; `ping` → `{at}`.
+  redact); `repo.resolve {dirs?, roots?}` → `{dirs: {[dir]: root|null}, repos: Repo[]}`; `agent.events {key, before?,
+  limit}` → older events for paging; `ping` → `{at}`.
+* `repo.resolve` (`repos.mjs`): walk up from each dir to `<ancestor>/.git` (a directory holding `HEAD`, or a file with a
+  `gitdir:` pointer, then `commondir` for the shared config); never `/` or the home directory itself. ≤ 200 dirs and
+  200 roots per request, ≤ 64 ancestors, bounded reads, no git binary. `Repo = {root, remote?, branch?, head?,
+  worktree?}`: `remote` is origin (else the first remote) as `host/path` without scheme, credentials or `.git`, then
+  redacted; `branch` from `ref: refs/heads/…`; `head` the first 12 hex characters when detached; `worktree` when
+  `.git` is a file. `roots` re-reads known roots (branch moves); a root that is no longer a repository is left out.
 * Messages sent: `hello` once (`{t:"hello", proto:1, host:HostInfo, at, token?}`), then `agent` (full record, on change,
   coalesced 250 ms), `events` (`{t:"events", agent, events:[…]}`), `gone` (`{t:"gone", agent}` when a file is deleted),
   `procs` (`{t:"procs", procs:Proc[]}` on change), `heartbeat` (`{t:"heartbeat", at, stats}` every 5 s).
@@ -106,6 +123,13 @@ Runtime: Node ≥ 22.15 (`zlib.createZstdDecompress`, `node:sqlite` with ≥ 22.
   that starts on that pod/site within [t−5 s, t+120 s] → link (`via:"command"`, `exact:false`).
 * Touches: index `Target`s of type `pod` (key `podKey(site, ns, name)`) and `file` (key `<host>:<path>`) → which
   agents/events touched them. Pods referenced by any target are pulled into `pods` even if not watched by label.
+* Repos (`repos.mjs`): the state hands every stored event with targets to the repo tracker, which queues the dirs of
+  its `file` targets per host and asks that host's collector `repo.resolve` over the same link the file previews use
+  (200 ms batches; dir answers cached 5 min, "no repository" 1 min; known roots re-read every 3 min; error backoff
+  30 s doubling to 5 min; a collector that does not know the method is not asked again for 30 min). Ingest never
+  waits on it. `Snapshot.repos` is `{[hostId]: Repo[]}`; a `Delta.repos` replaces the list of each changed host
+  (`[]` = none). The state sanitises every list (absolute root, redacted remote, ≤ 500 per host); hosts an upstream
+  owns take their lists from that upstream's snapshot and deltas.
 * Clock skew: `skewMs = hubNow − hello.at` (smoothed with heartbeats); every collector timestamp is shifted by skew.
 * HTTP (`http.mjs`, bound to `127.0.0.1` only): `GET /` + `/app.js` + `/app.css` (panel), `GET /api/snapshot`,
   `GET /api/changes?since=N`, `GET /api/stream?since=N` (SSE: `event: delta`, data = Delta JSON; keep-alive
@@ -138,7 +162,8 @@ Runtime: Node ≥ 22.15 (`zlib.createZstdDecompress`, `node:sqlite` with ≥ 22.
 * Ingest caps (`state.mjs`): agent and event strings clamped to `LIMITS` (`textChars`/`previewChars`); paths
   (`file`, `cwd`, `parent.file`, `target.path`) to `LIMITS.pathChars` (1024), while other target fields keep the
   text widths; targets ≤ `LIMITS.maxTargetsPerEvent`, ≤ 5000 agents per host (refused keys are counted in
-  `host.rejected`/`host.lastRejected`), ≤ 2000 procs per host. The 2 MiB line cap applies to the hub's ingest
+  `host.rejected`/`host.lastRejected`), ≤ 2000 procs per host. `target.lines` keeps only `read`/`added`/`removed`,
+  each a finite integer 0 ≤ n ≤ 10 000 000; anything else is dropped. The 2 MiB line cap applies to the hub's ingest
   sockets only; hub-dialed stdio / `kubectl exec` / `ssh`-relay channels keep `LIMITS.lineBytes` (16 MiB).
 * Upstream (`sources/upstream.mjs`): a hub can subscribe to another hub (`/api/stream`) and merge its state
   (the Mac embedded hub mirrors the server hub; local entries win for the local host id).
@@ -186,8 +211,9 @@ A bare prefix (`/fleet`, `/dsh`) answers 302 (not 301) to the trailing-slash for
   `agent-fleet/pod {key}`, `agent-fleet/query {...}`, `agent-fleet/panel-url`.
 * Model tool `agent_fleet` (`ctx.tools.register(defineTool(...))`): actions `overview` (hosts × kinds, running
   counts), `list` (filters: site, host, kind, status, role, text, since), `family` (by key or DSH session id),
-  `agent` (one agent + recent events), `pods` / `pod`, `files` (files touched by an agent or by everyone),
-  `file` (preview one file via collector), `query` (tool-call search). Output: compact JSON + text render.
+  `agent` (one agent + recent events), `pods` / `pod`, `files` (files touched by an agent or by everyone: ops per
+  file plus `lines` summed over the calls that reported them, so a lower bound), `file` (preview one file via
+  collector), `query` (tool-call search). Output: compact JSON + text render.
 * Browser: sidebar panel + `main` page "Agent Fleet" (iframe of the panel served by the hub; the URL fragment carries
   a one-time `#nonce=…`, plus `&focus=…` when a session is given, that the panel redeems for its session key)
   and session tab `conversation.view` id `agent-fleet` that opens the panel focused on the current session's family.
@@ -200,11 +226,18 @@ Vanilla JS + SVG, dark/light from `prefers-color-scheme`, no external fetches. L
    badge (D/C/X/O), status dot, live "doing", model, tokens, age; cross-host edges shown as "↗ k8s/os/pod-x".
 2. **Timeline** — Gantt like Agent DAG: one lane per agent of the selected family (or all running), bars from
    startedAt→endedAt|now, tool ticks colored by category, spawn/return connectors, live cursor, 1 s refresh.
-3. **Pods** — pods touched by agents, per site; phase, node, containers; which agents/events touched them; kube events.
-4. **Files** — files touched (path, host, ops, last touch, agents); click → preview pane (content via `api/file`,
-   diff-ish highlighting for edits not required).
-5. **Feed** — live stream of tool events across the fleet with targets.
-URL hash state: `#view=timeline&key=<agentKey>`, `#focus=<dshSessionId>`.
+3. **Graph** — two bipartite graphs over the tool calls of a window (5 m / 30 m / 2 h / 24 h). Left: agent families
+   (root → subagents → ACP children → agents started on other hosts/pods); a collapsed node aggregates its subtree,
+   an expanded one keeps its own calls. Right, `env`: site → pod / k8s resource / host / container (a local shell call
+   counts on the agent's own host); `files`: git repo (checkouts of one remote grouped, from `Snapshot.repos`) or a
+   directory anchor → compressed directory tree → file. Edges carry calls, agents, ops, line totals, pending and
+   recency; labels ride the curves. Data: `api/query` per target type over the window (incremental every 30 s) plus
+   the live deltas. Projections and the tool calls a DSH session mirrors from its ACP child are not counted twice.
+4. **Pods** — pods touched by agents, per site; phase, node, containers; which agents/events touched them; kube events.
+5. **Files** — files touched (path, host, ops, lines, last touch, agents); click → preview pane (content via
+   `api/file`, diff-ish highlighting for edits not required).
+6. **Feed** — live stream of tool events across the fleet with targets.
+URL hash state: `#view=timeline&key=<agentKey>`, `#focus=<dshSessionId>`, `#view=graph&g=env|files&win=30m`.
 
 ## Security
 

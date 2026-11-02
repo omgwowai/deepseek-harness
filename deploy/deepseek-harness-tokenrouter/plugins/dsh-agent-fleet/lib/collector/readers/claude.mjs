@@ -11,7 +11,8 @@
 // turn provisionally (see Session.provisionalEnd).
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { Session, makeReader, partsText, sampleText, exitCodeFromText, toMs, clip } from "./base.mjs";
+import { Session, makeReader, partsText, sampleText, exitCodeFromText, toMs, clip, withinCountLimit } from "./base.mjs";
+import { countLines } from "../../targets.mjs";
 
 export const kind = "claude";
 
@@ -41,6 +42,41 @@ function promptText(content) {
 }
 
 const tag = (text, name) => new RegExp(`<${name}>([^<]*)</${name}>`).exec(text)?.[1]?.trim();
+
+// Result-derived line counts (Contract A): a read reports `numLines`; an edit or write with `type: "update"` carries
+// a structuredPatch whose rows are prefixed " ", "+" or "-" (exact added/removed); a write with `type: "create"`
+// carries the whole new content, whose line count is the number of lines added.
+function patchCounts(patch) {
+  let added = 0, removed = 0;
+  for (const hunk of Array.isArray(patch) ? patch : []) {
+    for (const row of Array.isArray(hunk?.lines) ? hunk.lines : []) {
+      if (typeof row !== "string") continue;
+      if (row.startsWith("+")) added++;
+      else if (row.startsWith("-")) removed++;
+    }
+  }
+  return { added, removed };
+}
+
+/** Counts of one Claude `toolUseResult` (an array when a tool reports one result per file), or undefined. */
+function claudeFileLines(result) {
+  if (Array.isArray(result)) {
+    const entries = result.flatMap(entry => claudeFileLines(entry) ?? []);
+    return entries.length > 0 ? entries : undefined;
+  }
+  if (!result || typeof result !== "object") return undefined;
+  const file = result.file;
+  if (result.type === "text" && file && typeof file.filePath === "string" && Number.isInteger(file.numLines) && file.numLines >= 0) {
+    return [{ path: file.filePath, read: file.numLines }];
+  }
+  const path = typeof result.filePath === "string" ? result.filePath : undefined;
+  if (!path) return undefined;
+  if (result.type === "create" && typeof result.content === "string") {
+    return withinCountLimit(result.content) ? [{ path, added: countLines(result.content) }] : undefined;
+  }
+  if (Array.isArray(result.structuredPatch)) return [{ path, ...patchCounts(result.structuredPatch) }];
+  return undefined;
+}
 
 export function createReader({ file, host, site, now }) {
   const m = match(file) ?? { id: file.split("/").pop().replace(/\.jsonl$/, ""), role: "main" };
@@ -72,10 +108,12 @@ export function createReader({ file, host, site, now }) {
   loadMeta();
 
   const toolResult = (block, o, t) => {
-    const text = sampleText(block.content);
+    const full = partsText(block.content);
+    const text = sampleText(full);
     const agentId = o.toolUseResult?.agentId;
     s.toolEnd(t, block.tool_use_id, {
       isError: block.is_error === true, exitCode: exitCodeFromText(text.slice(0, 200)), text,
+      resultText: full, fileLines: claudeFileLines(o.toolUseResult),
       childIds: typeof agentId === "string" ? [`${sid}/${agentId}`] : undefined,
     });
   };

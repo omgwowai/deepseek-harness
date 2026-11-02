@@ -666,6 +666,248 @@ describe("dsh reader", () => {
   });
 });
 
+// ------------------------------------------------------- file target line counts from results (Contract A)
+
+describe("file target line counts from tool results (Contract A)", () => {
+  const stamp = ms => new Date(T0 + ms).toISOString();
+  const feedRows = (kind, file, rows) => {
+    const reader = READERS[kind].createReader({ file, host: "h1", site: "mac" });
+    reader.feed(rows);
+    return { reader, events: new Map(reader.takeEvents().map(event => [event.id, event])) };
+  };
+  const after = reader => new Map(reader.takeEvents().map(event => [event.id, event]));
+  const files = event => event.targets.filter(target => target.type === "file");
+  const linesOf = (event, path) => files(event).find(target => target.path === path)?.lines;
+
+  const OMP_FILE = join(tmp, `2026-10-01T10-00-00-000Z_${OMP_ID}.jsonl`);
+  const ompHeader = { type: "session", version: 3, id: OMP_ID, timestamp: stamp(0), cwd: "/work/demo" };
+  const ompCall = (ms, id, name, input) => ({ type: "message", id: `a${ms}`, timestamp: stamp(ms), message: {
+    role: "assistant", model: "model-a", stopReason: "toolUse", usage: {}, content: [{ type: "toolCall", id, name, arguments: input }] } });
+  const ompResult = (ms, id, name, details, content = "ok") => ({ type: "message", id: `r${ms}`, timestamp: stamp(ms), message: {
+    role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text: content }], isError: false,
+    ...(details !== undefined && { details }) } });
+
+  const CLAUDE_FILE = join(tmp, `${CLAUDE_ID}.jsonl`);
+  const claudeCall = (ms, id, name, input) => ({ type: "assistant", timestamp: stamp(ms), cwd: "/work/demo", message: {
+    id: `msg_${id}`, role: "assistant", model: "claude-x", stop_reason: "tool_use", usage: {},
+    content: [{ type: "tool_use", id, name, input }] } });
+  const claudeResult = (ms, id, text, result) => ({ type: "user", timestamp: stamp(ms), cwd: "/work/demo", message: {
+    role: "user", content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] }] },
+    ...(result !== undefined && { toolUseResult: result }) });
+
+  it("omp: a multi-file edit takes added/removed per file from each diff", () => {
+    const { events } = feedRows("omp", OMP_FILE, [
+      ompHeader,
+      ompCall(1000, "e1", "edit", { input: "[/work/demo/a.ts#A1B2]\nPUT 1:\nx\n[/work/demo/b.ts#C3D4]\nPUT 2:\ny" }),
+      ompResult(1200, "e1", "edit", { diff: " 1|same", perFileResults: [
+        { path: "/work/demo/a.ts", diff: " 1|alpha\n-2|old\n+2|new\n+3|extra\n 4|tail" },
+        { path: "/work/demo/b.ts", diff: " 1|one\n-2|two\n-3|three\n+2|TWO\n 4|plain" },
+      ] }),
+    ]);
+    const event = events.get("e1");
+    assert.deepEqual(files(event).map(target => target.path), ["/work/demo/a.ts", "/work/demo/b.ts"]);
+    assert.deepEqual(linesOf(event, "/work/demo/a.ts"), { added: 2, removed: 1 });
+    assert.deepEqual(linesOf(event, "/work/demo/b.ts"), { added: 1, removed: 2 });
+  });
+
+  it("omp: a ranged read counts returned rows (null gaps are elided) and replaces the selector's estimate", () => {
+    const { reader, events } = feedRows("omp", OMP_FILE, [ompHeader, ompCall(1000, "r1", "read", { path: "/work/demo/big.ts:1-3" })]);
+    assert.deepEqual(linesOf(events.get("r1"), "/work/demo/big.ts"), { read: 3 }, "the selector is the argument-derived count");
+    reader.feed([ompResult(1200, "r1", "read", {
+      resolvedPath: "/work/demo/big.ts", totalLines: 93,
+      displayContent: { text: "…", lineNumbers: [1, 2, 3, null, 40, 41, 42, null, 90] },
+    })]);
+    assert.deepEqual(linesOf(after(reader).get("r1"), "/work/demo/big.ts"), { read: 7 });
+  });
+
+  it("omp: a directory read has no line count", () => {
+    const { events } = feedRows("omp", OMP_FILE, [
+      ompHeader,
+      ompCall(1000, "d1", "read", { path: "/work/demo/src" }),
+      ompResult(1200, "d1", "read", { isDirectory: true, resolvedPath: "/work/demo/src" }, "a.ts\nb.ts"),
+    ]);
+    assert.equal(linesOf(events.get("d1"), "/work/demo/src"), undefined);
+  });
+
+  it("omp: a write result carries no count, so the argument's exact count stays", () => {
+    const { events } = feedRows("omp", OMP_FILE, [
+      ompHeader,
+      ompCall(1000, "w1", "write", { path: "/work/demo/notes.md", content: "a\nb\nc\nd\n" }),
+      ompResult(1200, "w1", "write", { path: "/work/demo/notes.md" }),
+    ]);
+    assert.deepEqual(linesOf(events.get("w1"), "/work/demo/notes.md"), { added: 4 });
+  });
+
+  it("claude: Read reports numLines, replacing the limit the call asked for", () => {
+    const { reader, events } = feedRows("claude", CLAUDE_FILE, [claudeCall(1000, "t1", "Read", { file_path: "/work/demo/a.ts", limit: 50 })]);
+    assert.deepEqual(linesOf(events.get("t1"), "/work/demo/a.ts"), { read: 50 });
+    reader.feed([claudeResult(1200, "t1", "l1\nl2", {
+      type: "text", file: { filePath: "/work/demo/a.ts", content: "l1\nl2", numLines: 2, startLine: 1, totalLines: 2 },
+    })]);
+    assert.deepEqual(linesOf(after(reader).get("t1"), "/work/demo/a.ts"), { read: 2 });
+  });
+
+  it("claude: an Edit's structuredPatch gives exact added/removed", () => {
+    const { events } = feedRows("claude", CLAUDE_FILE, [
+      claudeCall(1000, "t2", "Edit", { file_path: "/work/demo/a.ts", old_string: "old", new_string: "new" }),
+      claudeResult(1200, "t2", "updated", {
+        filePath: "/work/demo/a.ts", oldString: "old", newString: "new",
+        structuredPatch: [{ oldStart: 1, oldLines: 2, newStart: 1, newLines: 3, lines: [" ctx", "-old", "+new", "+more"] }],
+      }),
+    ]);
+    assert.deepEqual(linesOf(events.get("t2"), "/work/demo/a.ts"), { added: 2, removed: 1 });
+  });
+
+  it("claude: a Write update replaces the content count field by field; a create counts the new content", () => {
+    const update = feedRows("claude", CLAUDE_FILE, [
+      claudeCall(1000, "t3", "Write", { file_path: "/work/demo/b.ts", content: "a\nb\nc\nd\ne\n" }),
+    ]);
+    assert.deepEqual(linesOf(update.events.get("t3"), "/work/demo/b.ts"), { added: 5 });
+    update.reader.feed([claudeResult(1200, "t3", "updated", {
+      type: "update", filePath: "/work/demo/b.ts", content: "a\nb\nX\nd\ne\n",
+      structuredPatch: [{ oldStart: 2, oldLines: 2, newStart: 2, newLines: 2, lines: [" b", "-c", "+X", " d"] }],
+    })]);
+    assert.deepEqual(linesOf(after(update.reader).get("t3"), "/work/demo/b.ts"), { added: 1, removed: 1 }, "added replaced, removed added, no other field");
+
+    const create = feedRows("claude", CLAUDE_FILE, [
+      claudeCall(2000, "t4", "Write", { file_path: "/work/demo/new.ts", content: "one\ntwo\nthree" }),
+      claudeResult(2200, "t4", "created", { type: "create", filePath: "/work/demo/new.ts", content: "one\ntwo\nthree", structuredPatch: [] }),
+    ]);
+    assert.deepEqual(linesOf(create.events.get("t4"), "/work/demo/new.ts"), { added: 3 });
+  });
+
+  it("dsh: a read result counts its numbered rows after the [path#TAG] header", () => {
+    const file = join(tmp, "--work-demo--", DSH_MAIN, "session.v4.jsonl.zstd");
+    const text = "[a.ts#9EE6]\n12:const a = 1;\n13:const b = 2;\n…\n31:const c = 3;\n[Showing lines 12-31 of 93. Use :32 to continue]";
+    const { events } = feedRows("dsh", file, [
+      { type: "session", version: 4, id: DSH_MAIN, createdAt: T0, cwd: "/work/demo" },
+      { type: "tool/call", seq: 2, time: T0 + 100, data: { callId: "c1", name: "read", arguments: JSON.stringify({ path: "/work/demo/a.ts" }) } },
+      { type: "tool/result", seq: 3, time: T0 + 120, data: { message: { toolCallId: "c1", content: [{ type: "text", text }], isError: false } } },
+    ]);
+    assert.deepEqual(linesOf(events.get("c1"), "/work/demo/a.ts"), { read: 3 }, "the elided row and the continuation notice are not lines read");
+  });
+
+  it("dsh: a grep result printing numbered rows is a search, not a read", () => {
+    const file = join(tmp, "--work-demo--", DSH_MAIN, "session.v4.jsonl.zstd");
+    const { events } = feedRows("dsh", file, [
+      { type: "session", version: 4, id: DSH_MAIN, createdAt: T0, cwd: "/work/demo" },
+      { type: "tool/call", seq: 2, time: T0 + 100, data: { callId: "g1", name: "grep", arguments: JSON.stringify({ pattern: "const", path: "/work/demo/a.ts" }) } },
+      { type: "tool/result", seq: 3, time: T0 + 120, data: { message: {
+        toolCallId: "g1", content: [{ type: "text", text: "[a.ts#9EE6]\n12:const a = 1;\n31:const c = 3;" }], isError: false } } },
+    ]);
+    assert.deepEqual(files(events.get("g1")).map(target => [target.op, target.path]), [["search", "/work/demo/a.ts"]]);
+    assert.equal(linesOf(events.get("g1"), "/work/demo/a.ts"), undefined);
+  });
+
+  it("dsh 0.2.x: read and edit counts come from the result meta (rows returned, changed lines per file)", () => {
+    // The shapes DSH 0.2.1 writes (seen in a pod transcript): a <path>/<content> text plus `meta.lines` for a read,
+    // and `meta.diffs` (old/new text of the replaced span) for an edit.
+    const file = join(tmp, "--work-demo--", DSH_MAIN, "session.v4.jsonl.zstd");
+    const path = "/work/demo/notes.md";
+    const { events } = feedRows("dsh", file, [
+      { type: "session", version: 4, id: DSH_MAIN, createdAt: T0, cwd: "/work/demo" },
+      { type: "tool/call", seq: 2, time: T0 + 100, data: { callId: "r1", name: "read", arguments: JSON.stringify({ file_path: path }) } },
+      { type: "tool/result", seq: 3, time: T0 + 120, data: {
+        message: { toolCallId: "r1", content: [{ type: "text", text: `<path>${path}</path>\n<type>file</type>\n<content>\n1: one\n2: two\n3: three\n4: four\n\n(End of file - total 4 lines)\n</content>` }], isError: false },
+        meta: { path, offset: 1, lines: [1, 2, 3, 4].map(number => ({ number, text: "x" })), totalLines: 4, lang: "md" } } },
+      { type: "tool/call", seq: 4, time: T0 + 200, data: { callId: "e1", name: "edit", arguments: JSON.stringify({ file_path: path, old_string: "four", new_string: "four\nfive" }) } },
+      { type: "tool/result", seq: 5, time: T0 + 220, data: {
+        message: { toolCallId: "e1", content: [{ type: "text", text: `The file ${path} has been updated successfully.` }], isError: false },
+        meta: { path, diffs: [{ path, oldText: "two\nthree\nfour", newText: "two\nthree\nfour\nfive" }, { path, oldText: "one", newText: "uno" }] } } },
+    ]);
+    assert.deepEqual(linesOf(events.get("r1"), path), { read: 4 }, "the <path>/<content> text has no [path#TAG] header; meta.lines counts");
+    assert.deepEqual(linesOf(events.get("e1"), path), { added: 2, removed: 1 }, "+1 from the append, +1/−1 from the replaced line; the context rows do not count");
+  });
+
+  it("codex: a sed -n output body gives the read count", () => {
+    const file = join(tmp, `rollout-2026-10-01T10-00-00-${CODEX_P}.jsonl`);
+    const output = body => ({
+      timestamp: stamp(1200), ordinal: 2, type: "response_item",
+      payload: { type: "function_call_output", call_id: "call1", output: `Chunk ID: 4f2a1c\nWall time: 0.0023 seconds\nProcess exited with code 0\nOriginal token count: 4\nOutput:\n${body}` },
+    });
+    const { events } = feedRows("codex", file, [
+      { timestamp: stamp(0), ordinal: 0, type: "session_meta", payload: { timestamp: stamp(0), cwd: "/work/demo", id: CODEX_P } },
+      { timestamp: stamp(1000), ordinal: 1, type: "response_item", payload: {
+        type: "function_call", name: "exec_command", call_id: "call1", arguments: JSON.stringify({ cmd: "sed -n '1,80p' f" }) } },
+      output("line1\nline2\nline3\n"),
+    ]);
+    assert.deepEqual(linesOf(events.get("call1"), "/work/demo/f"), { read: 3 });
+  });
+
+  it("codex: a shell read that exited non-zero reports no line count", () => {
+    const file = join(tmp, `rollout-2026-10-01T10-00-00-${CODEX_P}.jsonl`);
+    const { events } = feedRows("codex", file, [
+      { timestamp: stamp(0), ordinal: 0, type: "session_meta", payload: { timestamp: stamp(0), cwd: "/work/demo", id: CODEX_P } },
+      { timestamp: stamp(1000), ordinal: 1, type: "response_item", payload: {
+        type: "function_call", name: "exec_command", call_id: "call1", arguments: JSON.stringify({ cmd: "sed -n '1,80p' f" }) } },
+      { timestamp: stamp(1200), ordinal: 2, type: "response_item", payload: {
+        type: "function_call_output", call_id: "call1",
+        output: "Chunk ID: 4f2a1c\nWall time: 0.0023 seconds\nProcess exited with code 1\nOriginal token count: 4\nOutput:\nline1\nline2\nline3\n" } },
+    ]);
+    const event = events.get("call1");
+    assert.deepEqual([event.status, event.exitCode], ["error", 1]);
+    assert.equal(linesOf(event, "/work/demo/f"), undefined);
+  });
+
+  it("codex code mode: the JSON envelope gives the command's own output and exit code", () => {
+    // Codex 0.166 `exec` (code mode) rows, as written in a pod rollout: the result's second part is an envelope.
+    const file = join(tmp, `rollout-2026-10-01T10-00-00-${CODEX_P}.jsonl`);
+    const call = (id, cmd) => ({ timestamp: stamp(1000), ordinal: 1, type: "response_item", payload: {
+      type: "custom_tool_call", call_id: id, name: "exec", input: `text(await tools.exec_command({cmd:${JSON.stringify(cmd)},max_output_tokens:1000}));\n` } });
+    const result = (id, exitCode, output) => ({ timestamp: stamp(1200), ordinal: 2, type: "response_item", payload: {
+      type: "custom_tool_call_output", call_id: id, output: [
+        { type: "input_text", text: "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+        { type: "input_text", text: JSON.stringify({ chunk_id: "f2f660", wall_time_seconds: 0.0000072, exit_code: exitCode, original_token_count: 8, output }) },
+      ] } });
+    const { events } = feedRows("codex", file, [
+      { timestamp: stamp(0), ordinal: 0, type: "session_meta", payload: { timestamp: stamp(0), cwd: "/work/demo", id: CODEX_P } },
+      call("read", "sed -n 1,3p notes.md"), result("read", 0, "line one\nline two\nline three\n"),
+      call("missing", "cat missing.md"), result("missing", 1, "cat: missing.md: No such file or directory\n"),
+    ]);
+    assert.deepEqual(linesOf(events.get("read"), "/work/demo/notes.md"), { read: 3 }, "3 lines, not the 2 lines of the envelope text");
+    const missing = events.get("missing");
+    assert.deepEqual([missing.status, missing.exitCode], ["error", 1]);
+    assert.equal(linesOf(missing, "/work/demo/missing.md"), undefined);
+  });
+
+  it("a shell read of one file drops the harness footer; two files get no count", () => {
+    const one = feedRows("omp", OMP_FILE, [
+      ompHeader,
+      ompCall(1000, "b1", "bash", { command: "cat README.md" }),
+      ompResult(1200, "b1", "bash", undefined, "a\nb\nc\n\n\nWall time: 0.10 seconds"),
+    ]);
+    assert.deepEqual(linesOf(one.events.get("b1"), "/work/demo/README.md"), { read: 3 });
+
+    const two = feedRows("omp", OMP_FILE, [
+      ompHeader,
+      ompCall(2000, "b2", "bash", { command: "cat a.ts b.ts" }),
+      ompResult(2200, "b2", "bash", undefined, "a\nb\nc"),
+    ]);
+    assert.deepEqual(files(two.events.get("b2")).map(target => target.path), ["/work/demo/a.ts", "/work/demo/b.ts"]);
+    assert.deepEqual(files(two.events.get("b2")).map(target => target.lines), [undefined, undefined], "the output cannot be split between files");
+  });
+
+  it("a result naming a path the call never touched leaves the targets alone", () => {
+    const { events } = feedRows("claude", CLAUDE_FILE, [
+      claudeCall(1000, "t1", "Read", { file_path: "/work/demo/a.ts", limit: 40 }),
+      claudeResult(1200, "t1", "x", { type: "text", file: { filePath: "/work/demo/other.ts", content: "x", numLines: 7, startLine: 1, totalLines: 7 } }),
+    ]);
+    const event = events.get("t1");
+    assert.deepEqual(files(event).map(target => target.path), ["/work/demo/a.ts"]);
+    assert.deepEqual(linesOf(event, "/work/demo/a.ts"), { read: 40 });
+  });
+
+  it("a result over the counting budget is not scanned", () => {
+    const huge = "x".repeat(4 * 1024 * 1024 + 1);
+    const { events } = feedRows("omp", OMP_FILE, [
+      ompHeader,
+      ompCall(1000, "b3", "bash", { command: "cat README.md" }),
+      ompResult(1200, "b3", "bash", undefined, huge),
+    ]);
+    assert.equal(linesOf(events.get("b3"), "/work/demo/README.md"), undefined);
+  });
+});
+
 // ------------------------------------------------------------------- DSH end to end: zstd frames through the tail
 
 describe("dsh transcript through createTail + reader (real zstd frames)", () => {

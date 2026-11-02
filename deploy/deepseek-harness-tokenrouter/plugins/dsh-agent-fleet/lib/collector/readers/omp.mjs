@@ -7,7 +7,7 @@
 // Line 1 is a padded `title` row that OMP rewrites in place (the collector re-feeds it); line 2 the `session`
 // header. Record ids: the uuid for a main session, `<uuid>/<job id>` for a subagent. A subagent's parent comes from
 // its path: forks copy the whole artifact directory, so the header's `parentSession` can name the original instead.
-import { Session, makeReader, partsText, splitModel, toMs, clip, isAcpProbe } from "./base.mjs";
+import { Session, makeReader, partsText, splitModel, toMs, clip, isAcpProbe, withinCountLimit } from "./base.mjs";
 
 export const kind = "omp";
 
@@ -45,6 +45,39 @@ function nested(chain, stem) {
     parent = name;
   }
   return true;
+}
+
+// Result-derived line counts (Contract A): OMP writes the rows it returned and the +/- rows of an edit into
+// `details`, which is exact; a write result carries no count (the argument's content is already exact).
+const DIFF_ADDED = /^\+\d+\|/;
+const DIFF_REMOVED = /^-\d+\|/;
+
+/** `{path?, added, removed}` of one edit diff, or undefined when the result shows no rows (nothing to replace with). */
+function diffFileLines(path, diff) {
+  if (typeof diff !== "string" || diff === "" || !withinCountLimit(diff)) return undefined;
+  let added = 0, removed = 0;
+  for (const row of diff.split("\n")) {
+    if (DIFF_ADDED.test(row)) added++;
+    else if (DIFF_REMOVED.test(row)) removed++;
+  }
+  return { ...(typeof path === "string" && path ? { path } : {}), added, removed };
+}
+
+/**
+ * Line counts of an OMP tool result: a read counts the numbered rows in `displayContent.lineNumbers` (null marks an
+ * elided gap; a directory has none), a multi-file edit carries one diff per file, a single-file edit one path + diff.
+ */
+function ompFileLines(details) {
+  if (!details || typeof details !== "object" || details.isDirectory === true) return undefined;
+  if (Array.isArray(details.displayContent?.lineNumbers)) {
+    return [{ read: details.displayContent.lineNumbers.filter(Number.isInteger).length }];
+  }
+  if (Array.isArray(details.perFileResults)) {
+    const entries = details.perFileResults.map(result => diffFileLines(result?.path, result?.diff)).filter(Boolean);
+    return entries.length > 0 ? entries : undefined;
+  }
+  const single = diffFileLines(details.path, details.diff);
+  return single ? [single] : undefined;
 }
 
 export function createReader({ file, host, site, now }) {
@@ -128,8 +161,10 @@ export function createReader({ file, host, site, now }) {
         if (msg.role === "user") { s.turnStart(t); s.user(t, partsText(msg.content)); }
         else if (msg.role === "assistant") assistant(o, t);
         else if (msg.role === "toolResult") {
+          const full = partsText(msg.content);
           s.toolEnd(Number.isFinite(msg.timestamp) ? msg.timestamp : t, msg.toolCallId, {
-            isError: msg.isError, exitCode: msg.details?.exitCode, text: partsText(msg.content),
+            isError: msg.isError, exitCode: msg.details?.exitCode, text: full, resultText: full,
+            fileLines: ompFileLines(msg.details),
             childIds: msg.toolName === "task" ? taskChildren(msg.details) : undefined,
           });
         }

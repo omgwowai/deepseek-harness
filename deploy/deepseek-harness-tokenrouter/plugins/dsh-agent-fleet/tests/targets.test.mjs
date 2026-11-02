@@ -2,7 +2,7 @@
 // Fixtures are synthetic; names and addresses model the real fleet (pods in mc-bochao-li, 10.0.60.98, sg-compute).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyTool, parseCommand } from "../lib/targets.mjs";
+import { classifyTool, countLines, parseCommand } from "../lib/targets.mjs";
 import { LIMITS, NAMESPACE, TOOL_CATEGORIES, TARGET_TYPES, podHostId } from "../lib/protocol.mjs";
 
 const MAC = { host: "mac", site: "mac", cwd: "/Users/me/work", home: "/Users/me" };
@@ -521,12 +521,16 @@ test("claude MCP tools are 'other'; DSH-hosted MCP tools classify as the underly
 });
 
 test("omp read: line ranges and selectors are stripped from the path", () => {
-  for (const [path, expect] of [
-    ["src/a.ts:50-80", "/Users/me/work/src/a.ts"], ["src/a.ts:raw", "/Users/me/work/src/a.ts"], ["src/a.ts:raw:296-328", "/Users/me/work/src/a.ts"],
-    ["/abs/b.md:-60", "/abs/b.md"], ["/abs/c.py:5-16,960-973", "/abs/c.py"], ["src/a.ts:50+30", "/Users/me/work/src/a.ts"],
+  for (const [path, expect, lines] of [
+    ["src/a.ts:50-80", "/Users/me/work/src/a.ts", { read: 31 }], ["src/a.ts:raw", "/Users/me/work/src/a.ts"],
+    ["src/a.ts:raw:296-328", "/Users/me/work/src/a.ts", { read: 33 }],
+    ["/abs/b.md:-60", "/abs/b.md", { read: 60 }], ["/abs/c.py:5-16,960-973", "/abs/c.py", { read: 26 }],
+    ["src/a.ts:50+30", "/Users/me/work/src/a.ts", { read: 30 }],
   ]) {
     const r = tool("read", { path }, "omp");
-    assert.deepEqual([r.category, r.targets], ["read", [{ type: "file", op: "read", host: "mac", path: expect }]], path);
+    const want = { type: "file", op: "read", host: "mac", path: expect };
+    if (lines) want.lines = lines;
+    assert.deepEqual([r.category, r.targets], ["read", [want]], path);
     assert.equal(r.preview, path);
   }
   assert.deepEqual(files(tool("read", { path: "docs/" }, "omp")), ["list:mac:/Users/me/work/docs"]);
@@ -536,7 +540,7 @@ test("omp read ssh://host/path becomes a host target plus a file on that host", 
   const r = tool("read", { path: "ssh://sg-compute/etc/x:1-20" }, "omp");
   assert.deepEqual(r.targets, [
     { type: "host", op: "ssh", host: "sg-compute", site: "sg-compute" },
-    { type: "file", op: "read", host: "sg-compute", path: "/etc/x" },
+    { type: "file", op: "read", host: "sg-compute", path: "/etc/x", lines: { read: 20 } },
   ]);
   const other = tool("read", { path: "ssh://bochao_li@10.0.60.98/data/y.log" }, "omp");
   assert.deepEqual(other.targets[1], { type: "file", op: "read", host: "server-bochao-01", path: "/data/y.log" });
@@ -654,6 +658,211 @@ test("tool names are matched case-insensitively and ignoring separators", () => 
   for (const name of ["web_fetch", "WebFetch", "webfetch"]) assert.equal(tool(name, { url: "https://a.b/" }).category, "web");
   for (const name of ["exec_command", "execCommand"]) assert.deepEqual(files(tool(name, { cmd: "cat /a" })), ["read:mac:/a"]);
   assert.equal(tool("functions.exec_command", { cmd: "cat /a" }, "codex").category, "shell");
+});
+
+// ───────────────────────────────────────────── line counts (Contract A) ─────────────────────────────────────────────
+
+const linesOf = t => t.lines;
+const fileLines = r => ofType(r, "file").map(t => [t.op, t.path, t.lines]);
+
+test("countLines: Contract A", () => {
+  assert.equal(countLines(""), 0);
+  assert.equal(countLines("one"), 1);
+  assert.equal(countLines("one\n"), 1);
+  assert.equal(countLines("one\ntwo"), 2);
+  assert.equal(countLines("one\ntwo\n"), 2);
+  assert.equal(countLines("\n"), 1);
+  assert.equal(countLines("\n\n"), 2);
+  assert.equal(countLines("a\r\nb\r\n"), 2); // CRLF rows still end in "\n"
+  for (const bad of [undefined, null, 0, 5, true, {}, [], ["a"]]) assert.equal(countLines(bad), 0);
+});
+
+test("write tools: added = lines of the content argument; a non-string content has no count", () => {
+  const added = (name, input, kind = "omp") => linesOf(ofType(tool(name, input, kind), "file")[0]);
+  assert.deepEqual(added("write", { path: "/w/a.ts", content: "1\n2\n3" }), { added: 3 });
+  assert.deepEqual(added("write", { path: "/w/a.ts", content: "1\n2\n3\n" }), { added: 3 });
+  assert.deepEqual(added("write", { path: "/w/a.ts", content: "\n" }), { added: 1 });
+  assert.deepEqual(added("Write", { file_path: "/w/b.ts", content: "x" }, "claude"), { added: 1 });
+  assert.deepEqual(added("write_file", { path: "/w/c.ts", content: "a\nb" }, "dsh"), { added: 2 });
+  assert.deepEqual(added("create_file", { path: "/w/d.ts", content: "a\nb" }, "dsh"), { added: 2 });
+  assert.equal(added("write", { path: "/w/e.ts" }), undefined);
+  assert.equal(added("write", { path: "/w/e.ts", content: 5 }), undefined);
+  assert.equal(added("write", { path: "/w/e.ts", content: { a: 1 } }), undefined);
+  assert.equal(added("write", { path: "/w/e.ts", content: "" }), undefined); // empty content: nothing to count
+});
+
+test("omp hashline edit: PUT/CUT rows per block; unknown parts never erase known ones; same path sums", () => {
+  const input = [
+    "[src/a.ts#AB12]",
+    "PUT 2.=4:",
+    "+x",
+    "+y",
+    "CUT 6.=7",
+    "PUT >9:",
+    "+z",
+    "[lib/b.ts#CD34]",
+    "PUT 1*:",
+    "+whole",
+    "+block",
+    "CUT 10*",
+    "PUT 3.=3 @snip",
+    "[src/a.ts#EF56]",
+    "PUT <1:",
+    "+top",
+  ].join("\n");
+  const r = tool("edit", { input }, "omp");
+  assert.equal(r.category, "edit");
+  assert.equal(r.preview, "src/a.ts, lib/b.ts, src/a.ts");
+  // a.ts: block 1 PUT 2..4 → +2/−3, CUT 6..7 → −2, PUT >9 → +1; block 3 PUT <1 → +1
+  // b.ts: PUT 1* → +2 (block size unknown), CUT 10* unknown, range paste 3..3 → −1
+  assert.deepEqual(fileLines(r), [
+    ["edit", "/Users/me/work/src/a.ts", { added: 4, removed: 5 }],
+    ["edit", "/Users/me/work/lib/b.ts", { added: 2, removed: 1 }],
+  ]);
+});
+
+test("omp hashline edit: header-less ops count against `path`; a lone + is a row; only-unknown blocks have no lines", () => {
+  const given = tool("edit", { path: "lib/x.mjs", input: "PUT 1.=3:\n+a\n+\n+b\nCUT 8*" }, "omp");
+  assert.deepEqual(fileLines(given), [["edit", "/Users/me/work/lib/x.mjs", { added: 3, removed: 3 }]]);
+  const none = tool("edit", { input: "[u.ts#A1]\nPUT 2*:\nCUT 5*" }, "omp");
+  assert.deepEqual(fileLines(none), [["edit", "/Users/me/work/u.ts", undefined]]);
+  const moved = tool("edit", { input: "[m.txt#A1]\nPUT 1.=1:\n+x\nMV n.txt" }, "omp");
+  assert.deepEqual(fileLines(moved), [
+    ["delete", "/Users/me/work/m.txt", undefined], // MV makes the source a delete target; counts describe reading/editing only
+    ["write", "/Users/me/work/n.txt", undefined], // the destination is a plain write
+  ]);
+});
+
+test("omp hashline edit: single-line PUT/CUT, `$` anchors, register pastes and stray body lines", () => {
+  const one = tool("edit", { input: [
+    "[q.ts#A1]",
+    "PUT 260:",
+    "+a",
+    "+b",
+    "CUT 7",
+    "CUT 9.=11",
+  ].join("\n") }, "omp");
+  // PUT N: replaces one line; CUT N cuts one line; CUT N.=M cuts the inclusive span
+  assert.deepEqual(fileLines(one), [["edit", "/Users/me/work/q.ts", { added: 2, removed: 5 }]]);
+  const noBody = tool("edit", { input: "[z.ts#A1]\nPUT 9:" }, "omp");
+  assert.deepEqual(fileLines(noBody), [["edit", "/Users/me/work/z.ts", { removed: 1 }]]);
+  const end = tool("edit", { input: [
+    "[e.ts#A1]",
+    "PUT >$:",
+    "+end1",
+    "+end2",
+    "PUT <$:",
+    "+head",
+    "PUT >$*:",
+    "+tail",
+  ].join("\n") }, "omp");
+  // `$` is the end-of-file anchor of the insert forms; inserts remove nothing
+  assert.deepEqual(fileLines(end), [["edit", "/Users/me/work/e.ts", { added: 4 }]]);
+  const pastes = tool("edit", { input: [
+    "[r.ts#A1]",
+    "PUT >7 @snip",
+    "PUT <$ @snip",
+    "PUT >$ @snip",
+    "PUT 3.=3 @snip",
+    "PUT 5 @snip",
+    "CUT 4 @snip",
+    "CUT 6.=8 @snip",
+  ].join("\n") }, "omp");
+  // inserts/pastes add nothing known; range and single-line pastes still remove their lines
+  assert.deepEqual(fileLines(pastes), [["edit", "/Users/me/work/r.ts", { removed: 6 }]]);
+  const noisy = tool("edit", { input: [
+    "[n.ts#A1]",
+    "PUT 4:",
+    "the model forgot the plus",
+    "+counted",
+    "<<< not an op >>>",
+    "+also counted",
+    "CUT 2.=3",
+  ].join("\n") }, "omp");
+  // a line that is neither an op, a header nor a "+" row is ignored, and the body keeps counting after it
+  assert.deepEqual(fileLines(noisy), [["edit", "/Users/me/work/n.ts", { added: 2, removed: 3 }]]);
+});
+
+test("path-based edit tools: old/new strings count removed/added", () => {
+  const lines = r => linesOf(ofType(r, "file")[0]);
+  assert.deepEqual(lines(tool("Edit", { file_path: "/srv/a.ts", old_string: "a\nb", new_string: "c" })), { added: 1, removed: 2 });
+  assert.deepEqual(lines(tool("MultiEdit", {
+    file_path: "/srv/b.ts",
+    edits: [{ old_string: "1", new_string: "2\n3" }, { old_string: "4\n5\n6", new_string: "7" }],
+  })), { added: 3, removed: 4 });
+  assert.equal(lines(tool("MultiEdit", { file_path: "/srv/b.ts", edits: [] })), undefined);
+  assert.equal(lines(tool("Edit", { file_path: "/srv/a.ts" })), undefined); // no text: unknown
+  assert.deepEqual(lines(tool("str_replace_editor", { command: "create", path: "/srv/new.txt", file_text: "a\nb\nc" }, "dsh")), { added: 3 });
+  assert.deepEqual(lines(tool("str_replace_editor", { command: "str_replace", path: "/srv/x.txt", old_str: "x\ny", new_str: "z" }, "dsh")), { added: 1, removed: 2 });
+  assert.deepEqual(lines(tool("str_replace_editor", { command: "insert", path: "/srv/x.txt", insert_line: 3, new_str: "a\nb" }, "dsh")), { added: 2 });
+  assert.equal(lines(tool("str_replace_editor", { command: "view", path: "/srv/x.txt" }, "dsh")), undefined);
+});
+
+test("apply_patch counts all three entry points; Move to keeps its counts on the source path", () => {
+  const patch = [
+    "*** Begin Patch",
+    "*** Add File: docs/new.md",
+    "+one",
+    "+two",
+    "*** Update File: src/a.ts",
+    "@@",
+    "-old1",
+    "-old2",
+    "+new1",
+    "*** Update File: src/move.ts",
+    "*** Move to: src/moved.ts",
+    "@@",
+    "-x",
+    "+y",
+    "*** Delete File: /abs/old.txt",
+    "*** End Patch",
+  ].join("\n");
+  const direct = tool("apply_patch", patch, "codex");
+  const want = [
+    ["write", "/Users/me/work/docs/new.md", { added: 2 }],
+    ["edit", "/Users/me/work/src/a.ts", { added: 1, removed: 2 }],
+    ["edit", "/Users/me/work/src/move.ts", { added: 1, removed: 1 }], // Move to: counts stay on the source
+    ["write", "/Users/me/work/src/moved.ts", undefined],
+    ["delete", "/abs/old.txt", undefined],
+  ];
+  assert.deepEqual(fileLines(direct), want);
+  assert.equal(direct.category, "edit");
+  const code = patch.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  assert.deepEqual(fileLines(tool("exec", `text(await tools.apply_patch("${code}"))`, "codex")), want);
+  const shell = tool("exec_command", { cmd: `apply_patch <<'PATCH'\n${patch}\nPATCH`, workdir: "/Users/me/other" }, "codex");
+  assert.deepEqual(fileLines(shell), want.map(([op, p, l]) => [op, p.replace("/Users/me/work", "/Users/me/other"), l]));
+});
+
+test("read counts from selectors and limits; open ranges and listings stay unknown", () => {
+  const read = (path, extra = {}) => ofType(tool("read", { path, ...extra }, "omp"), "file")[0];
+  for (const p of ["src/a.ts", "src/a.ts:50", "src/a.ts:50-", "src/a.ts:raw", "src/a.ts:img", "src/a.ts:conflicts", "docs/"]) {
+    assert.equal(read(p).lines, undefined, p);
+  }
+  assert.deepEqual(read("src/a.ts:1-1").lines, { read: 1 });
+  assert.deepEqual(read("src/a.ts:-60").lines, { read: 60 });
+  assert.deepEqual(read("src/a.ts:5-16,960-973").lines, { read: 26 });
+  // Claude Read: the limit is the count, the offset only moves the window
+  assert.deepEqual(ofType(tool("Read", { file_path: "/srv/d.ts", offset: 10, limit: 20 }), "file")[0].lines, { read: 20 });
+  assert.equal(ofType(tool("Read", { file_path: "/srv/d.ts", offset: 10 }), "file")[0].lines, undefined);
+});
+
+test("line counts never change category, preview, target order or the cap", () => {
+  const many = Array.from({ length: 40 }, (_, i) => `[f/${i}.ts#A1]\nPUT 1.=1:\n+x`).join("\n");
+  const r = tool("edit", { input: many }, "omp");
+  assert.equal(r.category, "edit");
+  assert.equal(r.targets.length, LIMITS.maxTargetsPerEvent);
+  assert.equal(r.targets[0].path, "/Users/me/work/f/0.ts");
+  assert.ok(r.targets.every(t => t.lines && t.lines.added === 1 && t.lines.removed === 1));
+});
+
+test("a 200 KB hashline edit stays fast", () => {
+  const rows = Array.from({ length: 12000 }, (_, i) => `PUT ${i + 1}.=${i + 1}:\n+x`).join("\n");
+  const input = `[big.ts#ABCD]\n${rows}\n`;
+  assert.ok(input.length > 200_000);
+  const t0 = performance.now();
+  const r = tool("edit", { input }, "omp");
+  assert.ok(performance.now() - t0 < 1500);
+  assert.deepEqual(ofType(r, "file")[0].lines, { added: 12000, removed: 12000 });
 });
 
 // ───────────────────────────────────────────── previews ─────────────────────────────────────────────

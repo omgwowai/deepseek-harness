@@ -17,7 +17,7 @@ const CATS = ['read', 'write', 'edit', 'search', 'shell', 'remote', 'k8s', 'spaw
 const CAT_LABEL = { read: '读取 read', write: '写入 write', edit: '编辑 edit', search: '搜索 search', shell: 'Shell', remote: '远程 remote', k8s: 'K8s', spawn: '派生 spawn', web: 'Web', coordination: '协作 coord', other: '其他 other' };
 const STATUS_LABEL = { running: '运行中', waiting: '等待用户', idle: '空闲', done: '完成', error: '错误', interrupted: '已中断', stale: '失联', unknown: '未知' };
 const ROLE_LABEL = { main: '主', subagent: '子', fork: '分叉', side: '旁路', projection: '投影' };
-const VIEWS = ['fleet', 'timeline', 'pods', 'files', 'feed'];
+const VIEWS = ['fleet', 'timeline', 'graph', 'pods', 'files', 'feed'];
 const NAMESPACE = 'mc-bochao-li';
 const CLUSTER_ALIASES = {
   chengdu: 'chengdu', 'chengdu-h100': 'chengdu', cd: 'chengdu',
@@ -48,15 +48,15 @@ function fileOpClass(op) { return op === 'write' ? 'w' : op === 'edit' || op ===
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;'));
 const clip = (s, n) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
-/** Clip to a pixel budget at ~11 px UI text: CJK / full-width glyphs count 11.4 px, everything else 6.1 px; "…" costs 6.1. */
+/** Width of one glyph at ~11 px UI text: CJK / full-width glyphs count 11.4 px, everything else 6.1 px. */
+const glyphPx = (c) => ((c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0xff00 && c <= 0xffef) ? 11.4 : 6.1);
+function textPx(s) { s = String(s ?? ''); let w = 0; for (let i = 0; i < s.length; i++) w += glyphPx(s.charCodeAt(i)); return w; }
+/** Clip to a pixel budget at ~11 px UI text; "…" costs 6.1. */
 function clipPx(s, px) {
   s = String(s ?? '');
-  const width = (c) => ((c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0xff00 && c <= 0xffef) ? 11.4 : 6.1);
-  let total = 0;
-  for (let i = 0; i < s.length; i++) total += width(s.charCodeAt(i));
-  if (total <= px) return s;
+  if (textPx(s) <= px) return s;
   let w = 0, end = 0;
-  while (end < s.length && w + width(s.charCodeAt(end)) + 6.1 <= px) w += width(s.charCodeAt(end++));
+  while (end < s.length && w + glyphPx(s.charCodeAt(end)) + 6.1 <= px) w += glyphPx(s.charCodeAt(end++));
   return end > 0 ? s.slice(0, end) + '…' : '';
 }
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -278,16 +278,20 @@ function createSseParser(onEvent) {
 function parseHash(hash) {
   const p = new URLSearchParams(String(hash || '').replace(/^#/, ''));
   const view = p.get('view');
+  const g = p.get('g'), win = p.get('win');
   return {
     view: VIEWS.includes(view) ? view : null,
     key: p.get('key') || '', site: p.get('site') || '', q: p.get('q') || '', focus: p.get('focus') || '',
     kinds: (p.get('kind') || '').split(',').filter((k) => KINDS.includes(k)),
     pod: p.get('pod') || '', file: p.get('file') || '', token: p.get('token') || '', nonce: p.get('nonce') || '',
+    g: GRAPH_MODES.includes(g) ? g : 'env',
+    win: GRAPH_WINS.includes(win) ? win : '30m',
   };
 }
 function buildHash(st) {
   const p = new URLSearchParams();
   p.set('view', st.view || 'fleet');
+  if (st.view === 'graph') { p.set('g', GRAPH_MODES.includes(st.g) ? st.g : 'env'); p.set('win', GRAPH_WINS.includes(st.win) ? st.win : '30m'); }
   if (st.key) p.set('key', st.key);
   if (st.site) p.set('site', st.site);
   if (st.kinds && st.kinds.length) p.set('kind', st.kinds.join(','));
@@ -298,18 +302,668 @@ function buildHash(st) {
   return '#' + p.toString().replace(/%3A/g, ':').replace(/%2F/g, '/').replace(/%2C/g, ',');
 }
 
-/** Aggregates a Map(eventKey → touch) into counts, last touch, agents and ops. */
+/** Aggregates a Map(eventKey → touch) into counts, last touch, agents, ops and the line totals of Contract A. */
 function summarizeTouches(map) {
-  const out = { n: 0, r: 0, w: 0, e: 0, last: 0, lastTouch: null, agents: new Map(), ops: new Map() };
+  const out = { n: 0, r: 0, w: 0, e: 0, last: 0, lastTouch: null, agents: new Map(), ops: new Map(), lines: { read: 0, added: 0, removed: 0 } };
   for (const t of map.values()) {
     out.n++; out[fileOpClass(t.op)]++;
     if (t.t > out.last) { out.last = t.t; out.lastTouch = t; }
+    if (t.lines) for (const k of ['read', 'added', 'removed']) if (Number.isFinite(t.lines[k]) && t.lines[k] > 0) out.lines[k] += t.lines[k];
     const a = out.agents.get(t.agent);
     if (!a) out.agents.set(t.agent, { n: 1, last: t.t }); else { a.n++; if (t.t > a.last) a.last = t.t; }
     const op = t.op || '?';
     out.ops.set(op, (out.ops.get(op) || 0) + 1);
   }
   return out;
+}
+
+/* ── interaction graphs (?view=graph): pure model ──
+   Two bipartite graphs over the tool events of a time window: agents ↔ runtime environment and agents ↔ files/repos.
+   Everything here is DOM-free so tests/panel.test.mjs can drive it in a vm. */
+
+const GRAPH_MODES = ['env', 'files'];
+const GRAPH_WINS = ['5m', '30m', '2h', '24h'];
+const GRAPH_WIN_MS = { '5m': 300e3, '30m': 1800e3, '2h': 7200e3, '24h': 86400e3 };
+const GRAPH_WIN_LABEL = { '5m': '5 分钟', '30m': '30 分钟', '2h': '2 小时', '24h': '24 小时' };
+const GRAPH_CAP_ROOTS = 80;
+const GRAPH_CAP_KIDS = 50;
+const GRAPH_MAX_LABELS = 60;
+const GRAPH_MAX_ROWS = 1200;
+const GRAPH_MAX_EDGES = 2000;
+const GRAPH_EXTERNAL = 'external';
+const GRAPH_EXTERNAL_LABEL = '外部 external';
+const GRAPH_POD_ACTIVE_MS = 60e3;
+const GRAPH_EDGE_RECENT_MS = 15000;
+const GRAPH_QUERY_TARGETS = ['pod', 'k8s', 'host', 'file'];
+const GRAPH_EDGE_PRIORITY = { env: ['k8s', 'remote', 'shell'], files: ['e', 'w', 'r'] };
+
+const trimPath = (p) => { const s = String(p ?? '').replace(/\/+$/, ''); return s === '' ? '/' : s; };
+const pathSegs = (p) => String(p ?? '').split('/').filter(Boolean);
+const underPath = (dir, path) => { if (!dir) return false; const d = trimPath(dir); const p = String(path ?? ''); return d === '/' ? p.startsWith('/') : p === d || p.startsWith(d + '/'); };
+const pathJoin = (base, segs) => (trimPath(base) === '/' ? '/' + segs.join('/') : trimPath(base) + '/' + segs.join('/'));
+const rootTail = (root) => pathSegs(root).slice(-2).join('/');
+
+/** Home directory of an absolute path (/Users/<u>, /home/<u>, /ch/home/<u>, /root), else null. */
+function homePathOf(path) {
+  const p = String(path ?? '');
+  let m = /^\/Users\/[^/]+/.exec(p);
+  if (m) return m[0];
+  m = /^\/ch\/home\/[^/]+/.exec(p);
+  if (m) return m[0];
+  m = /^\/home\/[^/]+/.exec(p);
+  if (m) return m[0];
+  if (p === '/root' || p.startsWith('/root/')) return '/root';
+  return null;
+}
+/**
+ * Directory anchor of a file outside every git repo: the deepest cwd of an agent on that host that contains the path,
+ * else home + two segments, else the first two path segments. The rest of the path is drawn below it.
+ */
+function fileAnchor(path, cwds) {
+  const p = String(path ?? '');
+  let best = null;
+  for (const c of cwds || []) {
+    const d = trimPath(c);
+    if (d === '/' || !underPath(d, p)) continue;
+    if (!best || d.length > best.length) best = d;
+  }
+  if (best) return best;
+  const home = homePathOf(p), segs = pathSegs(p), hs = home ? pathSegs(home).length : 0;
+  if (home && segs.length > hs) return '/' + segs.slice(0, hs + 2).join('/');
+  return segs.length ? '/' + segs.slice(0, 2).join('/') : '/';
+}
+/** Deepest git work tree of `path` in a host's Repo list (Contract B), with the normalised root. */
+function repoOfPath(path, repos) {
+  let best = null;
+  for (const r of repos || []) {
+    if (!r || !r.root) continue;
+    const root = trimPath(r.root);
+    if (root === '/' || !underPath(root, path)) continue;
+    if (!best || root.length > best.root.length) best = { repo: r, root };
+  }
+  return best;
+}
+/** github.com/omgwowai/deepseek-harness → omgwowai/deepseek-harness (the host is dropped, subgroups are kept). */
+function repoSlug(remote) {
+  const segs = String(remote || '').replace(/^[a-z]+:\/\//i, '').replace(/^[^@/]+@/, '').replace(/\.git$/i, '').split('/').filter(Boolean);
+  return (segs.length >= 3 ? segs.slice(1) : segs).join('/');
+}
+/** `pods -l app=z`: the k8s target stores the singular kind, kubectl prints the plural for selections. */
+function pluralResource(r) {
+  const s = String(r || 'resource');
+  return /s$/.test(s) ? s : s + 's';
+}
+/** Site of a target: explicit, else the kube context alias, else the target cluster, else the host's site. */
+function targetSiteOf(t, hosts) {
+  if (!t) return '?';
+  if (t.site) return String(t.site);
+  const s = siteOfCluster(t.cluster);
+  if (s) return s;
+  if (t.cluster) return String(t.cluster).trim();
+  const h = t.host && hosts.get(t.host);
+  if (h && h.site) return h.site;
+  if (t.host && SITES.includes(t.host)) return t.host;
+  return '?';
+}
+/** Namespace of a pod named without one: the watched pod record when there is one, else the fleet default. */
+function podNamespaceOf(site, name, pods) {
+  for (const p of pods.values()) if (p && p.name === name && (!site || site === '?' || !p.site || p.site === site)) return p.namespace || NAMESPACE;
+  return NAMESPACE;
+}
+const emptyStat = () => ({ calls: 0, ops: new Map(), lines: { read: 0, added: 0, removed: 0 }, last: 0, pending: false, agents: 0 });
+const lineCountsOf = (l) => {
+  if (!l || typeof l !== 'object') return null;
+  const out = {};
+  for (const k of ['read', 'added', 'removed']) if (Number.isFinite(l[k]) && l[k] > 0) out[k] = Math.floor(l[k]);
+  return Object.keys(out).length ? out : null;
+};
+const matchTerms = (hay, terms) => { for (const t of terms) if (!hay.includes(t)) return false; return true; };
+/** Index of the first item in a time-sorted list with t ≥ t0. */
+function firstAtOrAfter(list, t0) {
+  let lo = 0, hi = list ? list.length : 0;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (list[m].t < t0) lo = m + 1; else hi = m; }
+  return lo;
+}
+const nodeHay = (a) => [agentTitle(a), a && a.name, a && a.description, a && a.cwd, a && a.kind].filter(Boolean).join(' ').toLowerCase();
+
+/**
+ * The graph model: two trees (agents, resources) plus one interaction record per (event, target) in the window.
+ * Pure; `agents`, `pods`, `hosts` are Maps (as in the store), `repoMap` is Snapshot.repos, `events` is [{agent, event}].
+ * Rules: projections and their events are skipped; a DSH session bound over ACP whose child agent is present records
+ * mirrors of the child's tool calls, so its own tool events are skipped; an expanded agent keeps only its own calls
+ * (the view aggregates by the deepest visible node); shell calls with no remote target count on the agent's own host.
+ */
+function graphModel(opts) {
+  const o = opts || {};
+  const mode = GRAPH_MODES.includes(o.mode) ? o.mode : 'env';
+  const agents = o.agents && typeof o.agents.values === 'function' ? o.agents : new Map();
+  const links = Array.isArray(o.links) ? o.links : [];
+  const winStart = Number.isFinite(o.winStart) ? o.winStart : -Infinity;
+  const nowT = Number.isFinite(o.now) ? o.now : winStart;
+  const pods = o.pods && typeof o.pods.values === 'function' ? o.pods : new Map();
+  const hosts = o.hosts && typeof o.hosts.values === 'function' ? o.hosts : new Map();
+  const repoMap = o.repoMap && typeof o.repoMap === 'object' ? o.repoMap : {};
+  const sources = o.sources && typeof o.sources === 'object' ? o.sources : {};
+  const localExec = o.localExec !== false;
+  const runningOnly = !!o.runningOnly;
+  const terms = String(o.q || '').toLowerCase().split(/\s+/).filter(Boolean);
+
+  // Agent universe: projections mirror a native session; they and their events stay out of the graph.
+  const ag = new Map();
+  for (const [k, a] of agents) if (a && a.role !== 'projection') ag.set(k, a);
+  const mirror = new Set();
+  {
+    const byKindId = new Map();
+    for (const a of ag.values()) if (a.id != null) byKindId.set(a.kind + ':' + a.id, a);
+    for (const a of ag.values()) {
+      if (a.kind !== 'dsh' || !a.acp || a.acp.kind == null || a.acp.id == null) continue;
+      const child = byKindId.get(a.acp.kind + ':' + a.acp.id);
+      if (child && child.key !== a.key) mirror.add(a.key);
+    }
+  }
+  const g = buildGraph(ag, links);
+
+  // cwd of every agent on a host: the anchor of repo-less files.
+  const cwdsByHost = new Map();
+  for (const a of agents.values()) {
+    if (!a || !a.host || !a.cwd) continue;
+    let l = cwdsByHost.get(a.host);
+    if (!l) cwdsByHost.set(a.host, (l = []));
+    if (!l.includes(a.cwd)) l.push(a.cwd);
+  }
+
+  const events = [];
+  for (const it of Array.isArray(o.events) ? o.events : []) {
+    if (!it || !it.agent || !it.event) continue;
+    const ev = it.event;
+    if (ev.t < winStart || (ev.type !== 'tool' && ev.type !== 'spawn')) continue;
+    events.push(it);
+  }
+
+  // ── interaction records ──
+  let records = [];
+  if (mode === 'env') {
+    const siteDesc = (site) => ({
+      key: 'S:' + site,
+      label: site === GRAPH_EXTERNAL ? GRAPH_EXTERNAL_LABEL : SITE_LABEL[site] || site,
+      kind: 'site',
+      meta: { site, kube: sources[site] || null },
+    });
+    const resOf = (t, a) => {
+      if (!t || !t.type) return null;
+      if (t.type === 'pod') {
+        if (!t.name) return null;
+        const site = targetSiteOf(t, hosts), ns = t.namespace || NAMESPACE, label = `${site}/${ns}/${t.name}`;
+        return { key: 'pod:' + label, label, kind: 'pod', meta: { site, ns, name: t.name, key: label }, hay: `${label} ${site}`.toLowerCase() };
+      }
+      if (t.type === 'k8s') {
+        const site = targetSiteOf(t, hosts), resource = t.resource || 'resource', name = t.name || '', selector = t.selector || '';
+        const label = selector ? `${pluralResource(resource)} -l ${selector}` : name ? `${resource}/${name}` : `${pluralResource(resource)}（未指名）`;
+        return { key: 'k8s:' + site + '/' + label, label, kind: 'k8s', meta: { site, resource, name, selector }, hay: `${label} ${site}`.toLowerCase() };
+      }
+      if (t.type === 'host') {
+        const host = String(t.host || '?');
+        let site = t.site || (hosts.get(host) && hosts.get(host).site) || (SITES.includes(host) ? host : GRAPH_EXTERNAL);
+        if (site === '?') site = GRAPH_EXTERNAL;
+        return { key: 'host:' + host, label: host, kind: 'host', meta: { site, host }, hay: `${host} ${site}`.toLowerCase() };
+      }
+      if (t.type === 'agent') {
+        if (t.pod) {
+          const site = t.site || (a && a.site) || '?', ns = podNamespaceOf(site, t.pod, pods), label = `${site}/${ns}/${t.pod}`;
+          return { key: 'pod:' + label, label, kind: 'pod', meta: { site, ns, name: t.pod, key: label }, hay: `${label} ${site} launch`.toLowerCase() };
+        }
+        const site = t.site || (a && a.site) || GRAPH_EXTERNAL;
+        return { key: 'host:' + site, label: site, kind: 'host', meta: { site, host: site }, hay: `${site} launch`.toLowerCase() };
+      }
+      return null;
+    };
+    const localOf = (a) => {
+      if (!a) return null;
+      const host = String(a.host || '');
+      if (!host) return null;
+      if (host.startsWith('k8s/')) {
+        const parts = host.split('/'), site = parts[1] || a.site || '?', name = parts.slice(2).join('/');
+        const ns = podNamespaceOf(site, name, pods), label = `${site}/${ns}/${name}`;
+        return { key: 'pod:' + label, label, kind: 'pod', meta: { site, ns, name, key: label }, hay: `${label} ${site} local`.toLowerCase() };
+      }
+      if (a.container) {
+        const site = a.site || (hosts.get(host) && hosts.get(host).site) || (SITES.includes(host) ? host : GRAPH_EXTERNAL);
+        const label = `容器 ${a.container}`;
+        return { key: `container:${site}/${host}/${a.container}`, label, kind: 'container', meta: { site, host, container: a.container }, hay: `${label} ${host} ${site}`.toLowerCase() };
+      }
+      const site = a.site || (hosts.get(host) && hosts.get(host).site) || (SITES.includes(host) ? host : GRAPH_EXTERNAL);
+      return { key: 'host:' + host, label: host, kind: 'host', meta: { site, host }, hay: `${host} ${site} local`.toLowerCase() };
+    };
+    const foreign = (ev, a) => {
+      const host = a && a.host;
+      for (const t of ev.targets || []) {
+        if (!t || !t.type) continue;
+        if (t.type === 'url') continue;
+        if (t.type === 'file') { if (t.host && host && t.host !== host) return true; continue; }
+        return true;                                      // pod / k8s / host / agent: the call reaches another machine
+      }
+      return false;
+    };
+    for (const it of events) {
+      const a = ag.get(it.agent);
+      if (!a || mirror.has(it.agent)) continue;
+      const ev = it.event, found = new Map();
+      for (const t of ev.targets || []) { const d = resOf(t, a); if (d) found.set(d.key, { d, t }); }
+      if (localExec && ev.category === 'shell' && !foreign(ev, a)) { const d = localOf(a); if (d && !found.has(d.key)) found.set(d.key, { d, t: null, local: true }); }
+      for (const { d, t, local } of found.values()) {
+        records.push({
+          aKey: it.agent, resKey: d.key, ev, t: ev.t, cat: ev.category || ev.type,
+          op: local ? 'exec' : (t && t.op) || ev.category || ev.type,
+          cls: local ? 'shell' : d.kind === 'pod' || d.kind === 'k8s' ? 'k8s' : 'remote',
+          pending: ev.status === 'pending', target: t, hay: d.hay,
+          chain: [siteDesc(d.meta.site), d],
+        });
+      }
+    }
+  } else {
+    const fileRecs = [];
+    for (const it of events) {
+      const a = ag.get(it.agent);
+      if (!a || mirror.has(it.agent)) continue;
+      for (const t of it.event.targets || []) {
+        if (t.type !== 'file' || !t.path) continue;
+        fileRecs.push({ aKey: it.agent, ev: it.event, t: it.event.t, cat: it.event.category || it.event.type, op: t.op || 'read', target: t, host: t.host || a.host || '?', path: String(t.path), pending: it.event.status === 'pending', lines: lineCountsOf(t.lines) });
+      }
+    }
+    // Directory leaves: ls, a trailing slash, or a path that is a prefix of another touched path on the same host.
+    const touchedByHost = new Map();
+    for (const f of fileRecs) { let s = touchedByHost.get(f.host); if (!s) touchedByHost.set(f.host, (s = new Set())); s.add(f.path); }
+    const dirs = new Set();
+    for (const f of fileRecs) if (f.op === 'list' || f.path.endsWith('/')) dirs.add(f.host + '\u0000' + f.path);
+    for (const [host, set] of touchedByHost) {
+      const arr = [...set].sort();
+      for (let i = 0; i + 1 < arr.length; i++) if (arr[i + 1].startsWith(arr[i] + '/')) dirs.add(host + '\u0000' + arr[i]);
+    }
+    // Repo checkouts: group the same remote together; the rest hangs under an anchor directory.
+    const groups = new Map();
+    for (const f of fileRecs) {
+      const hit = repoOfPath(f.path, repoMap[f.host]);
+      if (hit) {
+        f.repo = hit.repo; f.root = hit.root;
+        f.groupKey = hit.repo.remote ? 'repo:' + hit.repo.remote : `repo:${f.host}:${hit.root}`;
+        let grp = groups.get(f.groupKey);
+        if (!grp) groups.set(f.groupKey, (grp = { remote: hit.repo.remote || '', checkouts: new Map() }));
+        grp.checkouts.set(f.host + ':' + hit.root, { host: f.host, root: hit.root, repo: hit.repo });
+      } else {
+        f.anchor = fileAnchor(f.path, cwdsByHost.get(f.host) || []);
+        f.groupKey = `anchor:${f.host}:${f.anchor}`;
+      }
+    }
+    const groupInfo = new Map();
+    for (const [key, grp] of groups) {
+      const checks = [...grp.checkouts.values()];
+      const branches = [...new Set(checks.map((c) => c.repo.branch).filter(Boolean))];
+      let label;
+      if (grp.remote) {
+        const slug = repoSlug(grp.remote) || baseName(checks[0].root);
+        label = slug + (branches.length === 1 ? ' @ ' + branches[0] : branches.length > 1 ? ` @ ${branches.length} branches` : '');
+      } else {
+        const c = checks[0], b = c.repo.branch || (c.repo.head ? c.repo.head.slice(0, 7) : '');
+        label = baseName(c.root) + (b ? ' @ ' + b : '');
+      }
+      groupInfo.set(key, { key, remote: grp.remote, checkouts: checks, multi: checks.length > 1, label, hosts: [...new Set(checks.map((c) => c.host))], branches });
+    }
+    for (const f of fileRecs) {
+      const chain = [];
+      let base;
+      if (f.repo) {
+        const gi = groupInfo.get(f.groupKey);
+        chain.push({ key: 'G:' + f.groupKey, label: gi.label, kind: 'repo', meta: { remote: gi.remote, hosts: gi.hosts, checkouts: gi.checkouts.length, branches: gi.branches } });
+        base = f.root;
+        if (gi.multi) {
+          const co = gi.checkouts.find((c) => c.host === f.host && c.root === f.root) || { repo: f.repo };
+          const branch = co.repo.branch || '', head = co.repo.head || '';
+          chain.push({
+            key: `C:${f.host}:${f.root}`, kind: 'checkout',
+            label: [branch || (head ? head.slice(0, 7) : 'detached'), f.host, rootTail(f.root)].join(' · '),
+            meta: { host: f.host, root: f.root, branch, head },
+          });
+        }
+      } else {
+        chain.push({ key: `A:${f.host}:${f.anchor}`, label: f.anchor, kind: 'anchor', meta: { host: f.host, path: f.anchor } });
+        base = f.anchor;
+      }
+      const rel = f.path.length > base.length ? f.path.slice(base.length).replace(/^\/+/, '') : '';
+      const segs = rel ? pathSegs(rel) : [];
+      if (segs.length) {
+        const dirLeaf = dirs.has(f.host + '\u0000' + f.path);
+        for (let i = 0; i < segs.length; i++) {
+          const full = pathJoin(base, segs.slice(0, i + 1)), last = i === segs.length - 1, isDir = !last || dirLeaf;
+          chain.push({
+            key: (isDir ? 'D:' : 'F:') + f.host + ':' + full, label: segs[i], kind: isDir ? 'dir' : 'file',
+            meta: isDir ? { host: f.host, path: full } : { host: f.host, path: full, fileKey: f.host + ':' + full },
+          });
+        }
+      }
+      records.push({
+        aKey: f.aKey, resKey: chain[chain.length - 1].key, ev: f.ev, t: f.t, cat: f.cat, op: f.op,
+        opClass: fileOpClass(f.op), cls: fileOpClass(f.op), lines: f.lines || null,
+        pending: f.pending, target: f.target, host: f.host, path: f.path,
+        hay: `${f.path} ${f.repo ? repoSlug(f.repo.remote || '') + ' ' + (f.repo.branch || '') : f.anchor} ${f.host}`.toLowerCase(),
+        chain,
+      });
+    }
+  }
+
+  // Text filter: narrow a side only when the term matches something on that side (an agent title vs a resource label),
+  // so searching an agent still shows every resource it touched and vice versa.
+  if (terms.length) {
+    const resHit = records.some((r) => matchTerms(r.hay, terms));
+    if (resHit) records = records.filter((r) => matchTerms(r.hay, terms));
+  }
+
+  // ── agent side ──
+  const withRec = new Set();
+  for (const r of records) withRec.add(r.aKey);
+  let keepBase = new Set();
+  for (const k of withRec) for (let c = k, n = 0; c && n < 400; c = g.parent.has(c) ? g.parent.get(c).from : null, n++) keepBase.add(c);
+  if (terms.length) {
+    const agentHit = [...ag.values()].some((a) => matchTerms(nodeHay(a), terms));
+    const match = new Set();
+    if (agentHit) for (const k of keepBase) { const a = ag.get(k); if (a && matchTerms(nodeHay(a), terms)) match.add(k); }
+    if (match.size) {
+      const keep = new Set();
+      for (const k of match) for (let c = k, n = 0; c && n < 400 && keepBase.has(c) && !keep.has(c); c = g.parent.has(c) ? g.parent.get(c).from : null, n++) keep.add(c);
+      keepBase = keep;
+    }
+  }
+  const leftRoots = [], leftByKey = new Map();
+  for (const k of keepBase) {
+    const a = ag.get(k);
+    if (!a) continue;
+    leftByKey.set(k, { key: k, kind: 'agent', label: agentTitle(a), a, parent: null, kids: [], own: emptyStat(), meta: {}, _ev: new Set(), _agents: new Set(), _podActive: new Set() });
+  }
+  for (const k of keepBase) {
+    const n = leftByKey.get(k), p = g.parent.get(k), pk = p && keepBase.has(p.from) ? p.from : null;
+    n.parent = pk;
+    if (pk) leftByKey.get(pk).kids.push(n); else leftRoots.push(n);
+  }
+  for (const r of records) {
+    const n = leftByKey.get(r.aKey);
+    if (n) addOwnStat(n, r, nowT);
+  }
+
+  // ── resource side ──
+  const rightRoots = [], rightByKey = new Map();
+  for (const rec of records) {
+    let parent = null;
+    for (const d of rec.chain) {
+      let n = rightByKey.get(d.key);
+      if (!n) {
+        n = { key: d.key, kind: d.kind, label: d.label, parent: parent ? parent.key : null, kids: [], own: emptyStat(), meta: d.meta || {}, _ev: new Set(), _agents: new Set(), _podActive: new Set() };
+        rightByKey.set(n.key, n);
+        if (parent) parent.kids.push(n); else rightRoots.push(n);
+      }
+      parent = n;
+    }
+    if (parent) addOwnStat(parent, rec, nowT);
+  }
+
+  finalizeTree(leftRoots, mode);
+  finalizeTree(rightRoots, mode);
+  if (mode === 'files') for (const n of rightRoots) compressDirs(n, rightByKey);
+  for (const n of rightByKey.values()) {
+    if (n.kind === 'pod') {
+      const p = pods.get(n.meta.key);
+      n.meta.phase = p ? p.phase : '';
+      n.meta.collect = !!(p && p.collect);
+      n.podAgents = n.agg.agents;
+      n.podActive = n._podActive.size;
+    } else if (n.kind === 'site') {
+      n.podCount = n.kids.filter((k) => k.kind === 'pod').length;
+    }
+  }
+  rightRoots.sort((a, b) => resRootCmp(a, b, mode));
+  for (const n of rightByKey.values()) if (n.kids.length > 1) n.kids.sort((a, b) => resCmp(a, b, mode));
+  for (const n of leftByKey.values()) {
+    let tag = '';
+    for (const k of n.kids) {
+      const p = g.parent.get(k.key), l = p && p.link;
+      if (!l) continue;
+      if (l.via === 'acp') { tag = 'ACP'; break; }
+      if ((l.via === 'command' || l.via === 'process' || l.via === 'env') && (l.crossHost || k.a.host !== n.a.host)) { if (!tag) tag = '远程'; }
+      else if (l.via === 'file' && !tag) tag = '子';
+    }
+    n.tag = tag;
+  }
+  leftRoots.sort((a, b) => ((b.subActive ? 1 : 0) - (a.subActive ? 1 : 0)) || ((b.a.startedAt || 0) - (a.a.startedAt || 0)) || (a.key < b.key ? -1 : 1));
+  for (const n of leftByKey.values()) n.kids.sort((a, b) => ((a.a.startedAt || 0) - (b.a.startedAt || 0)) || (a.key < b.key ? -1 : 1));
+  const roots = runningOnly ? leftRoots.filter((n) => n.subActive) : leftRoots;
+
+  return { mode, winStart, now: nowT, left: { roots, byKey: leftByKey, allRoots: leftRoots }, right: { roots: rightRoots, byKey: rightByKey }, records };
+}
+
+/** Adds one interaction to a node's own counters; event ids dedupe re-sent pending→ok updates. */
+function addOwnStat(n, rec, nowT) {
+  const ek = rec.aKey + '|' + (rec.ev && rec.ev.id);
+  if (!n._ev.has(ek)) { n._ev.add(ek); n.own.calls++; }
+  n._agents.add(rec.aKey);
+  n.own.ops.set(rec.op, (n.own.ops.get(rec.op) || 0) + 1);
+  if (rec.t > n.own.last) n.own.last = rec.t;
+  if (rec.pending) n.own.pending = true;
+  if (rec.lines) for (const k of ['read', 'added', 'removed']) if (rec.lines[k]) n.own.lines[k] += rec.lines[k];
+  if (n.kind === 'pod' && (rec.pending || rec.t >= nowT - GRAPH_POD_ACTIVE_MS)) n._podActive.add(rec.aKey);
+}
+/** Bottom-up subtree aggregates: calls/ops/lines/agents/last/pending, descendant count and "subtree has a live agent". */
+function finalizeTree(roots, mode) {
+  const walk = (n) => {
+    n.kids.sort((a, b) => resCmp(a, b, mode));
+    const ags = new Set(n._agents);
+    const agg = { calls: n.own.calls, agents: 0, ops: new Map(n.own.ops), lines: { ...n.own.lines }, last: n.own.last, pending: n.own.pending };
+    let desc = 0, sub = !!(n.a && isActive(n.a));
+    for (const k of n.kids) {
+      const s = walk(k);
+      agg.calls += s.calls;
+      for (const [op, c] of s.ops) agg.ops.set(op, (agg.ops.get(op) || 0) + c);
+      agg.lines.read += s.lines.read; agg.lines.added += s.lines.added; agg.lines.removed += s.lines.removed;
+      if (s.last > agg.last) agg.last = s.last;
+      agg.pending = agg.pending || s.pending;
+      for (const a of k._agentSet) ags.add(a);
+      desc += 1 + k.desc;
+      sub = sub || k.subActive;
+    }
+    n._agentSet = ags; agg.agents = ags.size;
+    n.agg = agg; n.desc = desc; n.subActive = sub; n.hasKids = n.kids.length > 0;
+    return agg;
+  };
+  for (const r of roots) walk(r);
+}
+/** Merge a directory that has one child directory and no touches of its own with that child (`lib` + `hub` → `lib/hub`). */
+function compressDirs(n, byKey) {
+  for (const k of n.kids) compressDirs(k, byKey);
+  if (n.kind !== 'dir') return;                           // the repo/checkout/anchor group is the tree's root: never merged
+  while (n.kids.length === 1 && n.kids[0].kind === 'dir' && n.kids[0].own.calls === 0) {
+    const c = n.kids[0];
+    n.label = String(n.label).replace(/\/+$/, '') + '/' + c.label;
+    n.kids = c.kids;
+    for (const k of n.kids) k.parent = n.key;
+    if (c.meta && c.meta.path) n.meta = { ...n.meta, path: c.meta.path };
+    byKey.delete(c.key);
+  }
+}
+function resCmp(a, b, mode) {
+  const rank = (n) => (mode === 'files' ? (n.kind === 'dir' || n.kind === 'checkout' ? 0 : 1) : ({ pod: 0, k8s: 1, host: 2, container: 3 }[n.kind] ?? 9));
+  const ra = rank(a), rb = rank(b);
+  if (ra !== rb) return ra - rb;
+  return a.label < b.label ? -1 : a.label > b.label ? 1 : a.key < b.key ? -1 : 1;
+}
+function resRootCmp(a, b, mode) {
+  if (mode === 'env') {
+    const rank = (n) => { const i = SITES.indexOf(n.meta.site); return n.meta.site === GRAPH_EXTERNAL ? 1e9 : i >= 0 ? i : 1000; };
+    const ra = rank(a), rb = rank(b);
+    if (ra !== rb) return ra - rb;
+  } else {
+    const ra = a.kind === 'repo' ? 0 : 1, rb = b.kind === 'repo' ? 0 : 1;
+    if (ra !== rb) return ra - rb;
+  }
+  return a.label < b.label ? -1 : a.label > b.label ? 1 : a.key < b.key ? -1 : 1;
+}
+
+/** Rows of one side: roots (cap 80), children of expanded nodes (cap 50 each), "+N more" rows, hard row cap. */
+function graphRows(roots, exp) {
+  const rows = [];
+  const walk = (n, depth) => {
+    if (rows.length >= GRAPH_MAX_ROWS) return;
+    const open = n.kids.length > 0 && !!(exp && exp.has(n.key));
+    rows.push({ kind: 'node', key: n.key, node: n, depth, open, hasKids: n.kids.length > 0 });
+    if (!open) return;
+    for (const k of n.kids.slice(0, GRAPH_CAP_KIDS)) walk(k, depth + 1);
+    if (n.kids.length > GRAPH_CAP_KIDS && rows.length < GRAPH_MAX_ROWS) rows.push({ kind: 'more', key: 'more:' + n.key, depth: depth + 1, more: n.kids.length - GRAPH_CAP_KIDS });
+  };
+  for (const r of roots.slice(0, GRAPH_CAP_ROOTS)) walk(r, 0);
+  if (roots.length > GRAPH_CAP_ROOTS) rows.push({ kind: 'more', key: 'more:roots', depth: 0, more: roots.length - GRAPH_CAP_ROOTS });
+  return rows;
+}
+
+/**
+ * Visible rows of both sides and the edges aggregated between the deepest visible ancestor-or-self of each endpoint.
+ * A collapsed agent therefore carries its whole subtree; expanding it splits the edge into its own calls and the
+ * children's edges. `expL`/`expR` are Sets of expanded node keys.
+ */
+function graphVisible(model, expL, expR) {
+  const leftRows = graphRows(model.left.roots, expL), rightRows = graphRows(model.right.roots, expR);
+  const visL = new Set(), visR = new Set();
+  for (const r of leftRows) if (r.kind === 'node') visL.add(r.key);
+  for (const r of rightRows) if (r.kind === 'node') visR.add(r.key);
+  const climb = (byKey, vis, key) => {
+    let n = byKey.get(key), i = 0;
+    while (n && !vis.has(n.key) && i++ < 400) n = n.parent ? byKey.get(n.parent) : null;
+    return n ? n.key : null;
+  };
+  const edges = new Map();
+  for (const rec of model.records) {
+    const lk = climb(model.left.byKey, visL, rec.aKey);
+    if (!lk) continue;
+    const rk = climb(model.right.byKey, visR, rec.resKey);
+    if (!rk) continue;
+    const key = lk + '\u0000' + rk;
+    let e = edges.get(key);
+    if (!e) {
+      edges.set(key, e = {
+        key, left: lk, right: rk, leftNode: model.left.byKey.get(lk), rightNode: model.right.byKey.get(rk),
+        calls: 0, agents: 0, ops: new Map(), classes: new Map(), lines: { read: 0, added: 0, removed: 0 },
+        last: 0, pending: false, dominant: model.mode === 'env' ? 'remote' : 'r', r: 0, w: 0, e: 0,
+        records: [], _agents: new Set(), _ev: new Set(),
+      });
+    }
+    const ek = rec.aKey + '|' + (rec.ev && rec.ev.id);
+    if (!e._ev.has(ek)) { e._ev.add(ek); e.calls++; e._agents.add(rec.aKey); }
+    e.ops.set(rec.op, (e.ops.get(rec.op) || 0) + 1);
+    const cls = model.mode === 'env' ? rec.cls : rec.opClass;
+    e.classes.set(cls, (e.classes.get(cls) || 0) + 1);
+    if (rec.lines) for (const k of ['read', 'added', 'removed']) if (rec.lines[k]) e.lines[k] += rec.lines[k];
+    if (rec.t > e.last) e.last = rec.t;
+    if (rec.pending) e.pending = true;
+    if (e.records.length < 500) e.records.push(rec);
+  }
+  const priority = GRAPH_EDGE_PRIORITY[model.mode] || GRAPH_EDGE_PRIORITY.env;
+  const list = [];
+  for (const e of edges.values()) {
+    e.agents = e._agents.size;
+    if (model.mode === 'files') { e.r = e.classes.get('r') || 0; e.w = e.classes.get('w') || 0; e.e = e.classes.get('e') || 0; }
+    let dom = '', best = -1;
+    for (const c of priority) { const n = e.classes.get(c) || 0; if (n > best) { best = n; dom = c; } }
+    e.dominant = best > 0 ? dom : priority[priority.length - 1];
+    e.dominantClass = model.mode === 'env' ? e.dominant : dom === 'w' ? 'write' : dom === 'e' ? 'edit' : 'read';
+    e.records.sort((a, b) => b.t - a.t);
+    list.push(e);
+  }
+  list.sort((a, b) => b.calls - a.calls || (a.key < b.key ? -1 : 1));
+  const stat = { calls: 0, agents: 0, resources: 0, last: 0, _agents: new Set(), _res: new Set() };
+  for (const e of list) {
+    stat.calls += e.calls;
+    for (const a of e._agents) stat._agents.add(a);
+    stat._res.add(e.right);
+    if (e.last > stat.last) stat.last = e.last;
+  }
+  stat.agents = stat._agents.size; stat.resources = stat._res.size;
+  return { leftRows, rightRows, edges: list, stats: stat };
+}
+
+/**
+ * Places each label on its own bezier, trying t = 0.5 outward (0.38, 0.62, 0.26, 0.74, 0.14, 0.86) and taking the
+ * first spot whose box overlaps no placed label. No room → hidden (hover still shows its label). Items carry
+ * {key, w, x0, y0, x1, y1, dx, rank, calls}; the lower rank wins the free spots, then the larger call count.
+ */
+function placeCurveLabels(items, opts) {
+  const o = opts || {};
+  const ts = o.ts || [0.5, 0.38, 0.62, 0.26, 0.74, 0.14, 0.86];
+  const lineH = Number.isFinite(o.lineH) ? o.lineH : 12;
+  const gap = Number.isFinite(o.gap) ? o.gap : 3;
+  const minX = Number.isFinite(o.minX) ? o.minX : -Infinity, maxX = Number.isFinite(o.maxX) ? o.maxX : Infinity;
+  const minY = Number.isFinite(o.minY) ? o.minY : -Infinity, maxY = Number.isFinite(o.maxY) ? o.maxY : Infinity;
+  const out = new Map(), placed = [];
+  const list = items.slice().sort((a, b) => (a.rank ?? 9) - (b.rank ?? 9) || (b.calls || 0) - (a.calls || 0) || (a.key < b.key ? -1 : 1));
+  for (const it of list) {
+    let spot = null;
+    for (const t of ts) {
+      const u = 1 - t;
+      const x = u * u * u * it.x0 + 3 * u * u * t * (it.x0 + it.dx) + 3 * u * t * t * (it.x1 - it.dx) + t * t * t * it.x1;
+      const y = it.y0 + (it.y1 - it.y0) * (3 * t * t - 2 * t * t * t);
+      const bx0 = x - it.w / 2, bx1 = x + it.w / 2, by0 = y - lineH / 2, by1 = y + lineH / 2;
+      if (bx0 < minX || bx1 > maxX || by0 < minY || by1 > maxY) continue;
+      let clash = false;
+      for (const p of placed) {
+        if (!(bx1 + gap < p.bx0 || p.bx1 + gap < bx0 || by1 + gap < p.by0 || p.by1 + gap < by0)) { clash = true; break; }
+      }
+      if (clash) continue;
+      spot = { hidden: false, t, x, y, bx0, bx1, by0, by1 };
+      break;
+    }
+    if (!spot) { out.set(it.key, { hidden: true }); continue; }
+    placed.push(spot);
+    out.set(it.key, spot);
+  }
+  return out;
+}
+/** `r820 +120 −30` with zero parts omitted (Contract A). */
+function edgeLinesText(lines) {
+  const p = [];
+  if (lines && lines.read) p.push('r' + fmtNum(lines.read));
+  if (lines && lines.added) p.push('+' + fmtNum(lines.added));
+  if (lines && lines.removed) p.push('−' + fmtNum(lines.removed));
+  return p.join(' ');
+}
+/** Compact per-target chip text: `r120` for reads, `+12 −3` for edits/writes. */
+function targetLinesText(t) {
+  const l = t && t.lines;
+  if (!l) return '';
+  const p = [];
+  if (t.op === 'edit' || t.op === 'write' || t.op === 'delete') {
+    if (l.added) p.push('+' + fmtNum(l.added));
+    if (l.removed) p.push('−' + fmtNum(l.removed));
+  } else if (l.read) p.push('r' + fmtNum(l.read));
+  return p.join(' ');
+}
+/** Edge label: env `25× · 3 agents`; files `14× r820 +120 −30`, or the op classes `5r 2e` when no lines are known. */
+function graphEdgeLabel(mode, e) {
+  if (mode === 'env') return `${e.calls}×${e.agents > 1 ? ` · ${e.agents} agents` : ''}`;
+  const lines = edgeLinesText(e.lines);
+  if (lines) return `${e.calls}× ${lines}`;
+  const ops = [];
+  if (e.r) ops.push(e.r + 'r');
+  if (e.w) ops.push(e.w + 'w');
+  if (e.e) ops.push(e.e + 'e');
+  return `${e.calls}×${ops.length ? ' ' + ops.join(' ') : ''}`;
+}
+/** Edge tooltip: both endpoints, the full op count and the line totals. */
+function graphEdgeTipHtml(mode, e, tNow) {
+  const t = Number.isFinite(tNow) ? tNow : Date.now();
+  const left = e.leftNode && e.leftNode.a ? agentTitle(e.leftNode.a) : e.leftNode ? e.leftNode.label : e.left;
+  const right = e.rightNode ? e.rightNode.label : e.right;
+  const ops = [...e.ops.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([op, n]) => `${esc(op)}×${n}`).join(' · ');
+  const lines = edgeLinesText(e.lines);
+  return `<div><b>${esc(left)}</b> ↔ <b>${esc(right)}</b></div>
+    <div class="row2"><span class="k">调用</span>${e.calls} 次 · ${e.agents} agents${e.pending ? ' · <span class="warn">进行中 pending</span>' : ''}</div>
+    ${ops ? `<div class="row2"><span class="k">操作</span>${esc(ops)}</div>` : ''}
+    ${lines ? `<div class="row2"><span class="k">行数</span>${esc(lines)}</div>` : ''}
+    <div class="row2"><span class="k">最近</span>${e.last ? fmtAge(t - e.last) + ' 前' : '–'}</div>
+    <div class="muted">点击查看该边上的调用 · click for calls</div>`;
 }
 
 /* Pure render fragments. They live here, not in the DOM kit, because tests load this file without a document. */
@@ -371,6 +1025,8 @@ if (typeof document === 'undefined') {   // loaded by tests: expose the pure par
     KINDS, SITES, CATS, NAMESPACE, SITE_LABEL, STATUS_LABEL, ROLE_LABEL, CAT_LABEL, GAP_MS, GAP_VIRT, siteOfCluster, podKeyOfTarget, fileKeyOfTarget,
     splitFileKey, fileOpClass, fmtDur, fmtAge, fmtNum, fmtBytes, agentTitle, containerClass, buildGraph, rootOf, subtree, resolveFocus,
     packLanes, makeAxis, pickStep, tickTimes, bucketSpans, visibleSegments, createSseParser, parseHash, buildHash, summarizeTouches, esc, clip, clipPx,
+    textPx, GRAPH_MODES, GRAPH_WINS, GRAPH_WIN_MS, GRAPH_WIN_LABEL, GRAPH_CAP_ROOTS, GRAPH_CAP_KIDS, GRAPH_EXTERNAL, GRAPH_QUERY_TARGETS,
+    homePathOf, fileAnchor, repoOfPath, repoSlug, graphModel, graphVisible, graphRows, placeCurveLabels, edgeLinesText, graphEdgeLabel, graphEdgeTipHtml, targetLinesText,
     ico, kindBadge, statusDot, agentRowSig, agentRowHtml, agentRowModel, isActive, redeemCredential,
   };
   return;
@@ -444,7 +1100,7 @@ function fileChip(fileKey, label) {
 }
 function targetChip(t) {
   switch (t.type) {
-    case 'file': { const k = fileKeyOfTarget(t); return k ? fileChip(k, (t.op ? t.op + '·' : '') + baseName(t.path)) : ''; }
+    case 'file': { const k = fileKeyOfTarget(t); const lt = targetLinesText(t); return k ? fileChip(k, (t.op ? t.op + '·' : '') + baseName(t.path) + (lt ? ' ' + lt : '')) : ''; }
     case 'pod': { const k = podKeyOfTarget(t); return k ? podChip(k, (t.op ? t.op + '·' : '') + t.name) : `<span class="chip t-pod mono">${esc((t.op || 'pod') + '·' + (t.name || '?'))}</span>`; }
     case 'k8s': return `<span class="chip t-k8s mono" title="${esc([t.cluster, t.namespace, t.resource, t.name].filter(Boolean).join('/'))}">${ico('k8s', 'sm')}${esc(clip([t.resource, t.name].filter(Boolean).join('/') || 'k8s', 28))}</span>`;
     case 'host': return `<span class="chip t-host mono" title="${esc((t.op || 'ssh') + ' ' + (t.host || ''))}${t.site ? ' · ' + esc(t.site) : ''}">${ico('host', 'sm')}${esc(clip(t.host || 'host', 24))}</span>`;
@@ -459,11 +1115,11 @@ function targetChip(t) {
 const S = {
   demo: null, token: '',
   loaded: false, cursor: 0, hub: null,
-  hosts: new Map(), agents: new Map(), links: [], pods: new Map(), sources: {},
+  hosts: new Map(), agents: new Map(), links: [], pods: new Map(), sources: {}, repos: {},
   feed: [], feedIdx: new Map(),                      // feed items {agent, event}, newest first by event.t
   stores: new Map(),                                  // agentKey → {list, byId, ver, loaded, hasMore, maxDur, pend, fetchedAt, sig}
   touch: { pods: new Map(), files: new Map() },       // entity key → Map(agentKey|eventId → touch)
-  ver: { agents: 0, links: 0, pods: 0, hosts: 0, feed: 0, touch: 0, events: 0 },
+  ver: { agents: 0, links: 0, pods: 0, hosts: 0, feed: 0, touch: 0, events: 0, repos: 0 },
   recSeq: 0, clockOffset: 0, lastDeltaAt: 0, lastContactAt: 0,
   conn: { state: 'connecting', error: '', retryAt: 0 },
   graph: null, graphVer: '',
@@ -474,6 +1130,8 @@ const S = {
     fileHost: '', fileAgent: '', fileOps: new Set(), fileQ: '', fileEvent: '',
     feedKinds: new Set(), feedCat: '', feedErr: false, feedQ: '', feedPaused: false, feedFrozen: null,
     focusRow: '', evFilter: 'all', evShow: 120,
+    graphMode: 'env', graphWin: '30m', graphLocal: true, graphRunning: false, graphQ: '', graphSel: '',
+    graphExpL: new Set(), graphExpR: new Set(),
   },
 };
 const now = () => Date.now() + S.clockOffset;
@@ -492,6 +1150,8 @@ function applySnapshot(snap) {
   S.links = snap.links || [];
   S.pods = new Map((snap.pods || []).map((p) => [p.key, stamp(p)]));
   S.sources = snap.sources || {};
+  S.repos = snap.repos && typeof snap.repos === 'object' ? snap.repos : {};
+  GQ.coverStart = 0; GQ.since = {}; GQ.fullPending = true; GQ.at = 0;
   S.feed = []; S.feedIdx = new Map();
   for (const f of snap.feed || []) addFeed(f.agent, f.event);
   for (const k in S.ver) S.ver[k]++;
@@ -508,6 +1168,7 @@ function applyDelta(d) {
   if (d.pods && d.pods.length) { for (const p of d.pods) S.pods.set(p.key, stamp(p)); S.ver.pods++; changed = true; }
   if (d.podsRemoved && d.podsRemoved.length) { for (const k of d.podsRemoved) S.pods.delete(k); S.ver.pods++; changed = true; }
   if (d.sources) { Object.assign(S.sources, d.sources); S.ver.hosts++; changed = true; }
+  if (d.repos && typeof d.repos === 'object') { for (const h of Object.keys(d.repos)) S.repos[h] = Array.isArray(d.repos[h]) ? d.repos[h] : []; S.ver.repos++; changed = true; }
   if (d.feed && d.feed.length) { for (const f of d.feed) addFeed(f.agent, f.event); S.ver.feed++; changed = true; }
   if (Number.isFinite(d.cursor) && d.cursor > S.cursor) S.cursor = d.cursor;
   if (changed) S.lastDeltaAt = Date.now();
@@ -539,7 +1200,7 @@ function upsertEvent(agentKey, e) {
 function putTouch(map, key, agentKey, e, t) {
   let m = map.get(key);
   if (!m) map.set(key, (m = new Map()));
-  m.set(agentKey + '|' + e.id, { agent: agentKey, id: e.id, t: e.t, op: t.op, cat: e.category, name: e.name, preview: e.preview, status: e.status });
+  m.set(agentKey + '|' + e.id, { agent: agentKey, id: e.id, t: e.t, op: t.op, cat: e.category, name: e.name, preview: e.preview, status: e.status, lines: t.lines });
   S.ver.touch++;
 }
 /** The hub defaults a file target without `host` to the host of the agent that made the call; so does the panel. */
@@ -772,7 +1433,7 @@ function scheduleRender(what) {
 
 function writeHash(push) {
   const u = S.ui;
-  const h = buildHash({ view: u.view, key: u.key, site: u.site, kinds: [...u.kinds], q: u.view === 'fleet' ? u.q : '', focus: u.focus, pod: u.view === 'pods' ? u.pod : '', file: u.view === 'files' ? u.file : '' });
+  const h = buildHash({ view: u.view, key: u.key, site: u.site, kinds: [...u.kinds], q: u.view === 'fleet' ? u.q : '', focus: u.focus, pod: u.view === 'pods' ? u.pod : '', file: u.view === 'files' ? u.file : '', g: u.graphMode, win: u.graphWin });
   if (h === location.hash) return;
   S.hashSelf = h;
   if (push) location.hash = h; else history.replaceState(null, '', h);
@@ -781,6 +1442,8 @@ function applyHash(h) {
   const u = S.ui;
   u.view = h.view || (h.focus && !h.key ? 'timeline' : 'fleet');
   u.key = h.key; u.site = h.site; u.kinds = new Set(h.kinds); u.q = h.q; u.focus = h.focus; u.pod = h.pod; u.file = h.file; u.ev = '';
+  if (h.g && u.graphMode !== h.g) { u.graphMode = h.g; u.graphSel = ''; GV.hover = ''; }
+  if (h.win && u.graphWin !== h.win) { u.graphWin = h.win; GQ.at = 0; }
   if (u.view === 'fleet' && h.key) u.drawer = { type: 'agent', key: h.key };       // in the timeline `key` only anchors the family
   else if (u.view === 'pods' && h.pod) u.drawer = { type: 'pod', key: h.pod };
   else u.drawer = null;
@@ -791,7 +1454,11 @@ function applyHash(h) {
 function setView(view, push = true, fromTab = false) {
   const u = S.ui;
   u.view = VIEWS.includes(view) ? view : 'fleet';
-  if (fromTab && u.drawer && (u.drawer.type === 'pod' ? u.view !== 'pods' : u.view === 'pods' || u.view === 'files')) u.drawer = null;
+  if (fromTab && u.drawer) {
+    const t = u.drawer.type;
+    const keep = t === 'pod' ? u.view === 'pods' || u.view === 'graph' : t === 'edge' ? u.view === 'graph' : !(u.view === 'pods' || u.view === 'files');
+    if (!keep) u.drawer = null;
+  }
   showView();
   writeHash(push);
   scheduleRender('all');
@@ -805,6 +1472,7 @@ function showView() {
     tab.tabIndex = v === view ? 0 : -1;
   }
   hideTip();
+  if (view !== 'graph') GV.visible = false;
 }
 function openPod(key) { S.ui.pod = key; S.ui.drawer = { type: 'pod', key }; }
 function go(spec) {
@@ -890,6 +1558,7 @@ function renderNow() {
   if (what.size === 1 && what.has('tick')) {
     refreshTimes();
     if (S.ui.view === 'timeline') renderTimeline(what);
+    if (S.ui.view === 'graph') graphTick();
     if (!byId('drawer').hidden) renderDrawer();
     return;
   }
@@ -898,6 +1567,7 @@ function renderNow() {
   switch (S.ui.view) {
     case 'fleet': renderFleet(); break;
     case 'timeline': renderTimeline(what); break;
+    case 'graph': renderGraph(what); break;
     case 'pods': renderPods(); break;
     case 'files': renderFiles(); break;
     case 'feed': renderFeed(); break;
@@ -1149,7 +1819,7 @@ function renderDrawer() {
   const el = byId('drawer'), d = S.ui.drawer;
   if (!d) { if (!el.hidden) el.hidden = true; return; }
   if (el.hidden) el.hidden = false;
-  if (d.type === 'pod') renderPodDrawer(el, d.key); else renderAgentDrawer(el, d.key);
+  if (d.type === 'pod') renderPodDrawer(el, d.key); else if (d.type === 'edge') renderEdgeDrawer(el, d); else renderAgentDrawer(el, d.key);
 }
 
 function drawerParentHtml(a, g) {
@@ -1331,6 +2001,41 @@ function renderPodDrawer(el, key) {
     <div>${(touches.length ? touches : []).slice(0, 80).map((x) => `<div class="trow" data-go="tl:${esc(x.agent)}" role="button" tabindex="0" title="打开该 agent 的时间线"><span class="tm muted">${fmtClock(x.t)}</span><span>${agentChip(x.agent, 22)} <span class="opchip">${esc(x.op || x.category || '')}</span></span><span class="pv">${esc(x.preview || '')}</span></div>`).join('') || (rec.loading ? '' : `<div class="muted">没有记录 · no touches recorded${ts.n ? '' : ''}</div>`)}</div>`);
   const kev = d.events || [];
   setHtml(byId('dr-pe'), `<h4>Kube 事件 Events <span class="muted">${kev.length}</span></h4>${d.eventsError ? `<div class="notice warn">kube 事件读取失败 · ${esc(clip(d.eventsError, 200))}</div>` : ''}${kev.length ? `<table class="grid" style="font-size:11.5px"><thead><tr><th>类型</th><th>原因</th><th>消息</th><th class="num">×</th><th>最近</th></tr></thead><tbody>${kev.slice(0, 40).map((e) => `<tr style="cursor:default"><td class="${e.type === 'Warning' ? 'ph-Pending' : ''}">${esc(e.type)}</td><td class="mono">${esc(e.reason)}</td><td style="white-space:normal;max-width:210px">${esc(clip(e.message, 160))}</td><td class="num">${e.count || 1}</td><td>${e.lastSeen ? fmtAge(now() - e.lastSeen) : ''}</td></tr>`).join('')}</tbody></table>` : `<div class="muted">${rec.loading ? '加载中…' : d.eventsError ? '' : '没有 kube 事件 · none'}</div>`}`);
+}
+
+/* ── edge drawer (interaction graph) ── */
+/** Both endpoints, the totals and every call on the edge newest first; a row opens the agent drawer at that event. */
+function renderEdgeDrawer(el, d) {
+  const e = d.edge;
+  if (!e) { if (!el.hidden) el.hidden = true; return; }
+  ensureSkeleton(el, 'edge', '<div class="dh" id="dr-head"></div><div class="db" id="dr-body"><div class="sec" id="dr-ei"></div><div class="sec" id="dr-ec"></div></div>');
+  if (el._for !== d.key) { el._for = d.key; byId('dr-body').scrollTop = 0; }
+  const ln = e.leftNode, rn = e.rightNode;
+  const left = ln && ln.a ? agentTitle(ln.a) : ln ? ln.label : e.left;
+  const right = rn ? rn.label : e.right;
+  const leftChip = ln && ln.a ? agentChip(ln.key, 30) : `<span class="chip">${esc(clip(left, 34))}</span>`;
+  const rightChip = rn && rn.kind === 'pod' && rn.meta && rn.meta.key ? podChip(rn.meta.key)
+    : rn && rn.kind === 'file' && rn.meta && rn.meta.fileKey ? fileChip(rn.meta.fileKey)
+    : `<span class="chip mono" title="${esc(right)}">${esc(clip(right, 40))}</span>`;
+  const lines = edgeLinesText(e.lines), age = e.last ? fmtAge(now() - e.last) : '–';
+  const ops = [...e.ops.entries()].sort((a, b) => b[1] - a[1]);
+  setHtml(byId('dr-head'), `<div class="l1">${ico('link')}<div class="ttl">交互 Edge</div><button type="button" class="btn icon" data-act="close-drawer" aria-label="关闭">${ico('close')}</button></div>
+    <div class="l2">${leftChip}<span class="muted">↔</span>${rightChip}</div>
+    <div class="l3"><span class="chip">${e.calls} 次调用 calls</span><span class="chip">${e.agents} agents</span>${lines ? `<span class="chip mono">${esc(lines)}</span>` : ''}${e.pending ? '<span class="chip warn">进行中 pending</span>' : ''}<span class="chip" title="${esc(e.last ? fmtDateTime(e.last) : '')}">最近 ${esc(age)} 前</span></div>
+    <div class="muted">${esc(GRAPH_WIN_LABEL[S.ui.graphWin] || S.ui.graphWin)} 窗口 · ${esc(S.ui.graphMode === 'env' ? '运行环境 Env' : '文件/仓库 Files')}</div>`);
+  setHtml(byId('dr-ei'), `<h4>汇总 Totals</h4><dl class="kv">
+    <dt>调用 calls</dt><dd class="mono">${e.calls}</dd>
+    <dt>agents</dt><dd class="mono">${e.agents}</dd>
+    <dt>操作 ops</dt><dd>${ops.map(([op, n]) => `<span class="opchip">${esc(op)}×${n}</span>`).join('') || '–'}</dd>
+    ${lines ? `<dt>行数 lines</dt><dd class="mono">${esc(lines)}</dd>` : ''}
+    <dt>最近 last</dt><dd>${esc(age)} 前${e.pending ? ' · <span class="warn">进行中 pending</span>' : ''}</dd></dl>`);
+  const recs = (e.records || []).slice();
+  setHtml(byId('dr-ec'), `<h4>调用 Calls <span class="muted">${e.calls}${recs.length < e.calls ? ` · 显示最近 ${recs.length}` : ''}</span></h4>
+    <div class="evl">${recs.slice(0, 200).map((r) => {
+      const ev = r.ev, linesTxt = edgeLinesText(r.lines);
+      const du = ev.status === 'pending' ? '…' : ev.duration != null ? fmtDur(ev.duration) : '';
+      return `<div class="erow egrow${ev.status === 'pending' ? ' pending' : ''}${ev.status === 'error' || ev.type === 'error' ? ' error' : ''}" data-gcall="${esc(r.aKey)}|${esc(ev.id)}" role="button" tabindex="0" title="打开该 agent 的事件"><span class="tm">${fmtClock(r.t)}</span>${catIcon(ev)}<span class="ag">${agentChip(r.aKey, 16)}</span><span class="nm" title="${esc(ev.preview || ev.text || '')}"><b>${esc(r.op || r.cat)}</b><span>${esc(clip(ev.preview || ev.text || '', 130))}${linesTxt ? ` <span class="muted">${esc(linesTxt)}</span>` : ''}</span></span><span class="du">${du}</span></div>`;
+    }).join('') || '<div class="muted" style="padding:6px 4px">没有记录 · no calls</div>'}</div>`);
 }
 
 /* ───────────────────────── 5d. timeline (SVG Gantt) ───────────────────────── */
@@ -1846,7 +2551,401 @@ function initTimeline() {
   });
 }
 
-/* ───────────────────────── 5e. pods view ───────────────────────── */
+/* ───────────────────────── 5e. interaction graph (SVG bipartite) ───────────────────────── */
+
+const GQ = { at: 0, loading: false, partial: [], errs: [], since: {}, coverStart: 0, fullPending: true };
+const GV = {
+  key: '', model: null, view: null, hover: '', drawAt: 0, timer: 0, raf: 0, visible: false,
+  rowH: 22, top: 8, rowsL: [], rowsR: [], shown: [],
+};
+
+const graphWindowMs = () => GRAPH_WIN_MS[S.ui.graphWin] || GRAPH_WIN_MS['30m'];
+/** A full window load is only needed when the store has no coverage yet or the window grew past it. */
+function graphNeedsFullLoad(tNow) {
+  return GQ.fullPending || !(GQ.coverStart > 0) || tNow - graphWindowMs() < GQ.coverStart - 1000;
+}
+
+/**
+ * Loads the drawn window once per target type (one `target` per request: an old hub silently matches nothing for a
+ * CSV list) plus the shell category. A full load covers the window; the 30 s refresh is incremental from the previous
+ * successful request start minus 60 s, so a slow uplink pays a few KB instead of the whole window. Items are ingested
+ * into the store, so pending tool calls turn into finished ones and the live feed keeps the model current.
+ */
+function loadGraphWindow() {
+  if (GQ.loading) return;
+  const tNow = now(), winStart = tNow - graphWindowMs(), full = graphNeedsFullLoad(tNow);
+  GQ.loading = true; GQ.partial = []; GQ.errs = [];
+  const sources = GRAPH_QUERY_TARGETS.map((label) => ({ label, filters: { target: label } }));
+  sources.push({ label: 'shell', filters: { category: 'shell' } });
+  const jobs = sources.map((s) => {
+    const since = Math.max(0, Math.floor(full ? winStart : Math.max(winStart, (GQ.since[s.label] ?? winStart) - 60000)));
+    return { label: s.label, since, p: api('query', { ...s.filters, since, limit: 3000 }) };
+  });
+  Promise.allSettled(jobs.map((j) => j.p)).then((res) => {
+    let failed = 0;
+    for (let i = 0; i < res.length; i++) {
+      const r = res[i], job = jobs[i];
+      if (r.status === 'fulfilled') {
+        const body = r.value || {}, items = body.items || [];
+        for (const it of items) if (it && it.agent && it.event) ingestEvent(it.agent, it.event);
+        GQ.since[job.label] = tNow;                      // start of this successful load; the next one overlaps 60 s
+        if (Number.isFinite(body.total) && body.total > items.length) GQ.partial.push(job.label);
+      } else { failed++; GQ.errs.push(job.label); }
+    }
+    if (full) {
+      if (!failed) { GQ.coverStart = winStart; GQ.fullPending = false; }
+      else GQ.fullPending = true;                        // retry the missing coverage on the next refresh
+    }
+  }).finally(() => {
+    GQ.loading = false; GQ.at = Date.now();
+    if (S.ui.view === 'graph') scheduleRender('graph');
+  });
+}
+function graphMaybeLoad() {
+  if (S.ui.view !== 'graph' || GQ.loading) return;
+  if (Date.now() - GQ.at > 30000) loadGraphWindow();
+}
+
+/** Events of the window from every store; the model then drops projections and mirrored ACP tool calls. */
+function graphEvents(winStart) {
+  const out = [];
+  for (const [agent, s] of S.stores) {
+    for (let i = firstAtOrAfter(s.list, winStart); i < s.list.length; i++) {
+      const e = s.list[i];
+      if (e.type !== 'tool' && e.type !== 'spawn') continue;
+      out.push({ agent, event: e });
+    }
+  }
+  return out;
+}
+/** Cached by store versions, window, mode and filters; the window slides in 30 s steps so a quiet graph still re-ages. */
+function graphGetModel() {
+  const winStart = now() - graphWindowMs();
+  const u = S.ui;
+  const key = [S.ver.events, S.ver.agents, S.ver.links, S.ver.pods, S.ver.hosts, S.ver.repos, u.graphWin, u.graphMode, u.graphLocal ? 1 : 0, u.graphRunning ? 1 : 0, u.graphQ, Math.floor(winStart / 30000)].join('|');
+  if (GV.model && GV.key === key) return GV.model;
+  GV.key = key;
+  GV.model = graphModel({
+    mode: u.graphMode, agents: S.agents, links: S.links, events: graphEvents(winStart), winStart, now: now(),
+    pods: S.pods, hosts: S.hosts, repoMap: S.repos, sources: S.sources,
+    localExec: u.graphLocal, runningOnly: u.graphRunning, q: u.graphQ,
+  });
+  return GV.model;
+}
+function graphSummaryText(view) {
+  const last = view.stats.last ? `${fmtAge(now() - view.stats.last)} 前` : '—';
+  return `${GRAPH_WIN_LABEL[S.ui.graphWin]} · ${view.stats.calls} 次交互 · ${view.stats.agents} agents · ${view.stats.resources} 资源 · 最近 ${last}`;
+}
+function graphTick() {
+  graphMaybeLoad();
+  if (GV.view) {
+    setText(byId('gv-sum'), graphSummaryText(GV.view));
+    // a recent edge cools down after 15 s: redraw at most once a second from the clock, never on every tick
+    if (performance.now() - GV.drawAt > 900) graphDraw();
+  }
+}
+function syncGraphControls() {
+  const u = S.ui;
+  for (const b of $$('#gv-mode [data-gmode]')) b.setAttribute('aria-pressed', String(b.dataset.gmode === u.graphMode));
+  for (const b of $$('#gv-wins [data-gwin]')) b.setAttribute('aria-pressed', String(b.dataset.gwin === u.graphWin));
+  const local = byId('gv-local'); if (local.checked !== u.graphLocal) local.checked = u.graphLocal;
+  const w = byId('gv-local-wrap'); if (w.hidden !== (u.graphMode !== 'env')) w.hidden = u.graphMode !== 'env';
+  const run = byId('gv-running'); if (run.checked !== u.graphRunning) run.checked = u.graphRunning;
+  const q = byId('gv-q'); if (q.value !== u.graphQ) q.value = u.graphQ;
+}
+function renderGraph(what) {
+  if (!GV.visible) { GV.visible = true; GQ.at = 0; }
+  graphMaybeLoad();
+  syncGraphControls();
+  const view = graphVisible(graphGetModel(), S.ui.graphExpL, S.ui.graphExpR);
+  GV.view = view;
+  setText(byId('gv-sum'), graphSummaryText(view));
+  const notes = [];
+  if (GQ.loading) notes.push('加载中…');
+  if (GQ.partial.length) notes.push(`部分数据（${GQ.partial.join(' / ')} 截断于 3000 条）`);
+  if (GQ.errs.length) notes.push(`查询失败（${GQ.errs.join(' / ')}）`);
+  setText(byId('gv-note'), notes.join(' · '));
+  byId('gv-note').className = GQ.partial.length || GQ.errs.length ? 'warn hint' : 'muted hint';
+  const gap = 900, el = performance.now() - GV.drawAt;
+  if (what && what.has('all')) graphDraw();
+  else if (el >= gap) graphDraw();
+  else if (!GV.timer) GV.timer = setTimeout(() => { GV.timer = 0; graphDraw(); }, gap - el);
+}
+function graphDrawSoon() { if (GV.raf) return; GV.raf = requestAnimationFrame(() => { GV.raf = 0; graphDraw(); }); }
+
+function gvText(x, y, cls, text, extra = '') { return `<text class="${cls}" x="${x.toFixed(1)}" y="${y.toFixed(1)}"${extra}>${esc(text)}</text>`; }
+function gvPill(x, y, w, h, text, cls = '') { return `<rect class="gpill ${cls}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(8, w).toFixed(1)}" height="${h}" rx="${(h / 2).toFixed(1)}"/>${gvText(x + 5, y + h - 4.2, 'gpill-t', text)}`; }
+function gvCaret(x, cy, open, side, idx) {
+  const d = `M${(x - 1.6).toFixed(1)} ${(cy - 3.4).toFixed(1)}l3.6 3.4l-3.6 3.4`;
+  return `<g class="gcaret-hit" data-gcaret="${idx}" data-gside="${side}"><rect x="${(x - 8).toFixed(1)}" y="${(cy - 9).toFixed(1)}" width="16" height="18" fill="transparent"/><path class="gcaret${open ? ' open' : ''}" d="${d}"${open ? ` transform="rotate(90 ${x.toFixed(1)} ${cy.toFixed(1)})"` : ''}/></g>`;
+}
+const GV_ICONS = { site: 'fleet', pod: 'pod', k8s: 'k8s', host: 'host', container: 'pod', repo: 'write', checkout: 'write', anchor: 'read', dir: 'read', file: 'read' };
+const GRAPH_HOST_SITES = ['mac', 'server-bochao-01', 'sg-compute'];
+const gvClamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function graphDraw() {
+  if (S.ui.view !== 'graph') return;
+  const sc = byId('gv-scroll'), svg = byId('gv-svg'), empty = byId('gv-empty'), v = GV.view;
+  if (!sc || !svg || !v) return;
+  const W = Math.max(240, sc.clientWidth), Hc = sc.clientHeight;
+  const rows = Math.max(v.leftRows.length, v.rightRows.length);
+  const has = v.leftRows.length > 0 && v.rightRows.length > 0 && v.edges.length > 0;
+  if (!has) {
+    svg.innerHTML = ''; svg.setAttribute('width', W); svg.setAttribute('height', Math.max(120, Hc)); svg.setAttribute('viewBox', `0 0 ${W} ${Math.max(120, Hc)}`);
+    empty.hidden = false;
+    empty.innerHTML = !S.loaded ? '加载中… loading' : `当前窗口内没有交互 · no interactions in this window<br><small>${S.ui.graphMode === 'env' ? '试试放宽时间窗口，或打开「本机执行」· widen the window or enable local exec' : '试试放宽时间窗口 · widen the window'}${S.ui.graphQ ? ' · 或清空过滤 · or clear the filter' : ''}</small>`;
+    setText(byId('gv-lcount'), '0 行'); setText(byId('gv-rcount'), '0 行');
+    GV.drawAt = performance.now();
+    return;
+  }
+  empty.hidden = true;
+  const sideW = Math.min(Math.round(Math.max(150, Math.min(560, W * 0.36))), Math.floor((W - 60) / 2));
+  const midW = W - sideW * 2;
+  const ROW = (GV.rowH = W < 780 ? 20 : 22), top = GV.top;
+  const H = Math.max(Hc, top + rows * ROW + 28);
+  byId('gv-wrap').style.setProperty('--gv-side', sideW + 'px');
+  setText(byId('gv-lcount'), `${v.leftRows.filter((r) => r.kind === 'node').length} 行`);
+  setText(byId('gv-rcount'), `${v.rightRows.filter((r) => r.kind === 'node').length} 行`);
+
+  const yL = new Map(), yR = new Map();
+  v.leftRows.forEach((r, i) => yL.set(r.key, top + i * ROW));
+  v.rightRows.forEach((r, i) => yR.set(r.key, top + i * ROW));
+  GV.rowsL = v.leftRows; GV.rowsR = v.rightRows;
+  let focus = GV.hover || S.ui.graphSel || '';
+  if (focus) {
+    const fs = focus[0], fk = focus.slice(2);
+    if (!v.edges.some((e) => (fs === 'L' ? e.left === fk : e.right === fk))) focus = '';
+  }
+  const focusSide = focus ? focus[0] : '', focusKey = focus ? focus.slice(2) : '';
+  const inFocus = (e) => !focus || (focusSide === 'L' ? e.left === focusKey : e.right === focusKey);
+
+  // Edge geometry with a small per-node fan so parallel edges never fully overlap.
+  const shown = v.edges.slice(0, GRAPH_MAX_EDGES).filter((e) => yL.has(e.left) && yR.has(e.right));
+  const geo = new Map();
+  for (const e of shown) geo.set(e.key, { yl: yL.get(e.left), yr: yR.get(e.right), offL: 0, offR: 0 });
+  const pushTo = (map, key, val) => { let l = map.get(key); if (!l) map.set(key, (l = [])); l.push(val); };
+  const byL = new Map(), byR = new Map();
+  for (const e of shown) { pushTo(byL, e.left, e); pushTo(byR, e.right, e); }
+  for (const [, list] of byL) { list.sort((a, b) => geo.get(a.key).yr - geo.get(b.key).yr); list.forEach((e, i) => { geo.get(e.key).offL = gvClamp((i - (list.length - 1) / 2) * 1.3, -6, 6); }); }
+  for (const [, list] of byR) { list.sort((a, b) => geo.get(a.key).yl - geo.get(b.key).yl); list.forEach((e, i) => { geo.get(e.key).offR = gvClamp((i - (list.length - 1) / 2) * 1.3, -6, 6); }); }
+  const x0 = sideW, x1 = W - sideW, dx = Math.max(26, (x1 - x0) * 0.42);
+  const pathOf = (e) => { const g = geo.get(e.key); return `M${x0} ${(g.yl + ROW / 2 + g.offL).toFixed(1)}C${(x0 + dx).toFixed(1)} ${(g.yl + ROW / 2 + g.offL).toFixed(1)},${(x1 - dx).toFixed(1)} ${(g.yr + ROW / 2 + g.offR).toFixed(1)},${x1} ${(g.yr + ROW / 2 + g.offR).toFixed(1)}`; };
+  const tNow = now();
+
+  const edgeSvg = [], hitSvg = [];
+  for (const e of shown) {
+    const g = geo.get(e.key), hot = tNow - e.last < GRAPH_EDGE_RECENT_MS, dim = !inFocus(e);
+    const w = Math.max(1, Math.min(6, 0.8 + Math.log(Math.max(1, e.calls)) * 1.15));
+    edgeSvg.push(`<path class="ge ge-${e.dominantClass}${e.pending ? ' pend' : ''}${hot ? ' hot' : ''}${dim ? ' dim' : ''}" d="${pathOf(e)}" stroke-width="${w.toFixed(2)}"/>`);
+  }
+  // Hit paths on top, biggest edge last so a crossing picks the strongest one.
+  for (let i = shown.length - 1; i >= 0; i--) hitSvg.push(`<path class="gehit" data-gei="${i}" d="${pathOf(shown[i])}" stroke-width="10"/>`);
+  GV.shown = shown;
+
+  const labelSvg = [];
+  if (midW >= 90) {
+    const items = [];
+    for (let i = 0; i < shown.length; i++) {
+      const e = shown[i];
+      if (!inFocus(e)) continue;
+      const txt = graphEdgeLabel(S.ui.graphMode, e);
+      const w = textPx(txt) + 10;
+      if (w > midW - 12) continue;
+      const g = geo.get(e.key);
+      items.push({
+        key: String(i), text: txt, w, x0, y0: g.yl + ROW / 2 + g.offL, x1, y1: g.yr + ROW / 2 + g.offR, dx,
+        calls: e.calls, rank: e.pending ? 0 : tNow - e.last < GRAPH_EDGE_RECENT_MS ? 1 : 2,
+      });
+    }
+    items.sort((a, b) => a.rank - b.rank || b.calls - a.calls || (a.key < b.key ? -1 : 1));
+    const picked = items.slice(0, GRAPH_MAX_LABELS);
+    const place = placeCurveLabels(picked, { minX: sideW + 4, maxX: W - sideW - 4, minY: top, maxY: H - 6, lineH: 13, gap: 5 });
+    for (const it of picked) {
+      const p = place.get(it.key);
+      if (!p || p.hidden) continue;
+      labelSvg.push(`<text class="glabel${focus ? ' on' : ''}" x="${p.x.toFixed(1)}" y="${(p.y + 3.6).toFixed(1)}" text-anchor="middle">${esc(it.text)}</text>`);
+    }
+  }
+
+  const rowSvg = [];
+  v.leftRows.forEach((r, i) => { const y = yL.get(r.key); if (y === undefined) return; rowSvg.push(graphAgentRowSvg(r, i, y, sideW, ROW, focus === 'L:' + (r.node && r.node.key))); });
+  v.rightRows.forEach((r, i) => { const y = yR.get(r.key); if (y === undefined) return; rowSvg.push(graphResRowSvg(r, i, y, W, sideW, ROW, focus === 'R:' + (r.node && r.node.key))); });
+
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  svg.innerHTML = `<line class="gsep" x1="${sideW}" y1="0" x2="${sideW}" y2="${H}"/><line class="gsep" x1="${W - sideW}" y1="0" x2="${W - sideW}" y2="${H}"/>
+    <g class="gedges">${edgeSvg.join('')}</g><g class="glabels">${labelSvg.join('')}</g><g class="ghits">${hitSvg.join('')}</g><g class="grows">${rowSvg.join('')}</g>`;
+  GV.drawAt = performance.now();
+}
+
+function gvCounts(n, open) {
+  const main = open ? (n.own.calls ? `${n.own.calls}×` : '') : `${n.agg.calls}×`;
+  const sum = open ? `Σ ${n.agg.calls}×` : '';
+  const mainW = main ? textPx(main) : 0, sumW = sum ? textPx(sum) : 0;
+  return { main, sum, mainW, sumW, totalW: mainW + sumW + (main && sum ? 8 : 0) };
+}
+function gvCountSvg(c, cy, right) {
+  const out = [];
+  if (c.sum) out.push(gvText(right, cy + 3.6, 'gdim', c.sum, ' text-anchor="end"'));
+  if (c.main) out.push(gvText(right - c.sumW - (c.sumW && c.mainW ? 8 : 0), cy + 3.6, 'gcount', c.main, ' text-anchor="end"'));
+  return out.join('');
+}
+
+function graphAgentRowSvg(row, idx, y, sideW, ROW, selected) {
+  if (row.kind === 'more') return `<g class="gmore"><rect class="rowbg" x="0" y="${y}" width="${sideW}" height="${ROW}"/><text class="gdim" x="${(24 + Math.min(row.depth, 8) * 12).toFixed(1)}" y="${(y + ROW / 2 + 3.5).toFixed(1)}">… 还有 ${row.more} 个 · +${row.more} more</text></g>`;
+  const n = row.node, a = n.a, cy = y + ROW / 2, indent = Math.min(row.depth, 8) * 12;
+  const title = agentTitle(a), host = shortHost(a.host || ''), tag = n.tag || '';
+  const c = gvCounts(n, row.open), desc = !row.open && n.desc ? `${n.desc} 后代` : '';
+  const right = sideW - 8, xTitle = 47 + indent, descW = desc ? textPx(desc) + 8 : 0;
+  let hostW = textPx(host) + 10, tagW = tag ? textPx(tag) + 5 : 0;
+  let titleMax = right - c.totalW - 6 - descW - hostW - tagW - 10 - xTitle;
+  if (titleMax < 54) { hostW = 0; tagW = 0; titleMax = right - c.totalW - 6 - descW - xTitle - 7; }
+  const shownTitle = clipPx(title, Math.max(30, titleMax));
+  const out = [
+    `<g class="gnode${selected ? ' gsel' : ''}" data-nk="L:${idx}"><title>${esc(`${title} · ${host} · ${a.status}${n.desc ? ` · ${n.desc} 后代` : ''}`)}</title>`,
+    `<rect class="rowbg" x="0" y="${y}" width="${sideW}" height="${ROW}"/>`,
+  ];
+  if (row.hasKids) out.push(gvCaret(12 + indent, cy, row.open, 'L', idx));
+  out.push(`<rect class="gkb k-${esc(a.kind)}" x="${(21 + indent).toFixed(1)}" y="${(cy - 6.5).toFixed(1)}" width="13" height="13" rx="2"/>`);
+  out.push(`<text class="gkbt" x="${(27.5 + indent).toFixed(1)}" y="${(cy + 3.2).toFixed(1)}" text-anchor="middle">${KIND_LETTER[a.kind] || '?'}</text>`);
+  out.push(`<circle class="sdot s-${esc(a.status || 'unknown')}" cx="${(40 + indent).toFixed(1)}" cy="${cy.toFixed(1)}" r="3.2"/>`);
+  out.push(gvText(xTitle, cy + 3.6, 'gtitle', shownTitle));
+  let x = xTitle + textPx(shownTitle) + 7;
+  if (hostW) { out.push(gvPill(x, cy - 6.5, hostW, 13, host, 'ghost')); x += hostW + 5; }
+  if (tagW) out.push(gvText(x, cy + 3.4, 'gtag', tag));
+  out.push(gvCountSvg(c, cy, right));
+  if (desc) out.push(gvText(right - c.totalW - 6, cy + 3.6, 'gdim', desc, ' text-anchor="end"'));
+  out.push('</g>');
+  return out.join('');
+}
+
+function graphResRowSvg(row, idx, y, W, sideW, ROW, selected) {
+  const x0 = W - sideW;
+  if (row.kind === 'more') return `<g class="gmore"><rect class="rowbg" x="${x0}" y="${y}" width="${sideW}" height="${ROW}"/><text class="gdim" x="${(x0 + 24 + Math.min(row.depth, 8) * 12).toFixed(1)}" y="${(y + ROW / 2 + 3.5).toFixed(1)}">… 还有 ${row.more} 个 · +${row.more} more</text></g>`;
+  const n = row.node, cy = y + ROW / 2, indent = Math.min(row.depth, 8) * 12, right = W - 8;
+  const c = gvCounts(n, row.open);
+  let sub = '', subCls = 'gdim';
+  if (n.kind === 'pod') sub = `● ${n.podActive || 0}/${n.podAgents || 0}`;
+  else if (n.kind === 'site') {
+    const site = n.meta.site;
+    if (site === GRAPH_EXTERNAL) sub = '';
+    else if (GRAPH_HOST_SITES.includes(site)) {
+      const h = S.hosts.get(site), st = h ? h.status : 'unknown';
+      sub = `${st === 'online' ? '●' : '○'} ${st}`;
+      subCls = st === 'online' ? 'gonline' : st === 'offline' || st === 'error' ? 'gbad' : 'gdim';
+    } else {
+      const k = n.meta.kube, parts = [];
+      if (k) parts.push(`kube ${k.status === 'online' ? '✓' : '✗'}`);
+      parts.push(`${n.podCount || 0} pod${n.podCount === 1 ? '' : 's'}`);
+      sub = parts.join(' · ');
+    }
+  } else if (n.kind === 'repo') sub = n.meta.hosts && n.meta.hosts.length === 1 ? shortHost(n.meta.hosts[0]) : `${(n.meta.hosts || []).length} hosts`;
+  const subW = sub ? textPx(sub) + 8 : 0;
+  let labelMax = right - c.totalW - 6 - subW - (x0 + 41 + indent) - 6;
+  if (labelMax < 40) labelMax = right - c.totalW - 6 - (x0 + 41 + indent) - 6;
+  const icon = GV_ICONS[n.kind] || 'other';
+  const label = n.kind === 'pod' ? `${n.meta.ns && n.meta.ns !== NAMESPACE ? n.meta.ns + '/' : ''}${n.meta.name}` : n.label;
+  const title = n.kind === 'pod' ? `${n.label} · ${n.meta.phase || '?'} · 最近 1 分钟 ${n.podActive || 0} 个 agent 在交互 / 窗口内共 ${n.podAgents || 0} 个 · ${n.podActive || 0} active in the last minute of ${n.podAgents || 0} agents` : n.label;
+  const out = [
+    `<g class="gnode${selected ? ' gsel' : ''}" data-nk="R:${idx}"><title>${esc(title)}</title>`,
+    `<rect class="rowbg" x="${x0}" y="${y}" width="${sideW}" height="${ROW}"/>`,
+  ];
+  if (row.hasKids) out.push(gvCaret(x0 + 12 + indent, cy, row.open, 'R', idx));
+  out.push(`<use href="#i-${icon}" class="gico" x="${(x0 + 20 + indent).toFixed(1)}" y="${(cy - 6.5).toFixed(1)}" width="13" height="13"/>`);
+  if (n.kind === 'pod') out.push(`<circle class="gphase ph-${esc(n.meta.phase || 'Unknown')}" cx="${(x0 + 39 + indent).toFixed(1)}" cy="${cy.toFixed(1)}" r="3"/>`);
+  out.push(gvText(x0 + 45 + indent, cy + 3.6, 'gtitle', clipPx(label, Math.max(28, labelMax))));
+  if (sub && labelMax >= 40) out.push(gvText(right - c.totalW - 6, cy + 3.6, subCls, sub, ' text-anchor="end"'));
+  out.push(gvCountSvg(c, cy, right));
+  out.push('</g>');
+  return out.join('');
+}
+
+/** Caret/row clicks. A pod opens the existing pod drawer without leaving the graph; a file opens the Files view. */
+function toggleGraphRow(side, idx) {
+  const row = (side === 'L' ? GV.rowsL : GV.rowsR)[idx];
+  if (!row || row.kind !== 'node' || !row.node || !row.node.kids.length) return;
+  const set = side === 'L' ? S.ui.graphExpL : S.ui.graphExpR;
+  if (set.has(row.node.key)) set.delete(row.node.key); else set.add(row.node.key);
+  scheduleRender('graph');
+}
+function graphNodeClick(side, node) {
+  S.ui.graphSel = side + ':' + node.key;
+  hideTip();
+  if (side === 'L') { openAgent(node.key); scheduleRender('all'); return; }
+  if (node.kind === 'pod' && node.meta && node.meta.key) { openPod(node.meta.key); scheduleRender('all'); return; }
+  if (node.kind === 'file' && node.meta && node.meta.fileKey) { go('file:' + node.meta.fileKey); return; }
+  const set = S.ui.graphExpR;
+  if (node.kids.length) { if (set.has(node.key)) set.delete(node.key); else set.add(node.key); }
+  scheduleRender('graph');
+}
+function openEdge(edge) {
+  S.ui.drawer = { type: 'edge', key: edge.key, edge };
+  scheduleRender('all');
+}
+function graphExpandAll(side, open) {
+  const set = side === 'L' ? S.ui.graphExpL : S.ui.graphExpR;
+  set.clear();
+  if (open) {
+    const model = GV.model || graphGetModel();
+    const byKey = side === 'L' ? model.left.byKey : model.right.byKey;
+    for (const n of byKey.values()) if (n.kids.length) set.add(n.key);
+  }
+  scheduleRender('graph');
+}
+
+function initGraph() {
+  const svg = byId('gv-svg'), sc = byId('gv-scroll');
+  new ResizeObserver(() => { if (S.ui.view === 'graph') graphDrawSoon(); }).observe(sc);
+  svg.addEventListener('pointermove', (ev) => {
+    const rowEl = ev.target.closest && ev.target.closest('[data-nk]');
+    let hover = '';
+    if (rowEl) {
+      const [side, idx] = rowEl.dataset.nk.split(':');
+      const row = (side === 'L' ? GV.rowsL : GV.rowsR)[Number(idx)];
+      if (row && row.kind === 'node' && row.node) hover = side + ':' + row.node.key;
+    }
+    if (hover !== GV.hover) { GV.hover = hover; graphDrawSoon(); }
+    const hit = ev.target.closest && ev.target.closest('[data-gei]');
+    if (hit) {
+      const e = GV.shown[Number(hit.dataset.gei)];
+      if (e) showTip(graphEdgeTipHtml(S.ui.graphMode, e, now()), ev.clientX, ev.clientY); else hideTip();
+    } else hideTip();
+  });
+  svg.addEventListener('pointerleave', () => { if (GV.hover) { GV.hover = ''; graphDrawSoon(); } hideTip(); });
+  svg.addEventListener('click', (ev) => {
+    const caret = ev.target.closest && ev.target.closest('[data-gcaret]');
+    if (caret) { toggleGraphRow(caret.dataset.gside, Number(caret.dataset.gcaret)); return; }
+    const hit = ev.target.closest && ev.target.closest('[data-gei]');
+    if (hit) { const e = GV.shown[Number(hit.dataset.gei)]; if (e) openEdge(e); return; }
+    const rowEl = ev.target.closest && ev.target.closest('[data-nk]');
+    if (!rowEl) return;
+    const [side, idx] = rowEl.dataset.nk.split(':');
+    const row = (side === 'L' ? GV.rowsL : GV.rowsR)[Number(idx)];
+    if (row && row.kind === 'node' && row.node) graphNodeClick(side, row.node);
+  });
+  byId('gv-mode').addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-gmode]');
+    if (!b || b.dataset.gmode === S.ui.graphMode) return;
+    S.ui.graphMode = b.dataset.gmode; S.ui.graphSel = '';
+    writeHash(false); scheduleRender('all');
+  });
+  byId('gv-wins').addEventListener('click', (ev) => {
+    const b = ev.target.closest('[data-gwin]');
+    if (!b || b.dataset.gwin === S.ui.graphWin) return;
+    S.ui.graphWin = b.dataset.gwin; GQ.at = 0;
+    writeHash(false); scheduleRender('all');
+  });
+  byId('gv-local').addEventListener('change', (ev) => { S.ui.graphLocal = ev.target.checked; scheduleRender('graph'); });
+  byId('gv-running').addEventListener('change', (ev) => { S.ui.graphRunning = ev.target.checked; scheduleRender('graph'); });
+  byId('gv-q').addEventListener('input', (ev) => { S.ui.graphQ = ev.target.value; scheduleRender('graph'); });
+  byId('gv-expand-l').addEventListener('click', () => graphExpandAll('L', true));
+  byId('gv-collapse-l').addEventListener('click', () => graphExpandAll('L', false));
+  byId('gv-expand-r').addEventListener('click', () => graphExpandAll('R', true));
+  byId('gv-collapse-r').addEventListener('click', () => graphExpandAll('R', false));
+}
+
+/* ───────────────────────── 5f. pods view ───────────────────────── */
 
 const touchIdx = { pod: { at: 0, loading: false, error: '' }, file: { at: 0, loading: false, error: '' } };
 /** Pulls the fleet-wide tool-call index for pod / file targets so the tables are complete, not just what the feed carried. */
@@ -1934,6 +3033,15 @@ function fileRows() {
   fileAggVer = S.ver.touch;
   return fileAgg;
 }
+/** Read / added / removed column of the Files table. */
+function linesCellHtml(l) {
+  if (!l || (!l.read && !l.added && !l.removed)) return '<span class="muted">–</span>';
+  const p = [];
+  if (l.read) p.push(`<span class="lr" title="读取的行数 lines read">r${fmtNum(l.read)}</span>`);
+  if (l.added) p.push(`<span class="la" title="新增的行数 lines added">+${fmtNum(l.added)}</span>`);
+  if (l.removed) p.push(`<span class="ld" title="删除的行数 lines removed">−${fmtNum(l.removed)}</span>`);
+  return p.join(' ');
+}
 function renderFiles() {
   loadTouchIndex('file');
   const u = S.ui, rows = fileRows(), t = now();
@@ -1956,11 +3064,13 @@ function renderFiles() {
   reconcile(byId('files-body'), shown.map((r) => {
     const ts = r.ts, sel = u.file === r.key, last = fmtAge(t - ts.last);
     return {
-      key: r.key, tag: 'tr', cls: sel ? 'sel' : '', sig: [ts.n, ts.r, ts.w, ts.e, ts.last, ts.agents.size, sel ? 1 : 0, S.ver.agents].join('|'), attrs: { 'data-file': r.key, tabindex: '0' },
+      key: r.key, tag: 'tr', cls: sel ? 'sel' : '', sig: [ts.n, ts.r, ts.w, ts.e, ts.lines.read, ts.lines.added, ts.lines.removed, ts.last, ts.agents.size, sel ? 1 : 0, S.ver.agents].join('|'), attrs: { 'data-file': r.key, tabindex: '0' },
       html: () => {
         const ag = [...ts.agents].sort((x, y) => y[1].last - x[1].last);
         return `<td><span class="path" title="${esc(r.path)}"><span class="dir">${esc(dirName(r.path))}</span><span class="base">${esc(baseName(r.path))}</span></span></td><td class="mono">${esc(shortHost(r.host))}</td>
-          <td class="num r${ts.r ? '' : ' zero'}">${ts.r}</td><td class="num w${ts.w ? '' : ' zero'}">${ts.w}</td><td class="num e${ts.e ? '' : ' zero'}">${ts.e}</td><td data-live="age" data-t="${ts.last || 0}" title="${esc(fmtDateTime(ts.last))}">${last}</td>
+          <td class="num r${ts.r ? '' : ' zero'}">${ts.r}</td><td class="num w${ts.w ? '' : ' zero'}">${ts.w}</td><td class="num e${ts.e ? '' : ' zero'}">${ts.e}</td>
+          <td class="num lines">${linesCellHtml(ts.lines)}</td>
+          <td data-live="age" data-t="${ts.last || 0}" title="${esc(fmtDateTime(ts.last))}">${last}</td>
           <td class="wrapchips">${ag.slice(0, 3).map(([k]) => agentChip(k, 16)).join('')}${ag.length > 3 ? `<span class="chip">+${ag.length - 3}</span>` : ''}</td>`;
       },
     };
@@ -2162,6 +3272,8 @@ function initEvents() {
     if (file) { S.ui.file = file.dataset.file; S.ui.fileEvent = ''; writeHash(true); scheduleRender('all'); return; }
     const fev = t.closest('[data-fev]');
     if (fev) { S.ui.fileEvent = S.ui.fileEvent === fev.dataset.fev ? '' : fev.dataset.fev; scheduleRender('file'); return; }
+    const gcall = t.closest('[data-gcall]');
+    if (gcall) { const id = gcall.dataset.gcall, i = id.indexOf('|'); if (i > 0) openAgent(id.slice(0, i), { ev: id.slice(i + 1) }); return; }
     const feed = t.closest('.frow[data-feed]');
     if (feed) { const id = feed.dataset.feed, i = id.indexOf('|'); openAgent(id.slice(0, i), { ev: id.slice(i + 1) }); return; }
     const er = t.closest('.erow[data-ev]');
@@ -2250,10 +3362,10 @@ async function boot() {
   const h = parseHash(location.hash);
   S.token = '';                                             // memory only: never sessionStorage/localStorage
   const qs = new URLSearchParams(location.search);
-  initTimeline(); initEvents();
+  initTimeline(); initGraph(); initEvents();
   if (qs.get('demo')) {
     try { S.demo = await createDemo(qs); } catch (e) { S.conn = { state: 'down', error: 'demo fixture: ' + e.message, retryAt: Date.now() + 1e9 }; }
-    window.__fleet = { S, TL, demo: S.demo, draw: tlDraw };       // review / test hook, only present in ?demo=1
+    window.__fleet = { S, TL, demo: S.demo, draw: tlDraw, graph: { draw: graphDraw, render: () => renderGraph(new Set(['all'])), openEdge, openPod, model: () => GV.model, view: () => GV.view, state: GQ } };       // review / test hook, only present in ?demo=1
   }
   applyHash(h);
   const credential = Boolean(h.token || h.nonce);
@@ -2287,6 +3399,7 @@ async function createDemo(qs) {
     cursor: fx.snapshot.cursor, hub: fx.snapshot.hub,
     agents: new Map(fx.snapshot.agents.map((a) => [a.key, a])), hosts: new Map(fx.snapshot.hosts.map((h) => [h.id, h])),
     links: fx.snapshot.links, pods: new Map(fx.snapshot.pods.map((p) => [p.key, p])), events: fx.events, files: fx.files, podEvents: fx.podEvents,
+    repos: fx.snapshot.repos || {},
     pending: new Map(), kids: [], subs: new Set(), seq: 0, step: 0,
   };
   const speed = Math.max(0.2, Number(qs.get('speed')) || 1);
@@ -2311,7 +3424,7 @@ async function createDemo(qs) {
   const touchedPod = (e, key) => (e.targets || []).some((t) => t.type === 'pod' && podKeyOfTarget(t) === key);
 
   const impl = {
-    snapshot: () => ({ cursor: st.cursor, now: Date.now(), hub: st.hub, hosts: [...st.hosts.values()], agents: [...st.agents.values()], links: st.links, pods: [...st.pods.values()], feed: feedNow(), sources: { chengdu: { status: 'online' }, weihai: { status: 'online' }, iron: { status: 'online' }, os: { status: 'online' } } }),
+    snapshot: () => ({ cursor: st.cursor, now: Date.now(), hub: st.hub, hosts: [...st.hosts.values()], agents: [...st.agents.values()], links: st.links, pods: [...st.pods.values()], repos: st.repos, feed: feedNow(), sources: { chengdu: { status: 'online' }, weihai: { status: 'online' }, iron: { status: 'online' }, os: { status: 'online' } } }),
     changes: () => ({ cursor: st.cursor, now: Date.now() }),
     hosts: () => ({ hosts: [...st.hosts.values()] }),
     pods: () => ({ pods: [...st.pods.values()] }),
@@ -2375,8 +3488,18 @@ async function createDemo(qs) {
     const e = { id: `toolu_sim${++st.seq}`, type: 'tool', t: Date.now(), status: 'pending', name, category };
     if (tg === 'file') {
       const paths = filesByHost.get(a.host) || [...filesByHost.values()][0] || ['/tmp/demo.txt'], path = pick(paths), op = category === 'edit' ? 'edit' : category === 'search' ? 'search' : 'read';
-      e.targets = [{ type: 'file', op, host: a.host, path }];
-      e.preview = category === 'edit' ? `edit ${path} (+${Math.round(rnd(2, 40))} −${Math.round(rnd(0, 12))})` : category === 'search' ? `grep -rn "${pick(['TODO', 'cursor', 'pending', 'snapshot'])}" ${dirName(path)}` : `read ${path}`;
+      if (op === 'edit') {
+        const added = Math.round(rnd(2, 40)), removed = Math.round(rnd(0, 12));
+        e.targets = [{ type: 'file', op, host: a.host, path, lines: { added, removed } }];
+        e.preview = `edit ${path} (+${added} −${removed})`;
+      } else if (op === 'read') {
+        const read = Math.round(rnd(40, 320));
+        e.targets = [{ type: 'file', op, host: a.host, path, lines: { read } }];
+        e.preview = `read ${path}`;
+      } else {
+        e.targets = [{ type: 'file', op, host: a.host, path }];
+        e.preview = `grep -rn "${pick(['TODO', 'cursor', 'pending', 'snapshot'])}" ${dirName(path)}`;
+      }
     } else if (tg === 'pod' && podTargets.length) {
       const p = pick(podTargets), op = pick(['logs', 'get', 'exec', 'describe']);
       e.targets = [{ ...p, op }];

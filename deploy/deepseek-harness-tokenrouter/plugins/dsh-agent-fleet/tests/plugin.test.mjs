@@ -536,6 +536,24 @@ describe("agent_fleet tool", () => {
     const forAgent = await callTool(t, { action: "files", key: OMP_KEY, text: "f2" });
     assert.deepEqual(forAgent.data.files.map(file => file.path), ["/work/demo/f2.txt"]);
     assert.deepEqual(forAgent.data.files[0].ops, { read: 9 }, "9 of the 60 events (n % 7 === 2) read f2.txt");
+    assert.equal(forAgent.data.files[0].lines, undefined, "no call reported line counts: no lines field");
+  });
+
+  test("files sums the line counts the calls reported, per field", async () => {
+    const fleet = makeFleet();
+    const file = (op, lines) => [{ type: "file", op, host: "mac", path: "/work/demo/lines.txt", ...(lines && { lines }) }];
+    const events = [
+      toolEvent(5, { targets: file("read", { read: 120 }) }),
+      toolEvent(4, { targets: file("read") }),                          // an older collector: no count
+      toolEvent(3, { targets: file("edit", { added: 7, removed: 2 }) }),
+      toolEvent(2, { targets: file("edit", { added: 3 }) }),            // removed unknown for this call
+      toolEvent(1, { targets: file("read", { read: 30 }) }),
+    ];
+    const t = tool(hubHandlers(fleet, { agent: ({ key }) => ({ key, events, hasMore: false }) }));
+    const row = (await callTool(t, { action: "files", key: OMP_KEY })).data.files[0];
+    assert.equal(row.path, "/work/demo/lines.txt");
+    assert.deepEqual(row.ops, { read: 3, edit: 2 });
+    assert.deepEqual(row.lines, { read: 150, added: 10, removed: 2 });
   });
 
   test("file previews page through long content and report refusals", async () => {

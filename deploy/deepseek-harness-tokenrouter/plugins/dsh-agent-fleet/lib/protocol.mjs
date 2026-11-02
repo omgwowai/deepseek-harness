@@ -90,7 +90,7 @@ export const C2H = Object.freeze(["hello", "agent", "events", "gone", "procs", "
 /** Hub → collector message types. */
 export const H2C = Object.freeze(["request", "reply"]);
 /** Requests a hub may send to a collector. */
-export const COLLECTOR_METHODS = Object.freeze(["file.read", "agent.events", "ping"]);
+export const COLLECTOR_METHODS = Object.freeze(["file.read", "repo.resolve", "agent.events", "ping"]);
 /** Requests the hub API answers (HTTP GET api/<method>, or hub.api.request in-process). */
 export const HUB_METHODS = Object.freeze(["snapshot", "changes", "family", "agent", "pods", "pod", "file", "query", "hosts", "health"]);
 
@@ -182,6 +182,8 @@ export const LIMITS = Object.freeze({
  * @property {AgentKind} [kind]   agent: launched agent kind
  * @property {string} [pod]       agent: pod name when launched inside a pod
  * @property {"acp"|"cli"} [transport]
+ * @property {{read?:number,added?:number,removed?:number}} [lines]  file: lines the call read / added / removed
+ *           (Contract A); each field is absent when the call could not tell, never negative
  *
  * @typedef {object} AgentEvent  One timeline item. Upserted by `id` within its agent.
  * @property {string} id          tool call id for tools; otherwise "<type>:<n>" stable for the transcript position
@@ -275,6 +277,13 @@ export const LIMITS = Object.freeze({
  * @property {string} [op]
  * @property {string} [category]
  *
+ * @typedef {object} Repo  A git work tree that file targets of a host live in (collector method `repo.resolve`).
+ * @property {string} root        absolute path of the work tree
+ * @property {string} [remote]    origin (else first remote) as `host/path`: no scheme, no credentials, no `.git` suffix
+ * @property {string} [branch]    current branch, from HEAD `ref: refs/heads/<branch>`
+ * @property {string} [head]      first 12 hex chars of the commit when HEAD is detached
+ * @property {boolean} [worktree] true when `.git` is a file (linked worktree or submodule)
+ *
  * @typedef {object} Snapshot
  * @property {number} cursor
  * @property {number} now
@@ -283,6 +292,7 @@ export const LIMITS = Object.freeze({
  * @property {AgentRecord[]} agents
  * @property {Link[]} links
  * @property {Pod[]} pods       pods touched by agents or hosting a collector
+ * @property {Object<string, Repo[]>} repos  repos per host id that the hub resolved (absent host = not resolved)
  * @property {{agent:string,event:AgentEvent}[]} feed  latest events across the fleet, newest last
  *
  * @typedef {object} Delta
@@ -295,6 +305,7 @@ export const LIMITS = Object.freeze({
  * @property {Link[]} [links]    full replacement of the link set when present
  * @property {Pod[]} [pods]
  * @property {string[]} [podsRemoved]
+ * @property {Object<string, Repo[]>} [repos]  full replacement of the repo list of each changed host (`[]` = none)
  * @property {{agent:string,event:AgentEvent}[]} [feed]
  */
 

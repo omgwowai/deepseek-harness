@@ -9,6 +9,7 @@
 // Ownership: a host belongs to `local` (a collector connected to this hub) or to the upstream hub that reported it;
 // local always wins, so the Mac's embedded hub never lets the server's copy of the Mac override its own.
 import { KUBE_CONTEXTS, LIMITS, NAMESPACE, SITES, AGENT_KINDS, parseAgentKey, parsePodHostId } from "../protocol.mjs";
+import { redactText } from "../redact.mjs";
 import { createEventStore } from "./events.mjs";
 import { createLinks } from "./links.mjs";
 
@@ -29,8 +30,45 @@ const MAX_PROCS_PER_HOST = 2000;
 const MAX_AGENT_KEY_CHARS = 1024;
 const MAX_EVENT_ID_CHARS = 512;
 const MAX_EVENT_TYPE_CHARS = 32;
+// repo.resolve answers are untrusted too: one collector can name thousands of roots and paste a token into a remote.
+const MAX_REPOS_PER_HOST = 500;
+const MAX_LINE_COUNT = 10_000_000;
+const LINE_FIELDS = Object.freeze(["read", "added", "removed"]);
 
 const clip = (value, max) => (typeof value === "string" && value.length > max ? value.slice(0, max) : value);
+
+/** Contract A: only {read, added, removed}, each a finite integer 0 ≤ n ≤ 10 000 000; other keys and values go. */
+function clampLines(lines) {
+  if (lines === null || typeof lines !== "object" || Array.isArray(lines)) return undefined;
+  const kept = {};
+  for (const field of LINE_FIELDS) {
+    const value = lines[field];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) continue;
+    kept[field] = Math.min(MAX_LINE_COUNT, Math.floor(value));
+  }
+  return Object.keys(kept).length > 0 ? kept : undefined;
+}
+
+/**
+ * The repo fields clients see (Contract B): an absolute root, an optional `host/path` remote without credentials,
+ * a bounded branch and a 12-hex head. Returns null when the record has no usable root, which is also what an
+ * untrusted collector gets for a malformed answer.
+ * @param {unknown} repo
+ * @returns {import("../protocol.mjs").Repo|null}
+ */
+export function sanitizeRepo(repo) {
+  if (repo === null || typeof repo !== "object" || Array.isArray(repo)) return null;
+  if (typeof repo.root !== "string" || !repo.root.startsWith("/") || repo.root.length > LIMITS.pathChars) return null;
+  const out = { root: repo.root };
+  if (typeof repo.remote === "string" && repo.remote !== "") {
+    const remote = redactText(clip(repo.remote, LIMITS.textChars), LIMITS.textChars);
+    if (remote !== "") out.remote = remote;
+  }
+  if (typeof repo.branch === "string" && repo.branch !== "") out.branch = clip(repo.branch, LIMITS.textChars);
+  if (typeof repo.head === "string" && /^[0-9a-f]{7,40}$/i.test(repo.head)) out.head = repo.head.slice(0, 12).toLowerCase();
+  if (repo.worktree === true) out.worktree = true;
+  return out;
+}
 
 /** Bound the agent fields the panel and the link index read; paths get LIMITS.pathChars, not the text width. */
 function clampAgent(record) {
@@ -71,6 +109,9 @@ function clampEvent(event) {
     target.path = clip(target.path, LIMITS.pathChars);
     target.url = clip(target.url, LIMITS.textChars);
     for (const field of ["name", "host", "pod", "namespace", "container", "resource", "cluster", "site"]) target[field] = clip(target[field], LIMITS.textChars);
+    const lines = clampLines(target.lines);
+    if (lines === undefined) delete target.lines;
+    else target.lines = lines;
   }
   return event;
 }
@@ -147,6 +188,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
   const agentJson = new Map();       // key → JSON of the stored record (change detection)
   const hostAgents = new Map();      // host id → Set<agent key>
   const procs = new Map();           // host id → Proc[]
+  const repos = new Map();           // host id → Repo[] (sanitised; [] means "resolved, no repository")
   const store = createEventStore({ perAgent: eventsPerAgent, feedItems });
   const links = createLinks({ agents, hostAgents, procs });
   const kubePods = new Map();        // pod key → Pod (this hub's kube source; the whole active set)
@@ -158,6 +200,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
   const lookupQueue = [];
   const listeners = new Set();
   const sinks = new Map();
+  let fileTargetObserver = null;     // repo tracker hook: called for every stored event that carries targets
   let podLookup = null;
   let lookupActive = 0;
   let connectionSeq = 0;
@@ -220,7 +263,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
 
   function buildDelta(since) {
     const delta = { cursor, now: now() };
-    const hostIds = new Set(), agentKeys = new Set(), podKeys = new Set(), siteNames = new Set(), feedEntries = new Set();
+    const hostIds = new Set(), agentKeys = new Set(), podKeys = new Set(), siteNames = new Set(), repoHostIds = new Set(), feedEntries = new Set();
     let linksChanged = false;
     for (let i = firstIndexAfter(since); i < journal.length; i += 1) {
       const entry = journal[i];
@@ -228,6 +271,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
         case "host": hostIds.add(entry.key); break;
         case "agent": case "removed": agentKeys.add(entry.key); break;
         case "pod": podKeys.add(entry.key); break;
+        case "repos": repoHostIds.add(entry.key); break;
         case "source": siteNames.add(entry.key); break;
         case "links": linksChanged = true; break;
         case "feed": for (const item of entry.entries) feedEntries.add(item); break;
@@ -245,6 +289,10 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
     for (const key of podKeys) { const pod = exposedPod(key); if (pod !== undefined) podList.push(pod); else podsRemoved.push(key); }
     if (podList.length > 0) delta.pods = podList;
     if (podsRemoved.length > 0) delta.podsRemoved = podsRemoved;
+    if (repoHostIds.size > 0) {
+      delta.repos = {};
+      for (const id of repoHostIds) delta.repos[id] = repos.get(id) ?? [];    // full replacement per host; [] = none
+    }
     if (siteNames.size > 0) {
       const view = sourcesView();
       delta.sources = Object.fromEntries([...siteNames].filter(site => view[site] !== undefined).map(site => [site, view[site]]));
@@ -349,6 +397,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
     const h = hosts.get(id);
     if (h === undefined || h.origin !== LOCAL || h.connection !== null || h.connectedAt !== undefined || (hostAgents.get(id)?.size ?? 0) > 0) return false;
     hosts.delete(id); hostAgents.delete(id); procs.delete(id);
+    if (repos.delete(id)) bump("repos", id);
     bump("host", id);
     return true;
   }
@@ -382,6 +431,32 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
     return true;
   }
 
+  // ------------------------------------------------------------------------------------------------- repos
+  /**
+   * Replace the repo list of one host (Contract B). Records are sanitised here, deduplicated by root and capped, so
+   * neither a collector nor an upstream hub can grow this map or smuggle a credential into a remote. No-op when the
+   * list did not change: the tracker republishes the same roots on every refresh.
+   * @param {string} id host id
+   * @param {unknown} list
+   * @returns {boolean} true when the stored list changed (and a Delta was journalled)
+   */
+  function setRepos(id, list) {
+    const next = [];
+    const seen = new Set();
+    for (const entry of (Array.isArray(list) ? list : []).slice(0, MAX_REPOS_PER_HOST)) {
+      const repo = sanitizeRepo(entry);
+      if (repo === null || seen.has(repo.root)) continue;
+      seen.add(repo.root);
+      next.push(repo);
+    }
+    next.sort((a, b) => (a.root < b.root ? -1 : a.root > b.root ? 1 : 0));
+    const prev = repos.get(id);
+    if (prev !== undefined && json(prev) === json(next)) return false;
+    repos.set(id, next);
+    bump("repos", id);
+    return true;
+  }
+
   function applyEvents(agentKey, events) {
     const entries = [];
     let changed = false;
@@ -391,6 +466,10 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
       if (!result.changed) continue;
       changed = true;
       links.eventSeen(agentKey, result.event);
+      if (fileTargetObserver !== null && Array.isArray(result.event.targets)) {
+        // The tracker only queues directory names here; it never awaits anything, so ingest stays synchronous.
+        try { fileTargetObserver(agentKey, result.event); } catch { /* a tracker bug must not break ingest */ }
+      }
       for (const key of result.newPods) podFirstTouched(key);
       if (result.feedEntry) entries.push(result.feedEntry);
     }
@@ -654,6 +733,15 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
       for (const [site, source] of Object.entries(map ?? {})) setSource(site, { ...source, at: shifted(source.at) }, name);
     }
 
+    /** Repos of a host this upstream owns; a host this hub collects itself keeps its own answer. */
+    function mergeRepos(map) {
+      if (map === null || typeof map !== "object" || Array.isArray(map)) return;
+      for (const [id, list] of Object.entries(map)) {
+        if (hosts.get(id)?.origin !== name) continue;
+        setRepos(id, Array.isArray(list) ? list : []);
+      }
+    }
+
     const sink = {
       name,
       get skewMs() { return skew.value; },
@@ -679,6 +767,11 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
           for (const key of [...(hostAgents.get(h.id) ?? [])]) if (!seenAgents.has(key)) removeAgent(key);
         }
         for (const [key, entry] of [...upstreamPods]) if (entry.origin === name && !seenPods.has(key)) { upstreamPods.delete(key); bump("pod", key); }
+        if (snapshot.repos !== undefined) {
+          // Replace for all hosts this upstream owns: a host that sent no list has no repo ([]), like its agent set.
+          const given = snapshot.repos !== null && typeof snapshot.repos === "object" && !Array.isArray(snapshot.repos) ? snapshot.repos : {};
+          for (const h of hosts.values()) if (h.origin === name) setRepos(h.id, Array.isArray(given[h.id]) ? given[h.id] : []);
+        }
         links.setExternal(name, snapshot.links ?? []);
         mergeFeed(snapshot.feed);
       },
@@ -694,6 +787,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
         for (const pod of delta.pods ?? []) mergePod(pod);
         for (const key of delta.podsRemoved ?? []) if (upstreamPods.get(key)?.origin === name) { upstreamPods.delete(key); bump("pod", key); }
         mergeSources(delta.sources);
+        mergeRepos(delta.repos);
         if (delta.links) links.setExternal(name, delta.links);
         mergeFeed(delta.feed);
         return returned ? "reset" : "ok";
@@ -736,6 +830,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
       agents: [...agents.values()],
       links: links.all(),
       pods: podList(),
+      repos: Object.fromEntries(repos),
       feed: store.feedItems(),
       sources: sourcesView(),
     };
@@ -820,8 +915,9 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
     hostId, version, startedAt,
     get cursor() { return cursor; },
     // inputs
-    hostConnected, hostDisconnected, hostState, forgetHost, applyCollectorMessage, setPods, removePod, setSource, upstream: upstreamSink,
+    hostConnected, hostDisconnected, hostState, forgetHost, applyCollectorMessage, setPods, removePod, setSource, setRepos, upstream: upstreamSink,
     setPodLookup(fn) { podLookup = fn; },
+    setFileTargetObserver(fn) { fileTargetObserver = typeof fn === "function" ? fn : null; },
     tick,
     // outputs
     snapshot, changesSince, family, agentEvents, pod, resolveAgent, skewOf,
@@ -833,6 +929,7 @@ export function createState({ now = Date.now, hostId = "hub", version = "0.0.0",
     agents: () => [...agents.values()],
     pods: podList,
     podRecord,
+    reposOf: id => repos.get(id),
     sources: sourcesView,
     fileTouches: (host, path, limit) => store.touchesOf("file", `${host}:${path}`, limit),
     query: filters => store.query(filters, key => agents.get(key)),

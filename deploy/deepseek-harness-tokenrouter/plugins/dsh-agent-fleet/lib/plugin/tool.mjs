@@ -18,7 +18,7 @@ const DESCRIPTION = `Look up the live state of the coding agents running on the 
 Agent keys look like \`<host>#<kind>:<id>\`, e.g. \`server-bochao-01#omp:01a18adc-49ee-7345-8b51-9e75b06a2614\` (host: mac, server-bochao-01, sg-compute, or k8s/<site>/<pod>). Copy keys verbatim from earlier results; wherever a key is expected, a bare session id or \`<kind>:<id>\` also works. Pod keys look like \`chengdu/mc-bochao-li/<pod name>\`. Sites: ${SITES.join(", ")}. Times are UTC.
 Results are one summary line followed by compact JSON, capped near 12 KB; lists end with a \`more\` count, so narrow the filters (site, kind, status, text, since) instead of asking for more rows. Event fields: at, name (tool), cat (category), status (omitted when ok), ms, preview, targets ("file:read:<host>:<path>", "pod:exec:<site>/<ns>/<pod>", ...).`;
 
-const ACTION_HELP = `What to do. overview: hosts × agent kinds with running counts, host connection state, pods, cross-host links (no other arguments). list: agents, running first then newest activity; filters site, host, kind, status, role, text, since. family: the whole tree an agent belongs to (root, subagents, ACP children, agents it started on other hosts/pods) with each member's latest events; needs key. agent: one agent's record and recent events; needs key, optional limit and before to page back. pods: pods agents touched or that host a collector; filters site, text. pod: one pod's containers, the agent calls that touched it and its kube events; needs pod. files: files read/written/edited per file, for one agent (key) or all agents; filters host, text, since. file: preview of one file on a host (redacted; secrets refused); needs host and path, offset pages long files. query: search tool calls fleet-wide; filters kind, site, host, category, target, text, since.`;
+const ACTION_HELP = `What to do. overview: hosts × agent kinds with running counts, host connection state, pods, cross-host links (no other arguments). list: agents, running first then newest activity; filters site, host, kind, status, role, text, since. family: the whole tree an agent belongs to (root, subagents, ACP children, agents it started on other hosts/pods) with each member's latest events; needs key. agent: one agent's record and recent events; needs key, optional limit and before to page back. pods: pods agents touched or that host a collector; filters site, text. pod: one pod's containers, the agent calls that touched it and its kube events; needs pod. files: files read/written/edited per file with call counts per operation and the lines read/added/removed, for one agent (key) or all agents; filters host, text, since. file: preview of one file on a host (redacted; secrets refused); needs host and path, offset pages long files. query: search tool calls fleet-wide; filters kind, site, host, category, target, text, since.`;
 
 const PARAMETERS = {
   action: { type: "string", required: true, enum: [...ACTIONS], description: ACTION_HELP },
@@ -382,6 +382,8 @@ async function pod(args, env) {
   });
 }
 
+const LINE_FIELDS = ["read", "added", "removed"];
+
 function aggregateFiles(entries, filter) {
   const files = new Map();
   for (const { agentKey, event } of entries) {
@@ -392,9 +394,15 @@ function aggregateFiles(entries, filter) {
       if (filter.host && host !== filter.host) continue;
       if (filter.text && !target.path.toLowerCase().includes(filter.text)) continue;
       const id = `${host}\u0000${target.path}`;
-      const file = files.get(id) ?? files.set(id, { host, path: target.path, ops: {}, last: 0, agents: new Set() }).get(id);
+      const file = files.get(id) ?? files.set(id, { host, path: target.path, ops: {}, lines: {}, last: 0, agents: new Set() }).get(id);
       const op = target.op ?? "touch";
       file.ops[op] = (file.ops[op] ?? 0) + 1;
+      // Line counts (target.lines) are per call and absent when the collector could not tell, so the totals are lower
+      // bounds; a field no call reported stays out of the row.
+      for (const field of LINE_FIELDS) {
+        const n = target.lines?.[field];
+        if (Number.isInteger(n) && n > 0) file.lines[field] = (file.lines[field] ?? 0) + n;
+      }
       file.last = Math.max(file.last, event.t ?? 0);
       if (agentKey) file.agents.add(agentKey);
     }
@@ -425,9 +433,9 @@ async function files(args, env) {
     const shown = aggregated.slice(0, rows(want, scale));
     const more = aggregated.length - shown.length;
     return {
-      summary: `${aggregated.length} files touched by ${source}${more > 0 ? `; ${shown.length} shown, ${more} more` : ""}; newest touch first. ops count the calls per operation.`,
+      summary: `${aggregated.length} files touched by ${source}${more > 0 ? `; ${shown.length} shown, ${more} more` : ""}; newest touch first. ops count the calls per operation; lines sums the lines those calls read/added/removed where the agent reported them.`,
       data: {
-        files: shown.map(file => ({ host: file.host, path: tailOf(file.path, 140), ops: file.ops, last: iso(file.last), agents: [...file.agents].slice(0, 2), agentsMore: file.agents.size > 2 ? file.agents.size - 2 : undefined })),
+        files: shown.map(file => ({ host: file.host, path: tailOf(file.path, 140), ops: file.ops, lines: Object.keys(file.lines).length > 0 ? file.lines : undefined, last: iso(file.last), agents: [...file.agents].slice(0, 2), agentsMore: file.agents.size > 2 ? file.agents.size - 2 : undefined })),
         more: more || undefined,
       },
     };

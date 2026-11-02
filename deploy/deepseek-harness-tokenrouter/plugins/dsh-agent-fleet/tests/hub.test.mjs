@@ -925,6 +925,97 @@ describe("file proxy", () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------- repo tracking
+
+describe("repo tracking", () => {
+  test("file events on a linked host ask its collector once; snapshot and deltas carry the repos", async t => {
+    const { hub } = await startTestHub(t, { repos: { batchMs: 20 } });
+    const requests = [];
+    const mac = connectCollector(hub, { id: "mac", site: "mac" }, {
+      onRequest: (method, params) => {
+        if (method !== "repo.resolve") return null;
+        requests.push(params);
+        return {
+          dirs: Object.fromEntries(params.dirs.map(dir => [dir, "/work/proj"])),
+          repos: [{ root: "/work/proj", remote: "github.com/o/proj", branch: "main" }],
+        };
+      },
+    });
+    await waitFor(() => hub.state.host("mac"), { what: "mac online" });
+    const deltas = [];
+    hub.state.subscribe(delta => { if (delta.repos) deltas.push(delta); });
+    const key = agentKey("mac", "omp", "m1");
+    mac.agent(agentRecord("mac", "omp", "m1"));
+    mac.events(key, [
+      toolEvent("t1", T0, { targets: [{ type: "file", op: "read", host: "mac", path: "/work/proj/src/a.ts" }] }),
+      toolEvent("t2", T0 + 1, { targets: [{ type: "file", op: "edit", host: "mac", path: "/work/proj/lib/b.ts" }] }),
+    ]);
+
+    const expected = [{ root: "/work/proj", remote: "github.com/o/proj", branch: "main" }];
+    const repos = await waitFor(() => (hub.state.snapshot().repos.mac?.length === 1 ? hub.state.snapshot().repos.mac : undefined), { what: "repos in the snapshot" });
+    assert.deepEqual(repos, expected);
+    assert.equal(requests.length, 1, "one batched request for both directories");
+    assert.deepEqual([...requests[0].dirs].sort(), ["/work/proj/lib/b.ts", "/work/proj/src/a.ts"]);
+    const delta = await waitFor(() => deltas.find(entry => entry.repos?.mac?.length === 1), { what: "a delta carrying the repos" });
+    assert.deepEqual(delta.repos.mac, expected, "the delta carries the full list of the changed host");
+
+    // the dir is cached: another event on it costs no request
+    mac.events(key, [toolEvent("t3", T0 + 2, { targets: [{ type: "file", op: "read", host: "mac", path: "/work/proj/src/a.ts" }] })]);
+    await sleep(100);
+    assert.equal(requests.length, 1);
+    assert.equal(hub.repos.stats().hosts.mac.requests, 1);
+    assert.equal(hub.repos.stats().hosts.mac.pending, 0);
+  });
+
+  test("a collector without repo.resolve is backed off, not asked again on every tick", async t => {
+    let asked = 0;
+    const { hub } = await startTestHub(t, { tickMs: 10, repos: { batchMs: 10, unsupportedMs: 150 } });
+    const mac = connectCollector(hub, { id: "mac", site: "mac" }, {
+      onRequest: method => {
+        if (method !== "repo.resolve") return null;
+        asked += 1;
+        throw Object.assign(new Error("unknown collector method repo.resolve"), { code: "unsupported" });
+      },
+    });
+    await waitFor(() => hub.state.host("mac"), { what: "mac online" });
+    const key = agentKey("mac", "omp", "m1");
+    mac.agent(agentRecord("mac", "omp", "m1"));
+    mac.events(key, [toolEvent("t1", T0, { targets: [{ type: "file", op: "read", host: "mac", path: "/work/a.ts" }] })]);
+    await waitFor(() => asked === 1, { what: "the first repo.resolve" });
+
+    mac.events(key, [toolEvent("t2", T0 + 1, { targets: [{ type: "file", op: "read", host: "mac", path: "/work/b.ts" }] })]);
+    await sleep(80);
+    assert.equal(asked, 1, "ticks ran but the host is backed off");
+    await waitFor(() => asked === 2, { timeoutMs: 3000, what: "asked again after the unsupported window" });
+    assert.equal(hub.state.snapshot().repos.mac, undefined, "a collector that cannot answer publishes nothing");
+  });
+
+  test("the in-process collector answers repo.resolve over the same link path", async t => {
+    let requests = 0;
+    const fake = {
+      startCollector({ send, hostInfo: info }) {
+        send({ t: "hello", proto: PROTOCOL_VERSION, at: Date.now(), host: hostInfo(info) });
+        const key = agentKey(info.id, "omp", "local1");
+        send({ t: "agent", agent: agentRecord(info.id, "omp", "local1") });
+        send({ t: "events", agent: key, events: [toolEvent("t1", T0, { targets: [{ type: "file", op: "read", host: info.id, path: "/work/local/a.ts" }] })] });
+        return {
+          handleRequest: async (method, params) => {
+            if (method !== "repo.resolve") return {};
+            requests += 1;
+            return { dirs: Object.fromEntries(params.dirs.map(dir => [dir, "/work/local"])), repos: [{ root: "/work/local", branch: "local" }] };
+          },
+          stop() {},
+        };
+      },
+    };
+    const hostId = "server-bochao-01";
+    const { hub } = await startTestHub(t, { hostId, local: { load: async () => fake }, repos: { batchMs: 10 } });
+    const repos = await waitFor(() => (hub.state.snapshot().repos[hostId]?.length === 1 ? hub.state.snapshot().repos[hostId] : undefined), { what: "repos from the local collector" });
+    assert.deepEqual(repos, [{ root: "/work/local", branch: "local" }]);
+    assert.equal(requests, 1);
+  });
+});
+
 // --------------------------------------------------------------------------------- host offline handling
 
 describe("host connection lifecycle", () => {

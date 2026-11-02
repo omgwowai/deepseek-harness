@@ -47,7 +47,7 @@ every `lib/`. `dist/` and `.scratch/` are ignored.
 
 ```bash
 cd plugins/dsh-agent-fleet
-node --test tests/*.test.mjs        # 324 tests; loopback sockets and temp dirs only, no cluster
+node --test tests/*.test.mjs        # 403 tests; loopback sockets and temp dirs only, no cluster
 ```
 
 Use a Node 22 binary for the command above (see Requirements). `npm test` runs the same script, but with the
@@ -57,13 +57,14 @@ load), so run the binary explicitly.
 | File | Covers |
 |---|---|
 | `tests/channel.test.mjs` | Framing, redial, child signalling. |
-| `tests/readers.test.mjs` | The four transcript readers, parent hints, incremental reads, zstd frames. |
+| `tests/readers.test.mjs` | The four transcript readers, parent hints, incremental reads, zstd frames, result-derived line counts. |
 | `tests/collector.test.mjs` | Discovery, hot/cold tails, processes, `AGENT_FLEET_PARENT`, ACP sidecar, request handling. |
-| `tests/targets.test.mjs` | Tool-call classification and targets. |
-| `tests/hub.test.mjs` | State, journal/cursor, deltas, links, upstream merge, watchdogs, health. |
+| `tests/repos.test.mjs` | `repo.resolve` (walk-up, linked worktrees, submodules, remote credential stripping, caps, cache) and the hub repo tracker (batching, backoff, old collectors, root refresh), `setRepos` sanitising and upstream ownership, `target.lines` clamping. |
+| `tests/targets.test.mjs` | Tool-call classification, targets, and argument-derived line counts. |
+| `tests/hub.test.mjs` | State, journal/cursor, deltas, links, upstream merge, watchdogs, health, repo tracking over real collector links. |
 | `tests/kube.test.mjs` | Pod list/watch, collector attach, pod file reads, terminal pods. |
 | `tests/edge.test.mjs` | Routes, prefix stripping, redirects, streaming, upgrades. |
-| `tests/panel.test.mjs` | Panel helpers against `lib/protocol.mjs`, demo fixture shape. |
+| `tests/panel.test.mjs` | Panel helpers against `lib/protocol.mjs`, the interaction-graph model, demo fixture shape. |
 | `tests/plugin.test.mjs` | Row config, patch writes, RPC routes, model tool actions, embedded mode. |
 
 A test is added only as a regression for a consumer-visible bug: it must fail on the old code and pass on the fix.
@@ -72,7 +73,7 @@ A test is added only as a regression for a consumer-visible bug: it must fail on
 
 ```bash
 node tools/build-collector.mjs
-# dist/agent-fleet-collector.mjs  294278 bytes  sha256 5da59dbf98145956  20 modules  externals: node:child_process node:fs …
+# dist/agent-fleet-collector.mjs  339163 bytes  sha256 692cd7928cdc98a2  21 modules  externals: node:child_process node:fs …
 ```
 
 `node bin/agent-fleet.mjs bundle [--out FILE]` runs the same build with a custom output path and prints the same
