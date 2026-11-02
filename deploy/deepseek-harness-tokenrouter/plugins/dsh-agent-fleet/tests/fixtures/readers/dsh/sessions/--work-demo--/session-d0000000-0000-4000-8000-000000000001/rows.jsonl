@@ -1,0 +1,19 @@
+{"type":"session","version":4,"id":"session-d0000000-0000-4000-8000-000000000001","createdAt":1790848800000,"cwd":"/work/demo","delegationDepth":0,"agentPreset":"standard"}
+{"type":"model/selection","seq":0,"time":1790848800010,"data":{"provider":"deepseek","model":"ds-flash-selected"}}
+{"type":"request/context","seq":1,"time":1790848800020,"data":{"provider":"deepseek","model":"ds-flash","contextWindow":1000000}}
+{"type":"turn/start","seq":2,"time":1790848800100,"data":{"turn":1}}
+{"type":"step/start","seq":3,"time":1790848800110,"data":{"turn":1,"step":1}}
+{"type":"user/message","seq":4,"time":1790848800120,"data":{"content":[{"type":"text","text":"List files and delegate a check"}],"source":{"kind":"user"},"role":"user","id":"um1"},"surfaceOp":"append"}
+{"type":"assistant/message","seq":5,"time":1790848803000,"data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"Let me look"}],"source":{"kind":"model","provider":"deepseek","model":"ds-flash"},"id":"am3000"},"usage":{"inputTokens":100,"outputTokens":40,"cacheReadTokens":900,"cacheWriteTokens":0,"reasoningTokens":5},"stream":[{"type":"text-chunks","time0":1790848801500,"index":0,"dt":[],"texts":["Let me look"]}]},"surfaceOp":"append"}
+{"type":"tool/call","seq":6,"time":1790848803100,"data":{"turn":1,"step":1,"callId":"call_bash1","name":"bash","arguments":"{\"command\":\"ls -la\"}"}}
+{"type":"tool/result","seq":7,"time":1790848803600,"data":{"turn":1,"step":1,"message":{"role":"tool","source":{"kind":"tool","callId":"call_bash1"},"toolCallId":"call_bash1","content":[{"type":"text","text":"total 0\nProcess exited with code 2"}],"isError":false,"id":"tr3600"}}}
+{"type":"tool/call","seq":8,"time":1790848803700,"data":{"turn":1,"step":1,"callId":"call_sub1","name":"subagent","arguments":"{\"description\":\"Check the lockfile\",\"prompt\":\"check it\"}"}}
+{"type":"subagent/catalog","seq":9,"time":1790848803710,"data":{"version":0,"childId":"d0000000-0000-4000-8000-000000000002","childCreatedAt":1790848803710,"mode":"continuable","label":"Check the lockfile"}}
+{"type":"tool/result","seq":10,"time":1790848803720,"data":{"turn":1,"step":1,"message":{"role":"tool","source":{"kind":"tool","callId":"call_sub1"},"toolCallId":"call_sub1","content":[{"type":"text","text":"started subagent d0000000-0000-4000-8000-000000000002"}],"isError":false,"id":"tr3720"}}}
+{"type":"subagent/catalog","seq":11,"time":1790848803800,"data":{"version":0,"childId":"d0000000-0000-4000-8000-0000000000aa","childCreatedAt":1790848803800,"mode":"continuable","label":"Teammate spawned elsewhere"}}
+{"type":"step/end","seq":12,"time":1790848803900,"data":{"turn":1,"step":1}}
+{"type":"turn/end","seq":13,"time":1790848804000,"data":{"turn":1,"reason":{"kind":"completed"}}}
+{"type":"turn/start","seq":14,"time":1790848805000,"data":{"turn":2}}
+{"type":"step/start","seq":15,"time":1790848805010,"data":{"turn":2,"step":1}}
+{"type":"user/message","seq":16,"time":1790848805020,"data":{"content":[{"type":"text","text":"now ask me something"}],"source":{"kind":"user"},"role":"user","id":"um2"},"surfaceOp":"append"}
+{"type":"tool/call","seq":17,"time":1790848805100,"data":{"turn":1,"step":1,"callId":"call_ask1","name":"ask","arguments":"{\"questions\":[{\"id\":\"q\",\"question\":\"Which one?\"}]}"}}

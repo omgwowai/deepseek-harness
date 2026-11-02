@@ -47,6 +47,15 @@ function lineageEnvironment(env: Record<string, string>, lineage: AcpLaunchLinea
   return { ...env, DSH_ACP_LINK_HEADERS: JSON.stringify(headers) }
 }
 
+/**
+ * The DSH session that launches this agent process, for Agent Fleet's process view (`AGENT_FLEET_VIA=dsh:<id>`).
+ * Deliberately not `AGENT_FLEET_PARENT`: the agent's own tool children inherit this env, and their parent is
+ * the agent's native session (its own session-id variable), not the DSH session two levels up.
+ */
+function fleetEnvironment(env: Record<string, string>, dshSessionId: string): Record<string, string> {
+  return { ...env, AGENT_FLEET_VIA: `dsh:${dshSessionId}` }
+}
+
 export async function prepareAgentLaunch(
   runtime: AcpAgentId | undefined,
   config: AcpStubAgentConfig,
@@ -54,12 +63,14 @@ export async function prepareAgentLaunch(
   subprocess: SubprocessSeam,
   createMcpLease: ((capabilities: acp.AgentCapabilities) => Promise<AcpMcpLease | undefined>) | undefined,
   lineage?: AcpLaunchLineage,
+  dshSessionId?: string,
 ): Promise<AcpRuntimeLaunch> {
   let env = await acpLaunchEnvironment({ config })
   // Discovery can initialize this process before MCP tools become available;
   // the same connection needs the bypass when its first DSH session is opened.
   if (runtime === 'codex') env = codexLoopbackEnvironment(env)
   if (lineage !== undefined) env = lineageEnvironment(env, lineage)
+  if (dshSessionId !== undefined) env = fleetEnvironment(env, dshSessionId)
   let mcpLease: AcpMcpLease | undefined
   // Devin reads MCP servers from its config at process startup, before ACP initialize.
   if (runtime === 'devin') {

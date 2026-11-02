@@ -1,0 +1,6 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-10-01T10:00:05.000Z","pad":"    "}
+{"type":"session","version":3,"id":"0aaaaaaa-3333-7000-8000-000000000003","timestamp":"2026-10-01T10:00:05.000Z","cwd":"/work/demo"}
+{"type":"model_change","id":"mc5000","parentId":null,"timestamp":"2026-10-01T10:00:05.050Z","runtime":{"version":"18.0.0"},"model":"acme/model-b"}
+{"type":"session_init","id":"si5000","parentId":null,"timestamp":"2026-10-01T10:00:05.060Z","agent":"scout","task":"Complete assignment thoroughly","resolvedModel":"acme/model-b:max","tools":["read"],"spawns":"*"}
+{"type":"message","id":"m5200","parentId":null,"timestamp":"2026-10-01T10:00:05.200Z","runtime":{"version":"18.0.0"},"message":{"timestamp":1790848805200,"role":"user","content":[{"type":"text","text":"Probe the build"}],"attribution":"agent"}}
+{"type":"message","id":"m9000","parentId":null,"timestamp":"2026-10-01T10:00:09.000Z","runtime":{"version":"18.0.0"},"message":{"timestamp":1790848805300,"role":"assistant","content":[{"type":"toolCall","id":"p1","name":"ask","arguments":{"questions":[{"id":"q","question":"Which target?"}]},"intent":"ask intent"}],"model":"model-a","provider":"acme","stopReason":"toolUse","usage":{"input":10,"output":20,"cacheRead":300,"cacheWrite":40,"totalTokens":370,"cost":{"total":0.5}},"duration":2900,"ttft":800}}

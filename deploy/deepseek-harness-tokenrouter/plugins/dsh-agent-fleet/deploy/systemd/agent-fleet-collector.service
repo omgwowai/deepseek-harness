@@ -1,0 +1,24 @@
+# Agent Fleet collector for a Linux host other than the hub's (systemd --user), e.g. sg-compute. It dials the
+# server hub's ingest through `ssh -W 127.0.0.1:7841 bochao_li@10.0.60.98` and reconnects with backoff.
+# Placeholders: @@F@@ = plugin dir, @@NODE@@ = node ≥ 22.15, @@HOST@@ = host id, @@SITE@@ = site, @@ROOTS@@ = --root flags.
+# The collector presents %h/.config/agent-fleet/ingest-token in hello (0600; deploy-server.sh sg copies the hub's
+# --ingest-token-file there over stdin). Without it the hub refuses the channel; the collector retries every 5 s.
+# Extra session roots can also come from ~/.config/agent-fleet/collector.env (AGENT_FLEET_ROOTS=kind=glob:kind=glob).
+[Unit]
+Description=Agent Fleet collector (@@HOST@@ → server-bochao-01 hub)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=NODE_NO_WARNINGS=1
+EnvironmentFile=-%h/.config/agent-fleet/collector.env
+ExecStart=@@NODE@@ @@F@@/bin/agent-fleet.mjs collector --ssh bochao_li@10.0.60.98 --ssh-port 7841 --host-id @@HOST@@ --site @@SITE@@ --kind server --token-file %h/.config/agent-fleet/ingest-token @@ROOTS@@
+Restart=always
+RestartSec=5
+Nice=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

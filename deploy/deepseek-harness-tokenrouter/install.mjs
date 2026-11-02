@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // Install the plugins of this directory into one DeepSeek Harness profile.
 //
-//   node install.mjs [--profile desktop|web] [--plugins mermaid,acp,agent-dag] [--no-telemetry] [--skill] [--dry-run]
+//   node install.mjs [--profile desktop|web] [--plugins mermaid,acp,agent-dag,fleet] [--no-telemetry] [--skill] [--dry-run]
+//
+// Without `--plugins` the set is mermaid,acp,agent-dag. `fleet` (Agent Fleet: live view of every DSH / Claude Code / Codex /
+// Oh My Pi session, no build step) is opt-in: `--plugins fleet`, or `--plugins mermaid,acp,agent-dag,fleet` for everything.
+// Its row is written by plugins/dsh-agent-fleet/configure.mjs.
 //
 // Each plugin is linked into the profile (`"<package>": "link:<absolute dir>"`), so editing or rebuilding
 // it here is what DSH loads after a restart. The profile manifest is backed up next to itself first.
@@ -38,8 +42,9 @@ const PLUGINS = {
     prepare: dir => run("npm", ["ci", "--omit=dev"], dir),
     subPlugins: process.argv.includes("--no-telemetry") ? [] : [{ name: "@tokenrouter/dsh-telemetry", dir: join(here, "plugins/dsh-agent-dag/telemetry") }],
   },
+  fleet: { name: "@local/dsh-agent-fleet", dir: join(here, "plugins/dsh-agent-fleet") },
 };
-const selected = (flag("--plugins") ?? Object.keys(PLUGINS).join(",")).split(",").map(key => key.trim()).filter(Boolean);
+const selected = (flag("--plugins") ?? "mermaid,acp,agent-dag").split(",").map(key => key.trim()).filter(Boolean);
 for (const key of selected) if (!PLUGINS[key]) throw new Error(`unknown plugin ${key} (${Object.keys(PLUGINS).join(", ")})`);
 
 function run(command, args, cwd) {

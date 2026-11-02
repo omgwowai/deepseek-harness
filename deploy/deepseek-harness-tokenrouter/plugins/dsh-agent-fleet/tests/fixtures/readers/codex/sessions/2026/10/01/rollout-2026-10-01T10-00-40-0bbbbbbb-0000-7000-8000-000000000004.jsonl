@@ -1,0 +1,6 @@
+{"timestamp":"2026-10-01T10:00:40.000Z","type":"session_meta","payload":{"id":"0bbbbbbb-0000-7000-8000-000000000004","session_id":"0bbbbbbb-0000-7000-8000-000000000004","timestamp":"2026-10-01T10:00:40.000Z","cwd":"/work/demo","originator":"@local/dsh-acp-adapter","cli_version":"0.166.0","source":"cli","thread_source":"user","model_provider":"acme"},"ordinal":0}
+{"timestamp":"2026-10-01T10:00:40.150Z","type":"turn_context","payload":{"turn_id":"turn1","cwd":"/work/demo","model":"gpt-x","effort":"high"}}
+{"timestamp":"2026-10-01T10:00:40.200Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Which models do you support?"}]}}
+{"timestamp":"2026-10-01T10:00:41.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo acme\",\"workdir\":\"/work/demo\"}","call_id":"call_acp1"}}
+{"timestamp":"2026-10-01T10:00:41.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_acp1","output":"Process exited with code 0\nacme"}}
+{"timestamp":"2026-10-01T10:00:42.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn1","last_agent_message":"acme","duration_ms":1800}}
