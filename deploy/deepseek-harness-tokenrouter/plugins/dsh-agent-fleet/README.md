@@ -47,7 +47,7 @@ every `lib/`. `dist/` and `.scratch/` are ignored.
 
 ```bash
 cd plugins/dsh-agent-fleet
-node --test tests/*.test.mjs        # 403 tests; loopback sockets and temp dirs only, no cluster
+node --test tests/*.test.mjs        # 405 tests; loopback sockets and temp dirs only, no cluster
 ```
 
 Use a Node 22 binary for the command above (see Requirements). `npm test` runs the same script, but with the
