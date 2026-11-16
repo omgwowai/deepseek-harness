@@ -25,7 +25,7 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { eachLogLine } from "./lib/session-log-stream.mjs";
+import { eachLogLine } from "./internal/session-log-stream.mjs";
 
 export const TOOLS_API = 3; // 3: GET /alignment/tools/runs (what one run_code did, step by step); items carry root
 // 2: sub=1 adds the session's subagents (agents, subCalls, group.sub, item.agent); subagents count
@@ -348,7 +348,7 @@ export function buildTable(files, now, windowDays = WINDOW_DAYS) {
   return { builtAt: now, from, windowDays, tools };
 }
 
-// A session log is read as a stream (lib/session-log-stream.mjs, 2026-11-16): whole zstd frames are decompressed in
+// A session log is read as a stream (internal/session-log-stream.mjs): whole zstd frames are decompressed in
 // batches and cut into lines, never the whole log as one string. Before, decodeLog made one string of the log and the
 // log (169 MB zstd, 608 MB of jsonl, over V8's ~512 MB string limit) failed with ERR_STRING_TOO_LONG, which
 // failed the whole baseline build. Batches of frames, not one call per frame: 2026-10-24 decoding frame by frame was

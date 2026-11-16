@@ -56,12 +56,12 @@
 // the persisted log, no agent activation), then kept current by every session/event (turn/start,
 // todo/write). Events that arrive during the first scan are merged by seq, so none is lost.
 import { createHash } from "node:crypto";
-import { splitTodo } from "./lib/todo-eta.mjs";
-import { carryEta, MATCH_MIN, matchTexts, normText, similarity } from "./lib/todo-match.mjs";
+import { splitTodo } from "./internal/todo-eta.mjs";
+import { carryEta, MATCH_MIN, matchTexts, normText, similarity } from "./internal/todo-match.mjs";
 import { jobName } from "./job-title.js";
 
 // the text pairing lives in lib/todo-match.mjs (shared with dsh-todo-reminder); re-exported for callers and tests
-export { MATCH_MIN, matchTexts, normText, similarity } from "./lib/todo-match.mjs";
+export { MATCH_MIN, matchTexts, normText, similarity } from "./internal/todo-match.mjs";
 
 export const TODOS_API = 5;
 export const ACTIVITY_MERGE_MS = 5000;

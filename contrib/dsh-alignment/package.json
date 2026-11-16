@@ -27,7 +27,7 @@
     "fm-refresh.js",
     "fm-boot-prompt.md",
     "fm",
-    "lib",
+    "internal",
     "session-inspect.mjs",
     "client.js",
     "cordis.patch.yml",

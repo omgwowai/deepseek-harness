@@ -70,7 +70,7 @@ import { createAlignmentWatcher } from "./watch.js";
 import { TIMEOUT_TICK_MS, createTimeoutRunner } from "./timeouts.js";
 import { createStuckRunner, noticeSource } from "./stuck.js";
 import { mountFmRoutes } from "./fm-mount.js";
-import { backgroundOf, itemsOf, runningOf } from "./lib/session-background.mjs";
+import { backgroundOf, itemsOf, runningOf } from "./internal/session-background.mjs";
 import { canInspectSessions, sessionInspector } from "./session-inspect.mjs";
 import { jobName } from "./job-title.js";
 import { curioHandler, curioReader } from "./curio.js";

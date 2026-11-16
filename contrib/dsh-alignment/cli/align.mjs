@@ -133,7 +133,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { appendUsage, readUsage, badLinesText, filterEvents, formatEvent, summarize, summaryText, parseWhen, sourceOf } from './usage.mjs';
 import { LOG_NAMES } from '../tool-stats.js';
-import { eachLogLine } from '../lib/session-log-stream.mjs';
+import { eachLogLine } from '../internal/session-log-stream.mjs';
 import { textOf } from './text-split.mjs';
 
 export { textOf };
@@ -2787,7 +2787,7 @@ export function sessionPaths(sid) {
   if (hit && hit.k === k) return hit.paths;
   const out = new Set();
   const add = (p) => { if (typeof p === 'string' && p && path.isAbsolute(p)) out.add(normPath(p)); };
-  // 按行流式读(lib/session-log-stream.mjs):长会话的日志解开会超过一个字符串的上限(608 MB 的日志就超过)
+  // 按行流式读(internal/session-log-stream.mjs):长会话的日志解开会超过一个字符串的上限(608 MB 的日志就超过)
   eachLogLine(f, (buf) => {
     const start = buf.toString('latin1', 0, 32); // 行首是 {"type":"…",只看开头决定要不要解整行
     const head = start.startsWith('{"type":"session"'), call = start.startsWith('{"type":"tool/call"') || start.startsWith('{"type":"tool/ptc-dispatch"');

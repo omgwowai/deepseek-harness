@@ -259,7 +259,7 @@ contrib/dsh-alignment/
   cli/align.mjs       command line (create and edit pages, local fallback server)
   cli/template.html   page template (version 3); template-v2.html is the old version 2
   fm/  fm-*.js        First Mate controls (optional)
-  lib/                internal helpers
+  internal/           internal helpers
   assets/stamp-fx/    stamp animation and its licenses
   test/               tests
 ```
