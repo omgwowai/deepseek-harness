@@ -1,0 +1,6 @@
+# plugins/dsh-alignment/cordis.patch.yml - the bundle artifact declared by package.json (dsh.bundle.patch).
+# Loading stays a single home insert (~/.dsh/cordis.patch.yml); neither profile lists dsh-alignment in
+# dsh.profile.bundles (a bundle plus the home insert would be a duplicate loader entry id).
+- insert:
+    - id: alignment
+      name: dsh-alignment

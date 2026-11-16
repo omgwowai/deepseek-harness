@@ -1,0 +1,59 @@
+{
+  "name": "dsh-alignment",
+  "version": "0.1.0",
+  "description": "对齐页：在 DSH 网页里给多会话协作做一张「谁在做什么、等你决定什么」的看板。3080 路由 /alignment/p/<页> 出页面和数据、点选项回复转发到会话；client.js 在右侧栏加「对齐页」入口；cli/align.mjs 是建页和改页的命令行。",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "source.js",
+    "todos.js",
+    "watch.js",
+    "timeouts.js",
+    "stuck.js",
+    "curio.js",
+    "job-title.js",
+    "tool-stats.js",
+    "tool-stats-worker.js",
+    "fm-mount.js",
+    "fm-refresh.js",
+    "fm-boot-prompt.md",
+    "fm",
+    "lib",
+    "session-inspect.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "cli",
+    "assets/stamp-fx/stamp-fx.js",
+    "assets/stamp-fx/NOTICE.md",
+    "assets/stamp-fx/OFL.txt",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test cli/align.test.mjs cli/doc-access.test.mjs \"test/*.test.mjs\"",
+    "test:unit": "node --test cli/align.test.mjs cli/doc-access.test.mjs test/backfill-pauses.test.mjs test/client-follow.test.mjs test/client-visibility.test.mjs test/client.test.mjs test/curio.test.mjs test/facts-kinds.test.mjs test/fm-refresh.test.mjs test/fm-route-cache.test.mjs test/job-title.test.mjs test/mine.test.mjs test/phone-file.test.mjs test/sidebar-contract.test.mjs test/stuck.test.mjs test/text-split.test.mjs test/timeouts.test.mjs test/todo-dag.test.mjs test/todos.test.mjs test/tool-stats.test.mjs test/usage-log.test.mjs test/watch.test.mjs test/work.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

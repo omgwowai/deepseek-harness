@@ -1,0 +1,127 @@
+[
+ {
+  "time": 1792822201813,
+  "todos": [
+   {
+    "content": "去掉 template.html 的渐隐遮罩（已删 mask-image 一行）",
+    "status": "completed"
+   },
+   {
+    "content": "截图四种详情（宽屏/窄屏） [ETA 3m/5m]",
+    "status": "in_progress"
+   },
+   {
+    "content": "改 DESIGN.md 9.3 并提交 [ETA 10m/18m]",
+    "status": "pending"
+   },
+   {
+    "content": "fresh-context 审查 [ETA 5m/9m]",
+    "status": "pending"
+   },
+   {
+    "content": "跑测试和 dsh-verify，合入 master，align refresh [ETA 24m/42m]",
+    "status": "pending"
+   }
+  ]
+ },
+ {
+  "time": 1792822335216,
+  "todos": [
+   {
+    "content": "去掉 template.html 的渐隐遮罩（已删 mask-image 一行）",
+    "status": "completed"
+   },
+   {
+    "content": "截图四种详情（宽屏/窄屏） [ETA 3m/5m]",
+    "status": "in_progress"
+   },
+   {
+    "content": "改 DESIGN.md 9.3 并提交 [ETA 10m/18m]",
+    "status": "pending"
+   },
+   {
+    "content": "fresh-context 审查 [ETA 5m/9m]",
+    "status": "pending"
+   },
+   {
+    "content": "跑测试和 dsh-verify，合入 master，align refresh [ETA 24m/42m]",
+    "status": "pending"
+   }
+  ]
+ },
+ {
+  "time": 1792822597791,
+  "todos": [
+   {
+    "content": "去掉 template.html 的渐隐遮罩（已删 mask-image 一行）",
+    "status": "completed"
+   },
+   {
+    "content": "修宽屏两栏最后一条待办被按钮挡住（网格末行 minmax）",
+    "status": "completed"
+   },
+   {
+    "content": "截图四种详情（宽屏/窄屏） [ETA 3m/5m]",
+    "status": "in_progress"
+   },
+   {
+    "content": "改 DESIGN.md 9.3 并提交 [ETA 10m/18m]",
+    "status": "pending"
+   },
+   {
+    "content": "fresh-context 审查 [ETA 5m/9m]",
+    "status": "pending"
+   },
+   {
+    "content": "跑测试和 dsh-verify，合入 master，align refresh [ETA 24m/42m]",
+    "status": "pending"
+   }
+  ]
+ },
+ {
+  "time": 1792822910775,
+  "todos": [
+   {
+    "content": "去掉 template.html 的渐隐遮罩（已删 mask-image 一行）",
+    "status": "completed"
+   },
+   {
+    "content": "修宽屏两栏最后一条待办被按钮挡住（网格末行 minmax）",
+    "status": "completed"
+   },
+   {
+    "content": "截图四种详情（宽屏/窄屏）",
+    "status": "completed"
+   },
+   {
+    "content": "fresh-context 审查（通过，次要 1 条保留）",
+    "status": "completed"
+   },
+   {
+    "content": "查清 worktree 里 fm-refresh-real-host 失败原因",
+    "status": "in_progress"
+   },
+   {
+    "content": "提交 DESIGN.md 两行 + 插件改动，rebase、dsh-verify、合入 master、align refresh [ETA 24m/42m]",
+    "status": "pending"
+   }
+  ]
+ },
+ {
+  "time": 1792823218825,
+  "todos": [
+   {
+    "content": "去渐隐遮罩 + 两栏末行修复",
+    "status": "completed"
+   },
+   {
+    "content": "截图、审查、测试、dsh-verify",
+    "status": "completed"
+   },
+   {
+    "content": "合入 master、align refresh、清理 worktree",
+    "status": "completed"
+   }
+  ]
+ }
+]
