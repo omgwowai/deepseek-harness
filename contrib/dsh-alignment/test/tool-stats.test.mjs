@@ -5,9 +5,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
+import { constants as bufferConstants } from "node:buffer";
 import {
   extractCalls, timeoutKind, errorKey, anomalies, percentile, buildTable, samplesOf, scanSessions, createBaseline, toolsHandler,
-  runStatsWorker, argSummary, childrenOf, subagentCalls, MIN_SAMPLES, FLOOR_MS, FLOOR_CHARS, WINDOW_DAYS, decodeLog,
+  runStatsWorker, argSummary, childrenOf, subagentCalls, MIN_SAMPLES, FLOOR_MS, FLOOR_CHARS, WINDOW_DAYS, toolEventsOfFile, samplesOfLog,
   runSteps, runsHandler, stepText, stepLabel, covered,
 } from "../tool-stats.js";
 
@@ -177,21 +178,52 @@ test("the baseline window is the last 30 days: a log from 20 days ago counts, on
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("decodeLog: every frame of a multi-frame log, with frame magic bytes inside the data; empty file; a cut-off last frame throws with the file", () => {
-  const lines = Array.from({ length: 300 }, (_, k) => JSON.stringify({ type: "tool/call", seq: k, data: { note: k % 7 ? "x" : "\u0028\u00b5\u002f\u00fd" + k } }));
-  const buf = frames(lines);
-  assert.equal(decodeLog(buf), lines.join("\n") + "\n");
-  // raw magic bytes stored in a frame (incompressible payload) do not split it
-  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-  const odd = Buffer.concat([zstdCompressSync(Buffer.concat([Buffer.from("a"), magic, Buffer.from("b\n")]), { params: { 100: 1 } }), zstdCompressSync(Buffer.from("c\n"))]);
-  assert.equal(decodeLog(odd), "a" + magic.toString("utf8") + "b\nc\n");
-  assert.equal(decodeLog(Buffer.alloc(0)), "");
-  assert.throws(() => decodeLog(buf.subarray(0, buf.length - 3)));
+test("logs are read as a stream: every frame of a multi-frame log, frame magic bytes inside the data, an empty file, a line across frames; a cut-off or damaged frame throws with the file", () => {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), "tool-stats-")));
   try {
-    const file = writeLog(root, "session-cut", grepCalls(20, 100, Date.now() - 3600e3));
-    writeFileSync(file, readFileSync(file).subarray(0, -3));
-    assert.throws(() => scanSessions({ root }), (e) => e.message.includes("session-cut"));
+    const file = join(root, "log.jsonl.zstd");
+    const evs = Array.from({ length: 300 }, (_, k) => ({ type: "tool/call", seq: k, data: { note: k % 7 ? "x" : "\u0028\u00b5\u002f\u00fd" + k } }));
+    const buf = frames(evs.map((e) => JSON.stringify(e)));
+    writeFileSync(file, buf);
+    assert.deepEqual(toolEventsOfFile(file), evs);
+    assert.deepEqual(toolEventsOfFile(file, { chunkBytes: 7, outBytes: 1 }), evs, "small read chunks and decode batches");
+    // raw magic bytes stored in a frame (incompressible payload) do not split it; a line cut by a flush joins up again
+    const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+    const line = '{"type":"tool/call","m":"a' + magic.toString("latin1") + 'b"}\n';
+    const raw = Buffer.from(line, "latin1");
+    writeFileSync(file, Buffer.concat([zstdCompressSync(raw.subarray(0, 20), { params: { 100: 1 } }), zstdCompressSync(raw.subarray(20))]));
+    const one = toolEventsOfFile(file);
+    assert.equal(one.length, 1, "one line, not split at the magic bytes or the frame cut");
+    assert.equal(Buffer.from(one[0].m, "utf8").length, Buffer.from("a" + magic.toString("utf8") + "b", "utf8").length);
+    writeFileSync(file, Buffer.alloc(0));
+    assert.deepEqual(toolEventsOfFile(file), []);
+    // cut-off last frame, damaged middle: the scan names the log
+    const sessions = join(root, "sessions");
+    const cut = writeLog(sessions, "session-cut", grepCalls(20, 100, Date.now() - 3600e3));
+    const good = readFileSync(cut);
+    writeFileSync(cut, good.subarray(0, -3));
+    assert.throws(() => scanSessions({ root: sessions }), (e) => e.message.includes("session-cut") && /last zstd frame incomplete/.test(e.message));
+    writeFileSync(cut, Buffer.concat([good.subarray(0, 40), Buffer.from("garbage!"), good.subarray(40)]));
+    assert.throws(() => scanSessions({ root: sessions }), (e) => e.message.includes("session-cut"));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a log with more text than one string can hold is scanned (2026-11-16: the Curio log, 608 MB of jsonl, ERR_STRING_TOO_LONG)", () => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "tool-stats-")));
+  try {
+    const now = Date.now(), t0 = now - 3600e3;
+    // 20 grep calls of 300 ms, then one 4 MB tool result line repeated past the longest possible string (~60 KB on disk),
+    // then 20 more calls: the calls after the bulk count too
+    const f = writeLog(root, "session-big", grepCalls(20, 300, t0));
+    const bulkLine = Buffer.from(JSON.stringify({ type: "user/message", seq: 0, time: t0, data: { text: "x".repeat(4 << 20) } }) + "\n");
+    const copies = Math.ceil((bufferConstants.MAX_STRING_LENGTH + 1) / bulkLine.length);
+    const bulk = zstdCompressSync(bulkLine);
+    const tail = Buffer.concat(grepCalls(20, 300, t0 + 1e6).map((e) => zstdCompressSync(Buffer.from(JSON.stringify(e) + "\n"))));
+    writeFileSync(f, Buffer.concat([readFileSync(f), ...Array(copies).fill(bulk), tail]));
+    assert.ok(copies * bulkLine.length > bufferConstants.MAX_STRING_LENGTH);
+    assert.equal(samplesOfLog(f).rows.length, 40);
+    const a = scanSessions({ root, now });
+    assert.deepEqual([a.stats.parsed, a.table.tools.grep.ms], [1, { p90: 300, n: 40 }]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

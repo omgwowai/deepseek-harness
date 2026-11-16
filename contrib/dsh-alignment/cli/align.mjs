@@ -132,7 +132,8 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { appendUsage, readUsage, badLinesText, filterEvents, formatEvent, summarize, summaryText, parseWhen, sourceOf } from './usage.mjs';
-import { decodeLog, LOG_NAMES } from '../tool-stats.js';
+import { LOG_NAMES } from '../tool-stats.js';
+import { eachLogLine } from '../lib/session-log-stream.mjs';
 import { textOf } from './text-split.mjs';
 
 export { textOf };
@@ -2786,16 +2787,18 @@ export function sessionPaths(sid) {
   if (hit && hit.k === k) return hit.paths;
   const out = new Set();
   const add = (p) => { if (typeof p === 'string' && p && path.isAbsolute(p)) out.add(normPath(p)); };
-  for (const line of decodeLog(fs.readFileSync(f)).split('\n')) {
-    const head = line.startsWith('{"type":"session"'), call = line.startsWith('{"type":"tool/call"') || line.startsWith('{"type":"tool/ptc-dispatch"');
-    if (!head && !call) continue;
+  // 按行流式读(lib/session-log-stream.mjs):长会话的日志解开会超过一个字符串的上限(608 MB 的日志就超过)
+  eachLogLine(f, (buf) => {
+    const start = buf.toString('latin1', 0, 32); // 行首是 {"type":"…",只看开头决定要不要解整行
+    const head = start.startsWith('{"type":"session"'), call = start.startsWith('{"type":"tool/call"') || start.startsWith('{"type":"tool/ptc-dispatch"');
+    if (!head && !call) return;
     let ev;
-    try { ev = JSON.parse(line); } catch { continue; } // 正在写的最后一行可能不完整
-    if (head) { add(ev.cwd); continue; }
+    try { ev = JSON.parse(buf.toString('utf8')); } catch { return; } // 正在写的最后一行可能不完整
+    if (head) { add(ev.cwd); return; }
     let a = ev.data && ev.data.arguments;
-    if (typeof a === 'string') { try { a = JSON.parse(a); } catch { continue; } }
+    if (typeof a === 'string') { try { a = JSON.parse(a); } catch { return; } }
     if (a && typeof a === 'object') for (const key of ['file_path', 'path', 'workdir', 'cwd']) add(a[key]);
-  }
+  });
   const paths = [...out];
   usedCache.set(f, { k, paths });
   return paths;

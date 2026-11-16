@@ -24,8 +24,8 @@
 // in the background: a request never waits for it (baseline null until the first build is done).
 import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { Worker } from "node:worker_threads";
+import { eachLogLine } from "./lib/session-log-stream.mjs";
 
 export const TOOLS_API = 3; // 3: GET /alignment/tools/runs (what one run_code did, step by step); items carry root
 // 2: sub=1 adds the session's subagents (agents, subCalls, group.sub, item.agent); subagents count
@@ -61,10 +61,17 @@ function resultOf(data) {
  * timeout (else null); args = the arguments object (or string).
  */
 export function extractCalls(events) {
-  const open = new Map(), out = [];
-  for (const e of events) {
+  const out = [], push = callExtractor((c) => out.push(c));
+  for (const e of events) push(e);
+  return out;
+}
+
+/** extractCalls one event at a time: returns push(event); onCall(call) runs at each result (logs read as a stream). */
+function callExtractor(onCall) {
+  const open = new Map();
+  return (e) => {
     const t = e?.type;
-    if (typeof t !== "string" || !t.startsWith("tool/")) continue;
+    if (typeof t !== "string" || !t.startsWith("tool/")) return;
     const d = e.data ?? {};
     if (t === "tool/call") open.set(d.callId, { name: d.name, time: e.time, args: d.arguments });
     else if (t === "tool/ptc-dispatch-start") open.set(d.subCallId, { name: d.name, time: e.time, args: d.arguments });
@@ -78,14 +85,13 @@ export function extractCalls(events) {
       const name = c?.name ?? d.name ?? "?";
       const start = typeof c?.time === "number" ? c.time : null;
       const kind = timeoutKind(text, r.isError);
-      out.push({
+      onCall({
         id: r.id, root: inner ? d.rootCallId ?? null : null, name, start, end: e.time, ms: start === null ? null : e.time - start,
         chars: inner ? null : text.length, error: r.isError, timeout: kind, text: r.isError || kind ? text.slice(0, TEXT_MAX) : null,
         args: parseArgs(c?.args ?? d.arguments ?? null),
       });
     }
-  }
-  return out;
+  };
 }
 
 /** "background" | "deadline" | "timeout" | null (see the header). */
@@ -342,22 +348,37 @@ export function buildTable(files, now, windowDays = WINDOW_DAYS) {
   return { builtAt: now, from, windowDays, tools };
 }
 
-// A session log is concatenated zstd frames; one zstdDecompressSync call decodes them all with one decoder (2026-10-24:
-// decoding frame by frame was ~14 s of a ~25 s 30-day cold build, ~370k frames; one call per log: ~13 s in all; same
-// bytes on all 2471 logs).
-// An older note says this call stops after the first frame, so it is checked once here and decodeLog fails loud if so.
-const ALL_FRAMES = zstdDecompressSync(Buffer.concat([zstdCompressSync(Buffer.from("a\n")), zstdCompressSync(Buffer.from("b\n"))])).toString() === "a\nb\n";
-/** A session log as text; an empty file (just created) is an empty log, a cut-off last frame throws. */
-export function decodeLog(buf) {
-  if (!ALL_FRAMES) throw new Error("dsh-alignment tools: this Node's zstdDecompressSync stops after the first frame — session logs would be cut short");
-  return buf.length === 0 ? "" : zstdDecompressSync(buf).toString("utf8");
+// A session log is read as a stream (lib/session-log-stream.mjs, 2026-11-16): whole zstd frames are decompressed in
+// batches and cut into lines, never the whole log as one string. Before, decodeLog made one string of the log and the
+// log (169 MB zstd, 608 MB of jsonl, over V8's ~512 MB string limit) failed with ERR_STRING_TOO_LONG, which
+// failed the whole baseline build. Batches of frames, not one call per frame: 2026-10-24 decoding frame by frame was
+// ~14 s of a ~25 s 30-day cold build (~370k frames). An empty file (just created) is an empty log; a cut-off last frame
+// (after one re-read) or a damaged frame throws.
+const TOOL_LINE = Buffer.from('{"type":"tool/');
+
+/**
+ * Call onEvent(event) for every tool event of a session log file, in order (lines are written with "type" first, so
+ * other lines are skipped without decoding them).
+ */
+export function eachToolEvent(file, onEvent, opts) {
+  eachLogLine(file, (line) => {
+    if (line.length >= TOOL_LINE.length && line.compare(TOOL_LINE, 0, TOOL_LINE.length, 0, TOOL_LINE.length) === 0) onEvent(JSON.parse(line.toString("utf8")));
+  }, opts);
 }
 
-/** Tool events of a decoded log (lines are written with "type" first). */
-export function toolEventsOf(text) {
+/** Tool events of a session log file (small logs, tests); scanSessions does not keep the events. */
+export function toolEventsOfFile(file, opts) {
   const out = [];
-  for (const line of text.split("\n")) if (line.startsWith('{"type":"tool/')) out.push(JSON.parse(line));
+  eachToolEvent(file, (e) => out.push(e), opts);
   return out;
+}
+
+/** samplesOf(extractCalls(events of file)) without holding the events or the calls' texts. */
+export function samplesOfLog(file, opts) {
+  const calls = [];
+  const push = callExtractor((c) => calls.push({ name: c.name, start: c.start, ms: c.ms, chars: c.chars, timeout: c.timeout }));
+  eachToolEvent(file, push, opts);
+  return samplesOf(calls);
 }
 
 /** Session logs under root (<root>/<project>/<session>/session.v4.jsonl.zstd) modified at or after since. */
@@ -398,7 +419,7 @@ export function scanSessions({ root, cacheFile, now = Date.now(), windowDays = W
     const c = old.files[l.file];
     if (c && c.mtimeMs === l.mtimeMs && c.size === l.size) { files[l.file] = c; reused++; calls += c.rows.length; continue; }
     let s;
-    try { s = samplesOf(extractCalls(toolEventsOf(decodeLog(readFileSync(l.file))))); }
+    try { s = samplesOfLog(l.file); }
     catch (error) { throw new Error("dsh-alignment tools: " + l.file + ": " + error.message, { cause: error }); }
     files[l.file] = { mtimeMs: l.mtimeMs, size: l.size, ...s };
     parsed++;
